@@ -1,0 +1,8 @@
+# A machine for the hub to manage: sshd with one user.
+FROM debian:trixie
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssh-server \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd -m -s /bin/bash alice && mkdir -p /run/sshd /home/alice/.ssh \
+ && chown alice:alice /home/alice/.ssh && chmod 700 /home/alice/.ssh
+CMD ["/usr/sbin/sshd", "-D", "-e"]

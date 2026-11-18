@@ -1,0 +1,12 @@
+#!/bin/sh
+# Stands in for Claude Code in tests: records how it was started, then keeps
+# trying every target host and logs which ones it can reach.
+echo "$*" >> "$HOME/fake-claude.args"
+case "$1" in auth) exit 0 ;; --version) echo "0.0.0 (fake)"; exit 0 ;; esac
+while true; do
+  for h in t1 t2; do
+    if ssh -o ConnectTimeout=3 "$h" true 2>/dev/null; then r=ok; else r=FAIL; fi
+    echo "$(date +%s) $h $r"
+  done >> "$HOME/reach.log"
+  sleep 1
+done
