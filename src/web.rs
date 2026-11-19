@@ -1044,6 +1044,17 @@ fn host_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
         button(c, &format!("/host/{n}/check"), "Check login", "primary", ""),
         button(c, &format!("/host/{n}/rescan"), "Re-read host keys", "", "")
     ));
+    b.push_str(&format!(
+        "<section class=\"card\"><h2>Address</h2><p>Moved {} to another network, such as its tailnet \
+         address? Its spaces stay.</p><form method=\"post\" action=\"/host/{n}/move-scan\" class=\"grid\">{}\
+         <label>Login <input name=\"target\" value=\"{}\" required></label>\
+         <label>Port <input name=\"port\" value=\"{}\" inputmode=\"numeric\"></label>\
+         <button>Read its host keys</button></form></section>",
+        esc(&h.name),
+        csrf(c),
+        esc(&format!("{}@{}", h.user, h.address)),
+        h.port
+    ));
     if h.blocked {
         b.push_str(&format!(
             "<section class=\"card\"><h2>Blocked</h2><p>No space can reach {} until you unblock it{}.</p>{}</section>",
@@ -1134,6 +1145,61 @@ fn host_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>) 
                 },
             )
             .map(|_| "new host keys saved".into()),
+        ),
+        "move-scan" => {
+            let target = f(form, "target").trim().to_string();
+            let port: u16 = f(form, "port").trim().parse().unwrap_or(22);
+            match get::<Scan>(
+                c,
+                Op::HostMoveScan {
+                    name: name.into(),
+                    target: target.clone(),
+                    port,
+                },
+            ) {
+                Ok(scan) => {
+                    let fps: String = scan
+                        .fingerprints
+                        .iter()
+                        .map(|f| format!("<li><code>{}</code></li>", esc(f)))
+                        .collect();
+                    let b = format!(
+                        "<section class=\"card narrow\"><h1>Move {}</h1><p>{} presents these host keys:</p><ul>{fps}</ul>\
+                         <p>Compare them with the output of this, run on the machine itself:</p>\
+                         <pre>for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf \"$f\"; done</pre>\
+                         <form method=\"post\" action=\"{here}/move\" class=\"stack\">{}\
+                         <input type=\"hidden\" name=\"target\" value=\"{}\">\
+                         <input type=\"hidden\" name=\"port\" value=\"{port}\"><input type=\"hidden\" name=\"keys\" value=\"{}\">\
+                         {}<button class=\"primary\">They match: move {}</button></form><p><a href=\"{here}\">Cancel</a></p></section>",
+                        esc(name),
+                        esc(&format!("{}:{}", scan.address, scan.port)),
+                        csrf(c),
+                        esc(&target),
+                        esc(&serde_json::to_string(&scan.host_keys).unwrap_or_default()),
+                        code_field(),
+                        esc(name)
+                    );
+                    Reply::Html(200, page(c, "Confirm host keys", &b, &Flash::default()))
+                }
+                Err(e) => back(&here, Err(e)),
+            }
+        }
+        "move" => back(
+            &here,
+            get::<String>(
+                c,
+                Op::HostMove {
+                    name: name.into(),
+                    target: f(form, "target").into(),
+                    port: f(form, "port").parse().unwrap_or(22),
+                    keys: serde_json::from_str(f(form, "keys")).unwrap_or_default(),
+                    code: f(form, "code").into(),
+                },
+            )
+            .map(|_| {
+                "moved; replace its key line on the machine with the one below, then press Check"
+                    .into()
+            }),
         ),
         "rm" => match get::<serde_json::Value>(
             c,

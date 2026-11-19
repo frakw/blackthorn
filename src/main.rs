@@ -221,6 +221,18 @@ enum HostCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Give a machine a new address, login or port, e.g. its tailnet IP
+    /// instead of its LAN one. Its spaces stay.
+    SetAddress {
+        name: String,
+        /// user@address
+        target: String,
+        #[arg(long, default_value_t = 22)]
+        port: u16,
+        /// Accept the host keys without asking (only if you have compared the fingerprints).
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -364,6 +376,12 @@ fn run(cli: Cli) -> Result<()> {
             HostCmd::Pubkey { name } => host_cmd::pubkey(&name),
             HostCmd::Check { name } => host_cmd::check(&name),
             HostCmd::Rescan { name, yes } => host_cmd::rescan(&name, yes),
+            HostCmd::SetAddress {
+                name,
+                target,
+                port,
+                yes,
+            } => host_cmd::set_address(&name, &target, port, yes),
         },
         Cmd::Web(w) => match w {
             WebCmd::Enable => web_cmd::enable(),
@@ -479,6 +497,8 @@ mod tests {
             ("host_check", &["host", "check"]),
             ("host_rescan", &["host", "rescan"]),
             ("host_rescan_confirm", &["host", "rescan"]),
+            ("host_move_scan", &["host", "set-address"]),
+            ("host_move", &["host", "set-address"]),
         ];
         // Operations that exist only because of the web: sessions.
         let web_only = ["web_config", "login", "logout", "whoami"];

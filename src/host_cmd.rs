@@ -1,5 +1,5 @@
-//! thorn host add / rm / ls / block / unblock / pubkey / check / rescan:
-//! the CLI side of the host operations in `ops`.
+//! thorn host add / rm / ls / block / unblock / pubkey / check / rescan /
+//! set-address: the CLI side of the host operations in `ops`.
 
 use crate::ops::{self, Scan};
 use crate::space_cmd::print_table;
@@ -19,16 +19,37 @@ pub fn add(name: &str, target: &str, port: u16, yes: bool) -> Result<()> {
         "\nOn {name}, add this line to ~{}/.ssh/authorized_keys:\n",
         scan.user
     );
-    println!("{line}\n");
-    if !line.starts_with("from=") {
-        println!(
-            "(no from=\"...\" limit: set ssh_from in /etc/blackthorn/config.toml, or install \
-             tailscale, so the key only works from this hub)\n"
-        );
-    }
+    print_line(&line);
     println!("then check it with: sudo thorn host check {name}");
     println!("and create a space on it with: sudo thorn new {name}");
     Ok(())
+}
+
+pub fn set_address(name: &str, target: &str, port: u16, yes: bool) -> Result<()> {
+    let scan = ops::host_move_scan(name, target, port, ops::ssh_client())?;
+    confirm_fingerprints(name, &scan, yes)?;
+    let line = ops::host_move(name, target, port, &scan.host_keys, ops::ssh_client())?;
+    println!(
+        "\n{name} is now {}@{}, port {port}; its spaces follow.",
+        scan.user, scan.address
+    );
+    println!(
+        "\nOn {name}, replace its blackthorn line in ~{}/.ssh/authorized_keys with:\n",
+        scan.user
+    );
+    print_line(&line);
+    println!("then check it with: sudo thorn host check {name}");
+    Ok(())
+}
+
+fn print_line(line: &str) {
+    println!("{line}\n");
+    if !line.starts_with("from=") {
+        println!(
+            "(no from=\"...\" limit: the hub found no address of its own to limit the key to; \
+             set ssh_from in /etc/blackthorn/config.toml)\n"
+        );
+    }
 }
 
 fn confirm_fingerprints(name: &str, scan: &Scan, yes: bool) -> Result<()> {

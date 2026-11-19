@@ -1,6 +1,6 @@
 [package]
 name = "blackthorn"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "An isolated hub where AI coding agents keep running and work on your machines over SSH, one way only."
 license = "MIT"

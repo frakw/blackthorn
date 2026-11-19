@@ -5,7 +5,9 @@
 
 use crate::config::{Config, CLAUDE};
 use crate::ctx::{self, Ctx};
-use crate::state::{now, validate_name, validate_rc_name, Block, Bridge, Host, Mode, Os, Space};
+use crate::state::{
+    now, validate_name, validate_rc_name, Block, Bridge, Host, Mode, Os, Space, State,
+};
 use crate::{keys, paths, render, sys, units};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -707,17 +709,30 @@ pub struct Scan {
 /// Reads a machine's host keys, for you to confirm before `host_add`.
 /// `client` is the address of whoever asks (your SSH or browser connection).
 pub fn host_scan(target: &str, port: u16, client: Option<IpAddr>) -> Result<Scan> {
+    scan_target(target, port, client, None)
+}
+
+/// Reads the host keys at a registered machine's new address, for you to
+/// confirm before `host_move`.
+pub fn host_move_scan(name: &str, target: &str, port: u16, client: Option<IpAddr>) -> Result<Scan> {
+    scan_target(target, port, client, Some(name))
+}
+
+/// `moving`: the registered machine that will get this address, if any.
+fn scan_target(
+    target: &str,
+    port: u16,
+    client: Option<IpAddr>,
+    moving: Option<&str>,
+) -> Result<Scan> {
     sys::require_root()?;
     let (cfg, state) = ctx::read_only()?;
+    if let Some(n) = moving {
+        state.host(n)?;
+    }
     let (user, address) = parse_target(target)?;
     refuse_address(&cfg, address, client)?;
-    if let Some((n, _)) = state
-        .hosts
-        .iter()
-        .find(|(_, h)| h.address == address && h.port == port)
-    {
-        bail!("{address} port {port} is already registered as {n}");
-    }
+    check_address_free(&state, address, port, moving)?;
     let host_keys = keys::scan(address, port)?;
     let fingerprints = keys::fingerprints(&host_keys)?;
     Ok(Scan {
@@ -727,6 +742,22 @@ pub fn host_scan(target: &str, port: u16, client: Option<IpAddr>) -> Result<Scan
         host_keys,
         fingerprints,
     })
+}
+
+fn check_address_free(
+    state: &State,
+    address: IpAddr,
+    port: u16,
+    except: Option<&str>,
+) -> Result<()> {
+    if let Some((n, _)) = state
+        .hosts
+        .iter()
+        .find(|(n, h)| Some(n.as_str()) != except && h.address == address && h.port == port)
+    {
+        bail!("{address} port {port} is already registered as {n}");
+    }
+    Ok(())
 }
 
 /// Machines blackthorn will not manage: they would have a path back.
@@ -781,24 +812,72 @@ pub fn host_add(
         },
     );
     ctx.commit()?;
-    authorized_keys_line(&ctx.cfg, name)
+    authorized_keys_line(&ctx.cfg, &ctx.state, name)
+}
+
+/// Gives a registered machine a new address, login or port (for example its
+/// tailnet address instead of its LAN one), with host keys you confirmed
+/// (from `host_move_scan`). Its spaces stay; their files and firewall rules
+/// follow. Returns the new authorized_keys line, which replaces the old one
+/// on the machine.
+pub fn host_move(
+    name: &str,
+    target: &str,
+    port: u16,
+    confirmed_keys: &[String],
+    client: Option<IpAddr>,
+) -> Result<String> {
+    let mut ctx = Ctx::open()?;
+    ctx.state.host(name)?;
+    let (user, address) = parse_target(target)?;
+    refuse_address(&ctx.cfg, address, client)?;
+    check_address_free(&ctx.state, address, port, Some(name))?;
+    let host_keys = keys::scan(address, port)?;
+    if host_keys != confirmed_keys {
+        bail!("{address}'s host keys changed since you confirmed them; scan again");
+    }
+    let h = ctx.state.hosts.get_mut(name).expect("exists");
+    h.address = address;
+    h.port = port;
+    h.user = user;
+    h.host_keys = host_keys;
+    ctx.commit()?;
+    authorized_keys_line(&ctx.cfg, &ctx.state, name)
 }
 
 /// The authorized_keys line for a host, limited to the hub's addresses.
-pub fn authorized_keys_line(cfg: &Config, name: &str) -> Result<String> {
-    let from = if cfg.ssh_from.is_empty() {
-        tailscale_ips()
-    } else {
-        cfg.ssh_from.clone()
-    };
+pub fn authorized_keys_line(cfg: &Config, state: &State, name: &str) -> Result<String> {
+    let from = hub_addresses(cfg, state.host(name)?.address);
     keys::authorized_keys_line(name, &from)
+}
+
+/// The addresses a machine sees the hub's connections come from: ssh_from
+/// if set, else the source address the kernel picks on the route to it (on
+/// a LAN and on a tailnet alike), else the hub's tailnet addresses.
+fn hub_addresses(cfg: &Config, target: IpAddr) -> Vec<IpAddr> {
+    if !cfg.ssh_from.is_empty() {
+        return cfg.ssh_from.clone();
+    }
+    let route = sys::output("ip", &["route", "get", &target.to_string()]);
+    match route.ok().as_deref().and_then(route_source) {
+        Some(src) => vec![src],
+        None => tailscale_ips(),
+    }
+}
+
+/// The `src` address in `ip route get` output.
+fn route_source(out: &str) -> Option<IpAddr> {
+    let words: Vec<&str> = out.split_whitespace().collect();
+    words
+        .windows(2)
+        .find(|w| w[0] == "src")
+        .and_then(|w| w[1].parse().ok())
 }
 
 pub fn host_pubkey(name: &str) -> Result<String> {
     sys::require_root()?;
     let (cfg, state) = ctx::read_only()?;
-    state.host(name)?;
-    authorized_keys_line(&cfg, name)
+    authorized_keys_line(&cfg, &state, name)
 }
 
 /// The hub's tailnet addresses, if tailscale is installed and up.
@@ -956,6 +1035,16 @@ pub fn ssh_client() -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_sources() {
+        let lan = "192.168.10.5 dev ens18 src 192.168.10.106 uid 0 \n    cache \n";
+        assert_eq!(route_source(lan), Some("192.168.10.106".parse().unwrap()));
+        let tailnet = "100.80.0.3 dev tailscale0 table 52 src 100.64.0.10 uid 0 \n    cache \n";
+        assert_eq!(route_source(tailnet), Some("100.64.0.10".parse().unwrap()));
+        assert_eq!(route_source(""), None);
+        assert_eq!(route_source("unreachable 10.9.9.9"), None);
+    }
 
     #[test]
     fn targets() {

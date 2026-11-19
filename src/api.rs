@@ -137,6 +137,18 @@ pub enum Op {
         keys: Vec<String>,
         code: String,
     },
+    HostMoveScan {
+        name: String,
+        target: String,
+        port: u16,
+    },
+    HostMove {
+        name: String,
+        target: String,
+        port: u16,
+        keys: Vec<String>,
+        code: String,
+    },
 }
 
 impl Op {
@@ -166,7 +178,8 @@ impl Op {
             | Op::BridgeAdd { code, .. }
             | Op::HostAdd { code, .. }
             | Op::HostRm { code, .. }
-            | Op::HostRescanConfirm { code, .. } => Some(code),
+            | Op::HostRescanConfirm { code, .. }
+            | Op::HostMove { code, .. } => Some(code),
             _ => None,
         }
     }
@@ -573,6 +586,16 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
         Op::HostCheck { name } => json(ops::host_check(&name)?),
         Op::HostRescan { name } => json(ops::host_rescan(&name)?),
         Op::HostRescanConfirm { name, keys, .. } => json(ops::host_rescan_confirm(&name, &keys)?),
+        Op::HostMoveScan { name, target, port } => {
+            json(ops::host_move_scan(&name, &target, port, client)?)
+        }
+        Op::HostMove {
+            name,
+            target,
+            port,
+            keys,
+            ..
+        } => json(ops::host_move(&name, &target, port, &keys, client)?),
     }
 }
 
@@ -658,6 +681,18 @@ pub fn all_op_names() -> Vec<String> {
             keys: vec![],
             code: s(),
         },
+        Op::HostMoveScan {
+            name: s(),
+            target: s(),
+            port: 22,
+        },
+        Op::HostMove {
+            name: s(),
+            target: s(),
+            port: 22,
+            keys: vec![],
+            code: s(),
+        },
     ];
     for op in &all {
         match op {
@@ -685,7 +720,9 @@ pub fn all_op_names() -> Vec<String> {
             | Op::HostPubkey { .. }
             | Op::HostCheck { .. }
             | Op::HostRescan { .. }
-            | Op::HostRescanConfirm { .. } => {}
+            | Op::HostRescanConfirm { .. }
+            | Op::HostMoveScan { .. }
+            | Op::HostMove { .. } => {}
         }
     }
     all.iter().map(Op::name).collect()

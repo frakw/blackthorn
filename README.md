@@ -204,6 +204,7 @@ restores the old settings at any time.
 | `thorn bridge add FROM TO [--for 1h]` / `bridge rm` / `bridge ls` | Let one space reach another space's machine for a while |
 | `thorn host add NAME USER@IP [--port P]` | Register a machine and create its key |
 | `thorn host ls` / `host check` / `host pubkey` / `host rescan` / `host rm` | Manage machines |
+| `thorn host set-address NAME USER@IP [--port P]` | Move a machine to a new address (e.g. LAN to tailnet); its spaces stay |
 | `thorn host block NAME [--for 30m] [--reason R]` / `host unblock` | Cut a machine off from every space |
 | `thorn web enable\|disable` / `web user add\|rm\|ls\|passwd\|totp-reset` | The web UI and its accounts |
 | `thorn harden ssh --totp\|--fido` / `harden confirm\|undo` | Two-factor SSH to the hub |
@@ -245,7 +246,7 @@ listing what it can reach and the rules of the hub.
 | `claude_bin` | `/usr/local/bin/claude` | Claude Code binary spaces run |
 | `claude_args` | `[]` | Arguments added to every Claude space |
 | `capacity` | `8` | Most chats one space runs at once |
-| `ssh_from` | `[]` | The hub's addresses as machines see them, for `from="..."` in key lines. Empty: `tailscale ip` |
+| `ssh_from` | `[]` | The hub's addresses as machines see them, for `from="..."` in key lines. Empty: the hub's source address on the route to each machine |
 | `never_manage` | `[]` | Addresses blackthorn refuses to manage and always drops (your tailnet control server, password manager...) |
 | `egress.https_anywhere` | `true` | Allow HTTPS to any address (Claude Code needs Anthropic, whose addresses change). See the threat model |
 | `egress.dns` | `[]` | DNS servers spaces may use; empty means those in `/etc/resolv.conf` |
@@ -268,6 +269,20 @@ listing what it can reach and the rules of the hub.
   policy is wrong.
 - Register machines by their tailnet IP. The key line then carries
   `from="<hub's tailnet IP>"` automatically.
+
+### Starting on a LAN, moving to a tailnet later
+
+Everything works on a plain LAN: the web UI listens on every address, and
+each key line is limited to the hub's LAN address (the address it uses to
+reach that machine). Give the hub a fixed LAN address (a DHCP reservation),
+since the key lines depend on it. To move to a tailnet later:
+
+1. Join the hub (and the machines) to the tailnet, as above.
+2. In `/etc/blackthorn/config.toml`, set `web.listen` to the hub's tailnet
+   address and `inbound.admin_from` to your devices; run `sudo thorn apply`.
+3. For each machine: `sudo thorn host set-address fig root@100.80.0.3`
+   (or *Address* on its page in the web UI), and replace its line in
+   `authorized_keys` with the new one it prints.
 - Do not manage the machine that runs your control server, and list it in
   `never_manage`: whoever controls it controls who can reach the hub.
 

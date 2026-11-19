@@ -113,7 +113,6 @@ hub /usr/local/bin/thorn init --claude-from /root/fake-claude >/dev/null
 say "configure the web UI and inbound limits"
 hubi sh -c "cat > /etc/blackthorn/config.toml" <<EOF
 claude_bin = "/usr/local/bin/claude"
-ssh_from = ["$HUB"]
 never_manage = ["192.0.2.99"]
 
 [inbound]
@@ -135,6 +134,10 @@ for t in t1 t2; do
   echo "$line" | docker exec -i "$P-$t" sh -c 'cat >> /home/alice/.ssh/authorized_keys; chown alice /home/alice/.ssh/authorized_keys; chmod 600 /home/alice/.ssh/authorized_keys'
   thorn host check "$t" | grep -q "(linux)" && ok "host check $t learns its OS" || fail "host check $t learns its OS"
 done
+# Same machine, re-registered at its address (here unchanged): spaces stay.
+thorn host set-address t2 "alice@$T2" --yes | grep -q "replace its blackthorn line" && ok "host set-address" || fail "host set-address"
+thorn host check t2 | grep -q "(linux)" && ok "t2 still logs in after set-address" || fail "t2 after set-address"
+thorn host set-address t2 "alice@$T1" --yes 2>&1 | grep -q "already registered as t1" && ok "set-address refuses another machine's address" || fail "set-address to t1's address"
 thorn host add laptop "me@$ADMIN" --yes 2>&1 | grep -q "device you administer" && ok "refuses to manage an admin device" || fail "refuses to manage an admin device"
 thorn host add hs "me@192.0.2.99" --yes 2>&1 | grep -q "never_manage" && ok "refuses a never_manage address" || fail "refuses a never_manage address"
 

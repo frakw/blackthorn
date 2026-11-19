@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "dev/**"]
   pull_request:
 
 jobs:
@@ -13,9 +13,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      # Failures also become annotations (readable on the run page without
+      # the full log).
+      - name: fmt
+        run: cargo fmt --check || { echo "::error::cargo fmt --check: run cargo fmt"; exit 1; }
+      - name: clippy
+        run: |
+          cargo clippy --all-targets --message-format=short -- -D warnings 2>&1 | tee clippy.log
+          s=${PIPESTATUS[0]}
+          grep -E '(error|warning)' clippy.log | head -20 | sed 's/^/::error::/' || true
+          exit $s
+      - name: test
+        run: |
+          cargo test 2>&1 | tee test.log
+          s=${PIPESTATUS[0]}
+          grep -E 'panicked|^error|FAILED' test.log | head -20 | sed 's/^/::error::/' || true
+          exit $s
       - name: nft accepts the generated rules
         run: |
           sudo apt-get install -y nftables
@@ -29,4 +42,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build
-      - run: tests/e2e/run.sh
+      - name: e2e
+        run: |
+          tests/e2e/run.sh 2>&1 | tee e2e.log
+          s=${PIPESTATUS[0]}
+          grep -E 'FAIL:|^error' e2e.log | head -10 | sed 's/^/::error::/' || true
+          exit $s
