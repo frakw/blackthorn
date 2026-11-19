@@ -297,14 +297,16 @@ r=$(web_post /login --data-urlencode "user=frakw" --data-urlencode "password=$PA
 C=$(csrf)
 
 say "notifications to an ntfy server"
-docker exec -d "$P-admin" sh -c "while true; do printf 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' | nc -l -q1 8099 >> /tmp/ntfy.req; done"
+docker exec -d "$P-admin" sh -c "while true; do printf 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' | nc -N -l 8099 >> /tmp/ntfy.req; done"
 sleep 1
 thorn notify set "http://$ADMIN:8099/bt-e2e-topic" | grep -q "notifications go to" && ok "thorn notify set" || fail "notify set"
 hub stat -c %a /etc/blackthorn/notify.toml | grep -q 600 && ok "the topic is kept root-only" || fail "notify.toml mode"
 web_get /settings | grep -q "bt-e2e-topic" && ok "the settings page shows where they go" || fail "notify card"
 r=$(web_post /notify/test --data-urlencode "csrf=$C")
 case "$r" in *"ok=test%20sent"*) ok "a test sent from the web";; *) fail "notify test: $r";; esac
-admin grep -q "Notifications work." /tmp/ntfy.req && ok "the ntfy server got it" || fail "ntfy request: $(admin cat /tmp/ntfy.req)"
+got=""
+for _ in $(seq 10); do admin grep -q "Notifications work." /tmp/ntfy.req && { got=1; break; }; sleep 0.5; done
+[ -n "$got" ] && ok "the ntfy server got it" || fail "ntfy request: $(admin cat /tmp/ntfy.req)"
 tcp_open "$P-t1" "$HUB" 22 || true
 got=""
 for _ in $(seq 75); do admin grep -q "machine t1 ($T1) tried to connect to the hub" /tmp/ntfy.req && { got=1; break; }; sleep 1; done
