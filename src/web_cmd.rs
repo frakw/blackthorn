@@ -21,9 +21,6 @@ pub fn enable() -> Result<()> {
             paths::CONFIG_FILE
         );
     }
-    if Users::load(users_path())?.users.is_empty() {
-        bail!("add an account first: sudo thorn web user add <name>");
-    }
     if cfg.inbound.admin_from.is_empty() {
         println!(
             "note: inbound.admin_from is empty, so any device that can reach {} may try to log in; \
@@ -38,6 +35,9 @@ pub fn enable() -> Result<()> {
     sys::systemctl(&["enable", "--now", units::API, units::WEB])?;
     for a in &cfg.web.listen {
         println!("web UI on http://{a}/");
+    }
+    if !has_accounts()? {
+        println!("no web accounts yet; add one with: sudo thorn web user add <name>");
     }
     Ok(())
 }
@@ -61,16 +61,37 @@ pub fn user_ls() -> Result<()> {
     Ok(())
 }
 
+pub fn has_accounts() -> Result<bool> {
+    Ok(!Users::load(users_path())?.users.is_empty())
+}
+
+/// Asks for a name (suggesting whoever ran sudo) and adds that account.
+pub fn first_account() -> Result<()> {
+    let suggested = std::env::var("SUDO_USER")
+        .ok()
+        .filter(|u| u != "root" && crate::state::validate_name("account", u).is_ok())
+        .unwrap_or_else(|| "admin".into());
+    let mut input = Input::new();
+    let name = input.line(&format!("account name [{suggested}]: "))?;
+    let name = if name.is_empty() { suggested } else { name };
+    add_account(&name, None, &mut input)
+}
+
 pub fn user_add(name: &str, totp_secret: Option<String>) -> Result<()> {
+    add_account(name, totp_secret, &mut Input::new())
+}
+
+/// Takes the one `Input` (and so the one stdin lock) the caller already
+/// holds: a second lock on stdin would wait forever.
+fn add_account(name: &str, totp_secret: Option<String>, input: &mut Input) -> Result<()> {
     sys::require_root()?;
     crate::state::validate_name("account", name)?;
     let mut users = Users::load(users_path())?;
     if users.users.contains_key(name) {
         bail!("there is already an account named {name}");
     }
-    let mut input = Input::new();
     let password = input.new_password()?;
-    let (secret, recovery, step) = enroll_totp(name, totp_secret, &mut input)?;
+    let (secret, recovery, step) = enroll_totp(name, totp_secret, input)?;
     users.users.insert(
         name.to_string(),
         User {
@@ -82,7 +103,11 @@ pub fn user_add(name: &str, totp_secret: Option<String>) -> Result<()> {
     );
     users.save(users_path())?;
     print_recovery(&recovery);
-    println!("account {name} added; turn the web UI on with: sudo thorn web enable");
+    if sys::unit_state(units::WEB) == "active" {
+        println!("account {name} added; log in to the web UI with it");
+    } else {
+        println!("account {name} added; turn the web UI on with: sudo thorn web enable");
+    }
     Ok(())
 }
 

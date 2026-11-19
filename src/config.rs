@@ -150,8 +150,15 @@ impl Config {
         }
     }
 
-    pub fn default_text() -> String {
-        let body = toml::to_string_pretty(&Config::default()).expect("default config serializes");
+    /// The first config file, with the web UI listening on `listen`.
+    pub fn default_text(listen: &[SocketAddr]) -> String {
+        let cfg = Config {
+            web: Web {
+                listen: listen.to_vec(),
+            },
+            ..Config::default()
+        };
+        let body = toml::to_string_pretty(&cfg).expect("default config serializes");
         format!(
             "# blackthorn configuration. See README.md for every option.\n\
              # Run `thorn apply` after editing.\n\n{body}"
@@ -181,9 +188,12 @@ mod tests {
 
     #[test]
     fn default_round_trips() {
-        let text = Config::default_text();
+        let text = Config::default_text(&[]);
         let parsed: Config = toml::from_str(&text).unwrap();
         assert_eq!(parsed, Config::default());
+        let listen: SocketAddr = "0.0.0.0:7180".parse().unwrap();
+        let parsed: Config = toml::from_str(&Config::default_text(&[listen])).unwrap();
+        assert_eq!(parsed.web.listen, vec![listen]);
     }
 
     #[test]

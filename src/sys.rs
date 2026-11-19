@@ -5,7 +5,7 @@ use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub fn require_root() -> Result<()> {
@@ -90,6 +90,18 @@ pub fn lookup_user(name: &str) -> Option<UserIds> {
         uid: pw.pw_uid,
         gid: pw.pw_gid,
     })
+}
+
+/// A user's home directory from the password database.
+pub fn user_home(name: &str) -> Option<PathBuf> {
+    let c = CString::new(name).ok()?;
+    // SAFETY: as in lookup_user; the directory string is copied out at once.
+    let pw = unsafe { libc::getpwnam(c.as_ptr()) };
+    if pw.is_null() {
+        return None;
+    }
+    let dir = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) };
+    Some(PathBuf::from(dir.to_str().ok()?))
 }
 
 /// A system user with its own group, no password and no login shell.

@@ -89,26 +89,36 @@ from those only.
 
 ## Install
 
-blackthorn is not meant to have a compiler on the hub. Build it elsewhere:
+On the hub (Debian, Ubuntu, Fedora or Arch, with systemd):
 
 ```sh
-cargo build --release          # produces target/release/thorn
+curl -fsSL https://github.com/frakw/blackthorn/releases/latest/download/install.sh | sh
 ```
 
-Copy `thorn` to the hub. There, install Claude Code for your own admin user
-the usual way, then:
+That one line:
 
-```sh
-sudo apt install tmux openssh-client nftables
-sudo ./thorn init --claude-from ~/.local/bin/claude
-```
+1. installs `tmux`, `openssh-client` and `nftables` if they are missing;
+2. downloads `thorn` (a static binary) and checks it against the release's
+   `SHA256SUMS`;
+3. installs Claude Code with Anthropic's installer, unless it is already
+   there, and puts it at `/usr/local/bin/claude`, root-owned, so spaces run
+   it but cannot change it;
+4. runs `thorn init`: systemd units, the firewall, and the web UI, turned on;
+5. asks for your web account: a password, then a QR code for your
+   authenticator app.
 
-`init` installs `thorn` to `/usr/local/bin`, copies the Claude Code binary to
-`/usr/local/bin/claude` (spaces run that copy and never update it
-themselves; run `init --claude-from` again to update), installs the systemd
-units, and loads the firewall.
+It ends by printing the web UI's address. Open it, log in, and do the rest
+there: add a machine, create a space on it, sign it in to Claude.
+
+Run the same line again to upgrade; your configuration stays as it is. To
+update Claude Code: `... | sh -s -- --update-claude`. Other options:
+`--version v0.3.0`, `--no-claude`, `--no-web`, and `--binary ./thorn` to
+install a binary you built yourself (`cargo build --release`; the hub needs
+no compiler).
 
 ## Quick start
+
+From the web UI, or the same from the command line:
 
 ```sh
 # 1. Register a machine by IP. Confirm its host-key fingerprints when asked.
@@ -139,6 +149,17 @@ The web UI is the everyday way to run blackthorn: the map, spaces (with a
 live view of each space's terminal, and Claude sign-in), machines, blocks
 and bridges. The command line can do everything it can, for when it is down.
 
+Logins need the password and a TOTP code; deleting a space, removing a
+machine, opening a bridge and accepting new host keys ask for a fresh code
+again. The HTTP-facing process runs as an unprivileged, sandboxed user and
+cannot act on its own: a root process behind a Unix socket checks every
+login and code.
+
+It is plain HTTP. On install it listens on the hub's tailnet address when
+Tailscale is up, where WireGuard already encrypts the traffic and no domain
+or certificate is needed. Without Tailscale it listens on every address;
+then narrow it down, and limit who may connect at all:
+
 ```sh
 # /etc/blackthorn/config.toml
 [web]
@@ -148,19 +169,10 @@ listen = ["100.64.0.10:7180"]      # the hub's tailnet address
 admin_from = ["100.64.0.2", "100.64.0.3"]   # your laptop and phone
 
 sudo thorn apply
-sudo thorn web user add me         # password + authenticator app (QR code)
-sudo thorn web enable
 ```
 
-Then open `http://100.64.0.10:7180/` from a device on your tailnet. Logins
-need the password and a TOTP code; deleting a space, removing a machine,
-opening a bridge and accepting new host keys ask for a fresh code again.
-
-It is plain HTTP on purpose: it listens only on the tailnet address, whose
-traffic WireGuard already encrypts, so no domain or certificate is needed.
-The HTTP-facing process runs as an unprivileged, sandboxed user and cannot
-act on its own: a root process behind a Unix socket checks every login and
-code.
+More accounts: `sudo thorn web user add NAME`. Turn the web UI off with
+`sudo thorn web disable`; the command line keeps working.
 
 ## SSH two-factor
 
@@ -179,7 +191,7 @@ restores the old settings at any time.
 
 | Command | What it does |
 |---|---|
-| `thorn init [--claude-from PATH]` | Set up the hub, or update Claude Code |
+| `thorn init [--claude-from PATH] [--no-web]` | Set up the hub (the installer runs it), or update Claude Code |
 | `thorn status [--json]` | The map: machines, spaces, bridges, hub health |
 | `thorn ls` | Spaces: machine, agent, state, what they can reach |
 | `thorn new HOST [--agent A] [--name N] [--single] [--rc-name N] [--arg A]...` | Create a space on a machine |
@@ -248,6 +260,8 @@ listing what it can reach and the rules of the hub.
 - Join the hub to the tailnet with its own tag, Tailscale SSH off, and
   without accepting routes others advertise:
   `tailscale up --advertise-tags=tag:blackthorn --ssh=false --accept-routes=false`.
+  Do this before installing blackthorn: the web UI then listens on the
+  tailnet address only.
 - In the tailnet policy, let your own devices reach `tag:blackthorn` on the
   admin ports, let `tag:blackthorn` reach your servers on port 22, and
   nothing else. The hub's own firewall enforces the same, in case the

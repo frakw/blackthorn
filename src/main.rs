@@ -50,6 +50,10 @@ enum Cmd {
         /// (e.g. ~/.local/bin/claude). Run again to update Claude Code.
         #[arg(long, value_name = "PATH")]
         claude_from: Option<PathBuf>,
+        /// On a first install, leave the web UI off (turn it on later with
+        /// `thorn web enable`).
+        #[arg(long)]
+        no_web: bool,
     },
     /// The hub at a glance: machines, their spaces, bridges.
     Status {
@@ -294,7 +298,13 @@ fn main() {
 fn run(cli: Cli) -> Result<()> {
     use space_cmd as s;
     match cli.cmd {
-        Cmd::Init { claude_from } => init_cmd::init(claude_from),
+        Cmd::Init {
+            claude_from,
+            no_web,
+        } => init_cmd::init(init_cmd::InitOpts {
+            claude_from,
+            no_web,
+        }),
         Cmd::Status { json } => view_cmd::status(json),
         Cmd::Ls => s::ls(),
         Cmd::New {

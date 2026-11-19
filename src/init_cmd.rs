@@ -3,8 +3,10 @@
 use crate::config::Config;
 use crate::ctx::{self, Ctx};
 use crate::state::{now, StateLock};
-use crate::{apply, firewall, keys, paths, sys, units};
+use crate::{apply, firewall, keys, ops, paths, sys, units, web_cmd};
 use anyhow::{bail, Context, Result};
+use std::io::IsTerminal;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 const NEEDED: &[(&str, &str)] = &[
@@ -20,7 +22,14 @@ const NEEDED: &[(&str, &str)] = &[
     ("systemctl", "systemd"),
 ];
 
-pub fn init(claude_from: Option<PathBuf>) -> Result<()> {
+/// What `thorn init` does beyond the basics.
+pub struct InitOpts {
+    pub claude_from: Option<PathBuf>,
+    /// Leave the web UI off on a first install.
+    pub no_web: bool,
+}
+
+pub fn init(opts: InitOpts) -> Result<()> {
     sys::require_root()?;
 
     let missing: Vec<&str> = NEEDED
@@ -54,10 +63,15 @@ pub fn init(claude_from: Option<PathBuf>) -> Result<()> {
     ] {
         sys::mkdir(Path::new(dir), mode)?;
     }
-    if !Path::new(paths::CONFIG_FILE).exists() {
+    // A first install: no config file yet. Later runs (upgrades) leave the
+    // config, and whether the web UI is on, as they are.
+    let first = !Path::new(paths::CONFIG_FILE).exists();
+    let web_on = first && !opts.no_web;
+    if first {
+        let listen = if web_on { default_listen() } else { vec![] };
         sys::write_file(
             Path::new(paths::CONFIG_FILE),
-            &Config::default_text(),
+            &Config::default_text(&listen),
             0o644,
             None,
         )?;
@@ -65,6 +79,13 @@ pub fn init(claude_from: Option<PathBuf>) -> Result<()> {
     }
     let cfg = Config::load(Path::new(paths::CONFIG_FILE))?;
 
+    let claude_from = opts.claude_from.or_else(|| {
+        if cfg.claude_bin.is_file() {
+            None
+        } else {
+            find_claude()
+        }
+    });
     if let Some(src) = claude_from {
         let src = src
             .canonicalize()
@@ -106,16 +127,103 @@ pub fn init(claude_from: Option<PathBuf>) -> Result<()> {
     }
     sys::systemctl(&["enable", "--now", units::FIREWALL, units::TICK_TIMER])?;
 
-    if sys::unit_state(units::WEB) == "active" {
+    if web_on {
+        sys::systemctl(&["enable", "--now", units::API, units::WEB])?;
+    } else if sys::unit_state(units::WEB) == "active" {
         sys::systemctl(&["restart", units::API, units::WEB])?;
     }
+    let web_active = sys::unit_state(units::WEB) == "active";
 
-    println!("\nblackthorn is ready. Next:");
-    println!("  sudo thorn host add <name> user@<address>   register a machine");
-    println!("  sudo thorn new <name>                       create a space on it (Claude)");
-    println!("  sudo thorn login <name>-claude              sign it in; it starts right after");
-    println!("  sudo thorn web user add <you>               then: sudo thorn web enable");
+    // The first web account, asked for right here when someone is at the
+    // terminal (the installer hands init the terminal).
+    let mut have_account = web_cmd::has_accounts()?;
+    if web_active && !have_account && std::io::stdin().is_terminal() {
+        println!("\nCreate your web account (password + authenticator app).");
+        have_account = match web_cmd::first_account() {
+            Ok(()) => true,
+            Err(e) => {
+                println!("no account created: {e:#}");
+                false
+            }
+        };
+    }
+
+    println!("\nblackthorn is ready.");
+    if web_active {
+        for url in web_urls(&cfg.web.listen) {
+            println!("  web UI: {url}");
+        }
+        if !have_account {
+            println!("  create your login first: sudo thorn web user add <name>");
+        }
+        if cfg.web.listen.iter().any(|a| a.ip().is_unspecified()) {
+            println!(
+                "  note: the web UI listens on every address, over plain HTTP. Reach it through\n  \
+                 Tailscale or a trusted network, and list your devices in inbound.admin_from\n  \
+                 in {} (then: sudo thorn apply).",
+                paths::CONFIG_FILE
+            );
+        }
+        println!("  In the web UI: add a machine, create a space on it, sign in to Claude.");
+    } else {
+        println!("  sudo thorn host add <name> user@<address>   register a machine");
+        println!("  sudo thorn new <name>                       create a space on it (Claude)");
+        println!("  sudo thorn login <name>-claude              sign it in; it starts right after");
+    }
     Ok(())
+}
+
+/// Where a new web UI listens: the hub's tailnet address when Tailscale is
+/// up (only your tailnet can reach it), otherwise every address.
+fn default_listen() -> Vec<SocketAddr> {
+    let tailnet: Vec<SocketAddr> = ops::tailscale_ips()
+        .into_iter()
+        .filter(|ip| ip.is_ipv4())
+        .map(|ip| SocketAddr::new(ip, WEB_PORT))
+        .collect();
+    if tailnet.is_empty() {
+        vec![SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), WEB_PORT)]
+    } else {
+        tailnet
+    }
+}
+
+const WEB_PORT: u16 = 7180;
+
+/// Addresses to open in a browser, with "every address" spelled out.
+fn web_urls(listen: &[SocketAddr]) -> Vec<String> {
+    let mut urls = Vec::new();
+    for a in listen {
+        if a.ip().is_unspecified() {
+            let ips = sys::output("hostname", &["-I"]).unwrap_or_default();
+            let ips: Vec<IpAddr> = ips
+                .split_whitespace()
+                .filter_map(|s| s.parse().ok())
+                .filter(|ip: &IpAddr| ip.is_ipv4())
+                .collect();
+            if ips.is_empty() {
+                urls.push(format!("http://<this machine's address>:{}/", a.port()));
+            }
+            urls.extend(ips.iter().map(|ip| format!("http://{ip}:{}/", a.port())));
+        } else {
+            urls.push(format!("http://{a}/"));
+        }
+    }
+    urls
+}
+
+/// Claude Code installed the usual way, in the home of whoever ran sudo, or
+/// root's.
+fn find_claude() -> Option<PathBuf> {
+    let mut homes = Vec::new();
+    if let Ok(u) = std::env::var("SUDO_USER") {
+        homes.extend(sys::user_home(&u));
+    }
+    homes.extend(sys::user_home("root"));
+    homes
+        .into_iter()
+        .map(|h| h.join(".local/bin/claude"))
+        .find(|p| p.is_file())
 }
 
 fn install_file(src: &Path, dest: &Path) -> Result<()> {

@@ -424,6 +424,7 @@ fn login_page(err: Option<&str>) -> Reply {
         <label>Authenticator code <input name=\"code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" required class=\"code\"></label>\
         <button class=\"primary\">Log in</button>\
         <p class=\"hint\">Lost your phone? A recovery code works in place of the authenticator code.</p>\
+        <p class=\"hint\">No account yet? On the hub, run <code>sudo thorn web user add &lt;name&gt;</code>.</p>\
         </form></section>";
     let flash = Flash {
         ok: None,

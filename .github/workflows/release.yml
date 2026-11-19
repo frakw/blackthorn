@@ -1,0 +1,63 @@
+name: Release
+
+# Push a tag such as v0.3.0 (matching Cargo.toml's version) to publish static
+# Linux builds, their SHA256SUMS and install.sh as a GitHub release. The
+# installer always fetches from releases/latest/download/.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+          - arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch }}-unknown-linux-musl
+      - name: The tag matches Cargo.toml
+        run: |
+          v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          test "v$v" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME but Cargo.toml says $v"; exit 1; }
+      - name: Cross linker
+        if: matrix.arch == 'aarch64'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build (static, musl)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          cargo build --release --locked --target ${{ matrix.arch }}-unknown-linux-musl
+          mkdir dist
+          cp target/${{ matrix.arch }}-unknown-linux-musl/release/thorn dist/thorn-${{ matrix.arch }}-linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thorn-${{ matrix.arch }}
+          path: dist/
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cp install.sh dist/
+          cd dist && sha256sum thorn-* install.sh > SHA256SUMS && cat SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "blackthorn $GITHUB_REF_NAME" --generate-notes

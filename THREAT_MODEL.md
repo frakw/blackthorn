@@ -26,6 +26,11 @@ issue.
 - **Whatever controls the network path to the hub's admin SSH**, for example
   a Tailscale or Headscale control server: it decides who can reach port 22.
   Key-only SSH remains the last barrier.
+- **Where you install from**: the GitHub release (or the mirror you point
+  the installer at) and Anthropic's Claude Code installer, over HTTPS. The
+  release's `SHA256SUMS` catches a damaged download, not a compromised
+  release; build from source and use `install.sh --binary` if that matters
+  to you.
 
 ## Threats considered
 
@@ -115,8 +120,11 @@ Know these before you rely on it.
    control server on a machine blackthorn does not manage, and list it in
    `never_manage`.
 
-9. **The web UI is plain HTTP.** It relies on the tailnet's encryption. Do
-   not make it listen on an address reachable outside the tailnet.
+9. **The web UI is plain HTTP.** It relies on the tailnet's encryption. A
+   fresh install without Tailscale listens on every address; anyone on that
+   network path can then read the session cookie. Set `web.listen` to the
+   tailnet address and `inbound.admin_from` to your devices, and do not
+   make it reachable outside the tailnet.
 
 10. **Remote Control is as safe as your Claude account.** Spaces accept
     instructions from Remote Control. See "Who is trusted".

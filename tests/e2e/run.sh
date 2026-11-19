@@ -85,10 +85,32 @@ ip_of() { docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{
 T1=$(ip_of t1) T2=$(ip_of t2) HUB=$(ip_of hub) ADMIN=$(ip_of admin)
 echo "   hub=$HUB t1=$T1 t2=$T2 admin=$ADMIN"
 
-say "init, with the web UI and inbound limits configured"
-docker cp "$THORN" "$P-hub:/root/thorn"
+say "one-line install, from a release directory"
+# A stand-in for a GitHub release: the binary and its SHA256SUMS.
+hub mkdir -p /opt/release /opt/bad
+docker cp "$THORN" "$P-hub:/opt/release/thorn-x86_64-linux"
+docker cp "$HERE/../../install.sh" "$P-hub:/root/install.sh"
 docker cp "$HERE/fake-claude" "$P-hub:/root/fake-claude"
-hub /root/thorn init --claude-from /root/fake-claude >/dev/null
+hub sh -c 'cd /opt/release && sha256sum thorn-x86_64-linux > SHA256SUMS'
+hub sh -c 'cp /opt/release/thorn-x86_64-linux /opt/bad/ && echo junk >> /opt/bad/thorn-x86_64-linux && cp /opt/release/SHA256SUMS /opt/bad/'
+install_from() { hub env BLACKTHORN_DOWNLOAD="file://$1" sh /root/install.sh --no-claude 2>&1; }
+out=$(install_from /opt/bad || true)
+if echo "$out" | grep -q "checksum mismatch" && ! hub test -e /usr/local/bin/thorn; then
+  ok "a binary that does not match SHA256SUMS is refused"
+else
+  fail "tampered binary: $out"
+fi
+out=$(install_from /opt/release) || fail "install: $out"
+[ "$(hub systemctl is-active blackthorn-web.service)" = active ] && ok "the web UI is on right after install" || fail "web UI on after install"
+hub grep -q '0.0.0.0:7180' /etc/blackthorn/config.toml && ok "without Tailscale it listens on every address" || fail "default listen address"
+echo "$out" | grep -q "web UI: http://$HUB:7180/" && ok "install prints the web address" || fail "install prints the web address: $out"
+echo "$out" | grep -q "sudo thorn web user add" && ok "and how to create the first login" || fail "first login hint"
+thorn web disable >/dev/null
+install_from /opt/release >/dev/null || fail "upgrade install"
+[ "$(hub systemctl is-active blackthorn-web.service)" != active ] && ok "running it again upgrades without turning the web UI back on" || fail "upgrade kept web off"
+hub /usr/local/bin/thorn init --claude-from /root/fake-claude >/dev/null
+
+say "configure the web UI and inbound limits"
 hubi sh -c "cat > /etc/blackthorn/config.toml" <<EOF
 claude_bin = "/usr/local/bin/claude"
 ssh_from = ["$HUB"]
