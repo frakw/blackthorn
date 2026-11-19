@@ -42,7 +42,10 @@ issue.
 3. **A misbehaving space.** For whatever reason, the agent of one space runs
    arbitrary commands as its own Unix user.
 4. **Attacks on the web UI** from the network it listens on: password
-   guessing, cross-site request forgery, malformed HTTP.
+   guessing, cross-site request forgery, malformed HTTP. Whoever has your
+   password and authenticator can also change who may reach the hub
+   (Settings), just as root on the console can; such changes need a fresh
+   code, are logged, and may not shut out the device making them.
 
 ## What blackthorn enforces
 
@@ -63,7 +66,7 @@ they are enforced by the kernel or by what the space has, not by the model.
 | Spaces cannot change the system | systemd sandbox: `ProtectSystem=strict`, `ProtectHome`, `NoNewPrivileges`, `PrivateTmp`, `RestrictSUIDSGID`, and more. |
 | Without the firewall, nothing runs | Space units require the firewall unit, and stopping the firewall unit leaves its rules loaded. |
 | The web UI's network side has no power | The HTTP listener runs as the unprivileged `blackthorn-web` user in a tight systemd sandbox, with no access to blackthorn's files. It forwards requests to a root API on a Unix socket, which accepts only that user, checks the password (Argon2id) and TOTP code itself, keeps the sessions, and enforces the CSRF value. A compromised web process can act only through a session a user has logged in to. |
-| Logins resist guessing | Password and TOTP are both needed; each code works once; five failures lock the account and the address for 15 minutes. Deleting spaces, removing machines, opening bridges and accepting new host keys need a fresh code. |
+| Logins resist guessing | Password and TOTP are both needed; each code works once; five failures lock the account and the address for 15 minutes. Deleting spaces, removing machines, moving them, opening bridges, accepting new host keys and changing settings need a fresh code. |
 | Web pages are hard to abuse | SameSite=Strict, HttpOnly session cookie; a CSRF value on every form; a CSP that allows no inline script or third-party resource; a small HTTP parser with size, time and connection limits. |
 | SSH changes cannot lock you out | `thorn harden ssh` checks your authenticator first, validates sshd's configuration, and undoes itself unless you confirm from a new login. |
 

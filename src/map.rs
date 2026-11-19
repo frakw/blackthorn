@@ -57,6 +57,24 @@ struct Col<'a> {
     w: i32,
 }
 
+/// How you reach this page, from where the web UI listens.
+fn web_path(listen: &[String]) -> &'static str {
+    let ips: Vec<std::net::IpAddr> = listen
+        .iter()
+        .filter_map(|a| a.parse::<std::net::SocketAddr>().ok())
+        .map(|a| a.ip())
+        .collect();
+    let tailnet = |ip: &std::net::IpAddr| match ip {
+        std::net::IpAddr::V4(v) => v.octets()[0] == 100 && (v.octets()[1] & 0xc0) == 64,
+        std::net::IpAddr::V6(v) => v.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+    };
+    if !ips.is_empty() && ips.iter().all(tailnet) {
+        "over the tailnet"
+    } else {
+        "over your network"
+    }
+}
+
 pub fn svg(o: &Overview) -> String {
     let mut cols: Vec<Col> = Vec::new();
     let mut x = MARGIN;
@@ -94,9 +112,10 @@ pub fn svg(o: &Overview) -> String {
         out,
         "<rect class=\"devices\" x=\"{MARGIN}\" y=\"12\" width=\"{}\" height=\"34\" rx=\"8\"/>\
          <text class=\"t-dim\" x=\"{}\" y=\"34\">your phone / laptop · Remote Control via claude.ai · \
-         this page over the tailnet</text>",
+         this page {}</text>",
         width - 2 * MARGIN,
-        MARGIN + 14
+        MARGIN + 14,
+        web_path(&o.hub.web_listen)
     );
     let _ = write!(
         out,
@@ -281,6 +300,19 @@ pub fn svg(o: &Overview) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn says_how_the_page_is_reached() {
+        let l = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(web_path(&l(&["100.64.0.10:7180"])), "over the tailnet");
+        assert_eq!(
+            web_path(&l(&["[fd7a:115c:a1e0::1]:7180"])),
+            "over the tailnet"
+        );
+        assert_eq!(web_path(&l(&["0.0.0.0:7180"])), "over your network");
+        assert_eq!(web_path(&l(&["192.168.10.106:7180"])), "over your network");
+        assert_eq!(web_path(&l(&["100.128.0.1:7180"])), "over your network");
+    }
     use crate::ops::{BridgeView, HubView};
     use crate::state::{Mode, Os};
 

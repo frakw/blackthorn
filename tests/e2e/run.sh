@@ -226,6 +226,20 @@ r=$(web_post /host/t2/rm --data-urlencode "csrf=$C" --data-urlencode "code=12345
 case "$r" in *"fresh%20code"*) ok "removing a machine without a fresh code is refused";; *) fail "step-up: $r";; esac
 thorn host ls | grep -q '^t2 ' && ok "t2 is still there" || fail "t2 is still there"
 
+say "settings, from the web and the command line"
+web_get /settings | grep -q 'name="inbound.admin_from"' && ok "the settings page lists admin_from" || fail "settings page"
+web_get / | grep -q "v$(thorn --version | cut -d' ' -f2)<" && ok "the web UI shows its version" || fail "version in the web UI"
+admin curl -s "http://$HUB:7180/static/logo.svg" | grep -q "<svg" && ok "the logo is served" || fail "logo"
+code=$(fresh_code $WEB_SECRET)
+r=$(web_post /settings --data-urlencode "csrf=$C" --data-urlencode "inbound.admin_from=192.0.2.77" --data-urlencode "code=$code")
+case "$r" in *"lock%20you%20out"*) ok "a setting that would lock you out is refused";; *) fail "lock-out guard: $r";; esac
+code=$(fresh_code $WEB_SECRET)
+r=$(web_post /settings --data-urlencode "csrf=$C" --data-urlencode "inbound.deny_from=192.0.2.50" --data-urlencode "code=$code")
+case "$r" in *"ok=saved"*) ok "a setting saved from the web";; *) fail "web settings: $r";; esac
+thorn firewall show | grep -q "192.0.2.50" && ok "and applied to the firewall at once" || fail "setting applied"
+thorn config set inbound.deny_from "" >/dev/null && ! hub grep -q "192.0.2.50" /etc/blackthorn/config.toml && ok "thorn config set empties a list" || fail "config set"
+hub env SSH_CONNECTION="192.0.2.9 50000 $HUB 22" /usr/local/bin/thorn config set inbound.admin_from 192.0.2.77 2>&1 | grep -q "lock you out" && ok "the command line refuses to lock out its SSH user too" || fail "CLI lock-out guard"
+
 say "block cuts a machine off now, and lifts itself"
 thorn host block t1 --for 70s --reason test >/dev/null
 expect_reach 10 t1-claude t1 FAIL

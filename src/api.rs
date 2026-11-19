@@ -149,6 +149,11 @@ pub enum Op {
         keys: Vec<String>,
         code: String,
     },
+    ConfigShow,
+    ConfigSet {
+        changes: Vec<(String, String)>,
+        code: String,
+    },
 }
 
 impl Op {
@@ -169,6 +174,7 @@ impl Op {
                 | Op::Overview
                 | Op::SpaceScreen { .. }
                 | Op::HostPubkey { .. }
+                | Op::ConfigShow
         )
     }
 
@@ -179,7 +185,8 @@ impl Op {
             | Op::HostAdd { code, .. }
             | Op::HostRm { code, .. }
             | Op::HostRescanConfirm { code, .. }
-            | Op::HostMove { code, .. } => Some(code),
+            | Op::HostMove { code, .. }
+            | Op::ConfigSet { code, .. } => Some(code),
             _ => None,
         }
     }
@@ -596,6 +603,18 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
             keys,
             ..
         } => json(ops::host_move(&name, &target, port, &keys, client)?),
+        Op::ConfigShow => json(ops::config_show()?),
+        Op::ConfigSet { changes, .. } => {
+            let r = ops::config_set(&changes, client, true)?;
+            if r.web_moved.is_some() {
+                // After this answer has gone back through the web process.
+                std::thread::spawn(|| {
+                    std::thread::sleep(Duration::from_secs(2));
+                    let _ = sys::systemctl(&["try-restart", crate::units::WEB]);
+                });
+            }
+            json(r)
+        }
     }
 }
 
@@ -693,6 +712,11 @@ pub fn all_op_names() -> Vec<String> {
             keys: vec![],
             code: s(),
         },
+        Op::ConfigShow,
+        Op::ConfigSet {
+            changes: vec![],
+            code: s(),
+        },
     ];
     for op in &all {
         match op {
@@ -722,7 +746,9 @@ pub fn all_op_names() -> Vec<String> {
             | Op::HostRescan { .. }
             | Op::HostRescanConfirm { .. }
             | Op::HostMoveScan { .. }
-            | Op::HostMove { .. } => {}
+            | Op::HostMove { .. }
+            | Op::ConfigShow
+            | Op::ConfigSet { .. } => {}
         }
     }
     all.iter().map(Op::name).collect()

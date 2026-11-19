@@ -3,6 +3,7 @@
 mod api;
 mod apply;
 mod config;
+mod config_cmd;
 mod ctx;
 mod firewall;
 mod harden;
@@ -135,6 +136,9 @@ enum Cmd {
     /// Let one space reach another space's machine for a while.
     #[command(subcommand)]
     Bridge(BridgeCmd),
+    /// Show or change the settings the web UI can change too.
+    #[command(subcommand)]
+    Config(ConfigCmd),
     /// Manage the machines spaces work on.
     #[command(subcommand)]
     Host(HostCmd),
@@ -181,6 +185,15 @@ enum BridgeCmd {
     Rm { from: String, to: String },
     /// List bridges.
     Ls,
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// The settings and their values.
+    Show,
+    /// Change one, e.g. `thorn config set inbound.admin_from "100.64.0.2, 100.64.0.3"`.
+    /// An empty value empties a list.
+    Set { key: String, value: String },
 }
 
 #[derive(Subcommand)]
@@ -348,6 +361,10 @@ fn run(cli: Cli) -> Result<()> {
             key,
             no_enter,
         } => s::send(&name, text.as_deref(), key.as_deref(), no_enter),
+        Cmd::Config(c) => match c {
+            ConfigCmd::Show => config_cmd::show(),
+            ConfigCmd::Set { key, value } => config_cmd::set(&key, &value),
+        },
         Cmd::Bridge(b) => match b {
             BridgeCmd::Add {
                 from,
@@ -499,6 +516,8 @@ mod tests {
             ("host_rescan_confirm", &["host", "rescan"]),
             ("host_move_scan", &["host", "set-address"]),
             ("host_move", &["host", "set-address"]),
+            ("config_show", &["config", "show"]),
+            ("config_set", &["config", "set"]),
         ];
         // Operations that exist only because of the web: sessions.
         let web_only = ["web_config", "login", "logout", "whoami"];

@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.svg" width="96" height="96" alt=""></p>
+
 # blackthorn
 
 blackthorn turns one small, isolated machine into the place where your AI
@@ -5,7 +7,7 @@ coding agents live. They keep running there, you reach them from your phone
 or laptop, and each one can work on exactly one of your machines, over SSH,
 one way only.
 
-Status: **early (v0.2)**. It works and is tested end to end, but expect
+Status: **early (v0.3)**. It works and is tested end to end, but expect
 changes. Read [THREAT_MODEL.md](THREAT_MODEL.md) before trusting it with
 anything important.
 
@@ -158,18 +160,19 @@ login and code.
 It is plain HTTP. On install it listens on the hub's tailnet address when
 Tailscale is up, where WireGuard already encrypts the traffic and no domain
 or certificate is needed. Without Tailscale it listens on every address;
-then narrow it down, and limit who may connect at all:
+then narrow it down, and limit who may connect at all, on the
+**Settings** page or from the command line:
 
 ```sh
-# /etc/blackthorn/config.toml
-[web]
-listen = ["100.64.0.10:7180"]      # the hub's tailnet address
-
-[inbound]
-admin_from = ["100.64.0.2", "100.64.0.3"]   # your laptop and phone
-
-sudo thorn apply
+sudo thorn config set web.listen 100.64.0.10:7180                 # the hub's tailnet address
+sudo thorn config set inbound.admin_from "100.64.0.2, 100.64.0.3"  # your laptop and phone
+sudo thorn config show
 ```
+
+Settings changes are written to `/etc/blackthorn/config.toml` (its comments
+stay) and applied at once. On the web they need a fresh code, and a change
+that would shut out the device you are using is refused. Everything else in
+the file is edited by hand, followed by `sudo thorn apply`.
 
 More accounts: `sudo thorn web user add NAME`. Turn the web UI off with
 `sudo thorn web disable`; the command line keeps working.
@@ -207,6 +210,7 @@ restores the old settings at any time.
 | `thorn host set-address NAME USER@IP [--port P]` | Move a machine to a new address (e.g. LAN to tailnet); its spaces stay |
 | `thorn host block NAME [--for 30m] [--reason R]` / `host unblock` | Cut a machine off from every space |
 | `thorn web enable\|disable` / `web user add\|rm\|ls\|passwd\|totp-reset` | The web UI and its accounts |
+| `thorn config show` / `config set KEY VALUE` | The settings the web UI can change: admin devices, never_manage, web address, ... |
 | `thorn harden ssh --totp\|--fido` / `harden confirm\|undo` | Two-factor SSH to the hub |
 | `thorn firewall show [--planned]` / `firewall apply` | Inspect or reload the rules |
 | `thorn apply` | Rewrite all generated files and reload everything |
@@ -278,8 +282,9 @@ reach that machine). Give the hub a fixed LAN address (a DHCP reservation),
 since the key lines depend on it. To move to a tailnet later:
 
 1. Join the hub (and the machines) to the tailnet, as above.
-2. In `/etc/blackthorn/config.toml`, set `web.listen` to the hub's tailnet
-   address and `inbound.admin_from` to your devices; run `sudo thorn apply`.
+2. On the Settings page (or with `sudo thorn config set`), set `web.listen`
+   to the hub's tailnet address and `inbound.admin_from` to your devices'
+   tailnet addresses.
 3. For each machine: `sudo thorn host set-address fig root@100.80.0.3`
    (or *Address* on its page in the web UI), and replace its line in
    `authorized_keys` with the new one it prints.

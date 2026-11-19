@@ -10,7 +10,10 @@
 use crate::api::{self, Op, Request, Response};
 use crate::http;
 use crate::map::{self, esc};
-use crate::ops::{Action, BridgeView, HostView, NewSpace, Overview, Scan, SpaceView, SPECIAL_KEYS};
+use crate::ops::{
+    Action, BridgeView, ConfigChange, HostView, NewSpace, Overview, Scan, Setting, SpaceView,
+    SPECIAL_KEYS,
+};
 use crate::webauth::url_encode;
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
@@ -211,6 +214,7 @@ fn route(
     match (method, path) {
         ("GET", "/static/app.css") => return Reply::Asset("text/css; charset=utf-8", CSS),
         ("GET", "/static/app.js") => return Reply::Asset("text/javascript; charset=utf-8", JS),
+        ("GET", "/static/logo.svg") => return Reply::Asset("image/svg+xml", LOGO_FILE),
         ("GET", "/login") => return login_page(query.get("err").map(|s| s.as_str())),
         ("POST", "/login") => return login_post(form, client),
         _ => {}
@@ -311,6 +315,9 @@ fn route(
         ("GET", ["host", _]) => host_page(&c, &name, &flash),
         ("POST", ["host", _, action]) => host_post(&c, &name, action, form),
 
+        ("GET", ["settings"]) => settings_page(&c, &flash),
+        ("POST", ["settings"]) => settings_post(&c, form),
+
         ("GET", ["bridges"]) => bridges_page(&c, &flash),
         ("POST", ["bridges"]) => {
             let from = f(form, "from").to_string();
@@ -372,7 +379,7 @@ fn page(c: &Ctx, title: &str, body: &str, flash: &Flash) -> String {
     } else {
         format!(
             "<nav><a href=\"/\">Map</a><a href=\"/spaces\">Spaces</a><a href=\"/hosts\">Machines</a>\
-             <a href=\"/bridges\">Bridges</a></nav><form method=\"post\" action=\"/logout\" class=\"logout\">\
+             <a href=\"/bridges\">Bridges</a><a href=\"/settings\">Settings</a></nav><form method=\"post\" action=\"/logout\" class=\"logout\">\
              {}<button class=\"link\">Log out {}</button></form>",
             csrf(c),
             esc(&c.user)
@@ -382,12 +389,27 @@ fn page(c: &Ctx, title: &str, body: &str, flash: &Flash) -> String {
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <title>{} · blackthorn</title><link rel=\"stylesheet\" href=\"/static/app.css\">\
+         <link rel=\"icon\" href=\"/static/logo.svg\" type=\"image/svg+xml\">\
          <script src=\"/static/app.js\" defer></script></head><body>\
-         <header class=\"top\"><a class=\"brand\" href=\"/\">blackthorn</a>{nav}</header>\
+         <header class=\"top\"><a class=\"brand\" href=\"/\">{LOGO}blackthorn</a>\
+         <span class=\"version\" title=\"blackthorn version\">v{VERSION}</span>{nav}</header>\
          <main>{fl}{body}</main></body></html>",
         esc(title)
     )
 }
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The logo inline (colored by the stylesheet), and as a file (favicon).
+const LOGO: &str = "<svg class=\"logo\" viewBox=\"0 0 32 32\" width=\"22\" height=\"22\" aria-hidden=\"true\">\
+    <path class=\"logo-stem\" d=\"M5 27 L22.2 9.8\" stroke-width=\"2.6\" stroke-linecap=\"round\" fill=\"none\"/>\
+    <path class=\"logo-thorn\" d=\"M20.9 8.4 L23.6 11.1 L29 3 Z\"/>\
+    <path class=\"logo-thorn\" d=\"M8.9 23.1 L11.6 20.4 L6.6 15.6 Z\"/>\
+    <path class=\"logo-thorn\" d=\"M14.9 17.1 L17.6 14.4 L23 19.4 Z\"/>\
+    <path class=\"logo-stem\" d=\"M18.4 13.6 Q16.6 11 14.9 11.8\" stroke-width=\"1.4\" stroke-linecap=\"round\" fill=\"none\"/>\
+    <circle class=\"logo-berry\" cx=\"12\" cy=\"9.6\" r=\"4.8\"/>\
+    <circle class=\"logo-bloom\" cx=\"10.4\" cy=\"8\" r=\"1.3\"/></svg>";
+const LOGO_FILE: &str = include_str!("../assets/logo.svg");
 
 fn csrf(c: &Ctx) -> String {
     format!(
@@ -1218,6 +1240,96 @@ fn host_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>) 
         },
         _ => back(&here, Err("unknown action".into())),
     }
+}
+
+fn settings_page(c: &Ctx, flash: &Flash) -> Reply {
+    let settings = match get::<Vec<Setting>>(c, Op::ConfigShow) {
+        Ok(s) => s,
+        Err(e) => {
+            return Reply::Html(
+                500,
+                page(c, "Settings", &format!("<pre>{}</pre>", esc(&e)), flash),
+            )
+        }
+    };
+    let mut fields = String::new();
+    for s in &settings {
+        let input = if s.key == "egress.https_anywhere" {
+            let on = s.value == "true";
+            format!(
+                "<select name=\"{k}\"><option value=\"true\"{}>true</option><option value=\"false\"{}>false</option></select>",
+                if on { " selected" } else { "" },
+                if on { "" } else { " selected" },
+                k = esc(&s.key)
+            )
+        } else {
+            format!(
+                "<input name=\"{}\" value=\"{}\" placeholder=\"(empty)\">",
+                esc(&s.key),
+                esc(&s.value)
+            )
+        };
+        fields.push_str(&format!(
+            "<label><code>{}</code> {input}</label><p class=\"hint\">{}</p>",
+            esc(&s.key),
+            esc(&s.help)
+        ));
+    }
+    let you = c
+        .client
+        .map(|a| format!(" You are connected from <code>{a}</code>."))
+        .unwrap_or_default();
+    let b = format!(
+        "<h1>Settings</h1><section class=\"card\"><p class=\"hint\">Saved to <code>/etc/blackthorn/config.toml</code> \
+         and applied at once. Lists are addresses separated by commas.{you} A change that would shut you out is \
+         refused.</p><form method=\"post\" action=\"/settings\" class=\"stack\">{}{fields}{}\
+         <button class=\"primary\">Save</button></form></section>",
+        csrf(c),
+        code_field()
+    );
+    Reply::Html(200, page(c, "Settings", &b, flash))
+}
+
+fn settings_post(c: &Ctx, form: &HashMap<String, String>) -> Reply {
+    let current = match get::<Vec<Setting>>(c, Op::ConfigShow) {
+        Ok(s) => s,
+        Err(e) => return back("/settings", Err(e)),
+    };
+    // Only what was changed, so the rest of the file stays as it is.
+    let norm = |v: &str| {
+        v.split(|ch: char| ch == ',' || ch.is_whitespace())
+            .filter(|x| !x.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let changes: Vec<(String, String)> = current
+        .iter()
+        .filter_map(|s| {
+            let v = form.get(&s.key)?;
+            (norm(v) != norm(&s.value)).then(|| (s.key.clone(), v.clone()))
+        })
+        .collect();
+    if changes.is_empty() {
+        return back("/settings", Ok("nothing changed".into()));
+    }
+    let r = get::<ConfigChange>(
+        c,
+        Op::ConfigSet {
+            changes,
+            code: f(form, "code").into(),
+        },
+    );
+    back(
+        "/settings",
+        r.map(|r| match r.web_moved {
+            Some(urls) => format!(
+                "saved {}; the web UI moves to {} in a few seconds",
+                r.changed.join(", "),
+                urls.join(" ")
+            ),
+            None => format!("saved {}", r.changed.join(", ")),
+        }),
+    )
 }
 
 fn bridges_page(c: &Ctx, flash: &Flash) -> Reply {

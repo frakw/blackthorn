@@ -8,10 +8,10 @@ use crate::ctx::{self, Ctx};
 use crate::state::{
     now, validate_name, validate_rc_name, Block, Bridge, Host, Mode, Os, Space, State,
 };
-use crate::{keys, paths, render, sys, units};
-use anyhow::{bail, Context, Result};
+use crate::{apply, keys, paths, render, sys, units};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
@@ -1032,9 +1032,320 @@ pub fn ssh_client() -> Option<IpAddr> {
         .ok()
 }
 
+// ------------------------------------------------------------- settings
+
+/// The settings the web UI and `thorn config` can change, with what they
+/// mean. Everything else stays in config.toml.
+pub const SETTINGS: &[(&str, &str)] = &[
+    (
+        "inbound.admin_from",
+        "Your devices: only these addresses may connect to the hub's SSH and web UI. \
+         Empty: anything that can reach the hub may try.",
+    ),
+    (
+        "never_manage",
+        "Machines blackthorn must never manage, such as your tailnet's control server. \
+         Their connections to the hub are dropped.",
+    ),
+    (
+        "inbound.deny_from",
+        "More addresses whose connections to the hub are always dropped.",
+    ),
+    (
+        "web.listen",
+        "Where the web UI listens, as address:port, e.g. the hub's tailnet address :7180.",
+    ),
+    (
+        "ssh_from",
+        "The hub's own addresses for from=\"...\" in key lines. Empty: found for each machine.",
+    ),
+    (
+        "egress.https_anywhere",
+        "Spaces may open HTTPS to any address (true or false). Claude Code needs it.",
+    ),
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Setting {
+    pub key: String,
+    pub value: String,
+    pub help: String,
+}
+
+pub fn config_show() -> Result<Vec<Setting>> {
+    sys::require_root()?;
+    let (cfg, _) = ctx::read_only()?;
+    Ok(SETTINGS
+        .iter()
+        .map(|(k, h)| Setting {
+            key: k.to_string(),
+            value: setting_value(&cfg, k),
+            help: h.to_string(),
+        })
+        .collect())
+}
+
+fn setting_value(cfg: &Config, key: &str) -> String {
+    fn list<T: ToString>(v: &[T]) -> String {
+        v.iter()
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+    match key {
+        "inbound.admin_from" => list(&cfg.inbound.admin_from),
+        "never_manage" => list(&cfg.never_manage),
+        "inbound.deny_from" => list(&cfg.inbound.deny_from),
+        "web.listen" => list(&cfg.web.listen),
+        "ssh_from" => list(&cfg.ssh_from),
+        "egress.https_anywhere" => cfg.egress.https_anywhere.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Addresses separated by commas or spaces; empty is an empty list.
+fn parse_list<T: std::str::FromStr>(key: &str, value: &str) -> Result<Vec<T>>
+where
+    T::Err: std::fmt::Display,
+{
+    value
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<T>().map_err(|e| anyhow!("{key}: {s:?}: {e}")))
+        .collect()
+}
+
+fn toml_list<T: ToString>(v: &[T]) -> toml_edit::Item {
+    let mut a = toml_edit::Array::new();
+    for x in v {
+        a.push(x.to_string());
+    }
+    toml_edit::value(a)
+}
+
+/// What a settings change did.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConfigChange {
+    pub changed: Vec<String>,
+    /// The web UI's new addresses, when it moved (it restarts on them).
+    pub web_moved: Option<Vec<String>>,
+}
+
+/// Changes settings (`key`, `value` pairs) in config.toml, keeping its
+/// comments, and applies them. Refused if it would lock out `client` (the
+/// address of whoever asks) or make a managed machine an admin device.
+/// `from_web`: the web UI may not turn itself off.
+pub fn config_set(
+    changes: &[(String, String)],
+    client: Option<IpAddr>,
+    from_web: bool,
+) -> Result<ConfigChange> {
+    let ctx = Ctx::open()?;
+    let text = std::fs::read_to_string(paths::CONFIG_FILE).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| format!("reading {}", paths::CONFIG_FILE))?;
+    let mut cfg = ctx.cfg.clone();
+    let mut out = ConfigChange::default();
+    for (key, value) in changes {
+        let value = value.trim();
+        match key.as_str() {
+            "inbound.admin_from" => {
+                cfg.inbound.admin_from = parse_list(key, value)?;
+                doc["inbound"]["admin_from"] = toml_list(&cfg.inbound.admin_from);
+            }
+            "never_manage" => {
+                cfg.never_manage = parse_list(key, value)?;
+                doc["never_manage"] = toml_list(&cfg.never_manage);
+            }
+            "inbound.deny_from" => {
+                cfg.inbound.deny_from = parse_list(key, value)?;
+                doc["inbound"]["deny_from"] = toml_list(&cfg.inbound.deny_from);
+            }
+            "web.listen" => {
+                cfg.web.listen = parse_list::<SocketAddr>(key, value)?;
+                doc["web"]["listen"] = toml_list(&cfg.web.listen);
+            }
+            "ssh_from" => {
+                cfg.ssh_from = parse_list(key, value)?;
+                doc["ssh_from"] = toml_list(&cfg.ssh_from);
+            }
+            "egress.https_anywhere" => {
+                cfg.egress.https_anywhere = match value {
+                    "true" | "yes" | "on" => true,
+                    "false" | "no" | "off" => false,
+                    _ => bail!("{key} is true or false, not {value:?}"),
+                };
+                doc["egress"]["https_anywhere"] = toml_edit::value(cfg.egress.https_anywhere);
+            }
+            _ => bail!("unknown setting {key:?}; `thorn config show` lists them"),
+        }
+        if !out.changed.contains(key) {
+            out.changed.push(key.clone());
+        }
+    }
+    check_settings(&cfg, &ctx.state, client, from_web, &local_addresses())?;
+    let new_text = doc.to_string();
+    let parsed: Config = toml::from_str(&new_text)
+        .with_context(|| format!("the change would break {}", paths::CONFIG_FILE))?;
+    if parsed != cfg {
+        bail!(
+            "the change was not written as expected; edit {} by hand",
+            paths::CONFIG_FILE
+        );
+    }
+    sys::write_file(Path::new(paths::CONFIG_FILE), &new_text, 0o644, None)?;
+    apply::firewall_rules(&cfg, &ctx.state, ctx.now, true)?;
+    apply::everything(&cfg, &ctx.state, ctx.now)?;
+    if cfg.web.listen != ctx.cfg.web.listen {
+        out.web_moved = Some(
+            cfg.web
+                .listen
+                .iter()
+                .map(|a| format!("http://{a}/"))
+                .collect(),
+        );
+    }
+    Ok(out)
+}
+
+fn check_settings(
+    cfg: &Config,
+    state: &State,
+    client: Option<IpAddr>,
+    from_web: bool,
+    local: &[IpAddr],
+) -> Result<()> {
+    for (n, h) in &state.hosts {
+        if cfg.inbound.admin_from.contains(&h.address) {
+            bail!(
+                "{} is machine {n}: a managed machine must never be able to reach the hub, \
+                 so it cannot be an admin device",
+                h.address
+            );
+        }
+        if cfg.never_manage.contains(&h.address) {
+            bail!(
+                "{} is machine {n}, which blackthorn manages; remove it first (thorn host rm {n})",
+                h.address
+            );
+        }
+    }
+    if let Some(c) = client {
+        let shut_out = (!cfg.inbound.admin_from.is_empty() && !cfg.inbound.admin_from.contains(&c))
+            || cfg.inbound.deny_from.contains(&c)
+            || cfg.never_manage.contains(&c);
+        if shut_out {
+            bail!(
+                "this would lock you out: you are connected from {c}, which would no longer be \
+                 let in. Add {c} to inbound.admin_from, or make this change from the hub's console"
+            );
+        }
+    }
+    if from_web && cfg.web.listen.is_empty() {
+        bail!("the web UI cannot turn itself off; use `sudo thorn web disable` on the hub");
+    }
+    if !local.is_empty() {
+        for a in &cfg.web.listen {
+            if !a.ip().is_unspecified() && !local.contains(&a.ip()) {
+                bail!(
+                    "{} is not an address of this machine; the web UI could not listen there",
+                    a.ip()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// This machine's own addresses (empty if `ip` cannot tell).
+fn local_addresses() -> Vec<IpAddr> {
+    sys::output("ip", &["-o", "addr", "show"])
+        .map(|o| parse_ip_addr(&o))
+        .unwrap_or_default()
+}
+
+fn parse_ip_addr(out: &str) -> Vec<IpAddr> {
+    out.lines()
+        .filter_map(|l| {
+            let w: Vec<&str> = l.split_whitespace().collect();
+            let i = w.iter().position(|x| *x == "inet" || *x == "inet6")?;
+            w.get(i + 1)?.split('/').next()?.parse().ok()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setting_checks() {
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let mut state = State::default();
+        state.hosts.insert(
+            "fig".into(),
+            Host {
+                address: ip("100.80.0.3"),
+                port: 22,
+                user: "root".into(),
+                host_keys: vec![],
+                os: Os::Linux,
+                block: None,
+            },
+        );
+        let local = [ip("127.0.0.1"), ip("100.64.0.10")];
+        let me = Some(ip("100.64.0.2"));
+        let mut cfg = Config::default();
+        assert!(check_settings(&cfg, &state, me, true, &local).is_ok());
+        cfg.inbound.admin_from = vec![ip("100.64.0.5")];
+        let e = check_settings(&cfg, &state, me, true, &local).unwrap_err();
+        assert!(e.to_string().contains("lock you out"), "{e}");
+        assert!(check_settings(&cfg, &state, None, false, &local).is_ok());
+        cfg.inbound.admin_from = vec![ip("100.64.0.2"), ip("100.80.0.3")];
+        assert!(check_settings(&cfg, &state, me, true, &local).is_err());
+        cfg.inbound.admin_from = vec![ip("100.64.0.2")];
+        cfg.never_manage = vec![ip("100.80.0.3")];
+        assert!(check_settings(&cfg, &state, me, true, &local).is_err());
+        cfg.never_manage = vec![];
+        cfg.web.listen = vec!["100.64.0.10:7180".parse().unwrap()];
+        assert!(check_settings(&cfg, &state, me, true, &local).is_ok());
+        cfg.web.listen = vec!["100.64.0.99:7180".parse().unwrap()];
+        assert!(check_settings(&cfg, &state, me, true, &local).is_err());
+        cfg.web.listen = vec![];
+        assert!(check_settings(&cfg, &state, me, true, &local).is_err());
+        assert!(check_settings(&cfg, &state, me, false, &local).is_ok());
+    }
+
+    #[test]
+    fn lists_and_addresses() {
+        let v: Vec<IpAddr> = parse_list("k", "100.64.0.2, 100.64.0.3 ,fd7a::1").unwrap();
+        assert_eq!(v.len(), 3);
+        assert!(parse_list::<IpAddr>("k", "").unwrap().is_empty());
+        assert!(parse_list::<IpAddr>("k", "laptop").is_err());
+        let out = "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever\n\
+                   2: ens18    inet 192.168.10.106/24 brd 192.168.10.255 scope global ens18\n\
+                   3: tailscale0    inet6 fd7a:115c:a1e0::1/128 scope global\n";
+        let a = parse_ip_addr(out);
+        assert_eq!(a.len(), 3);
+        assert!(a.contains(&"192.168.10.106".parse().unwrap()));
+    }
+
+    #[test]
+    fn settings_keep_comments() {
+        let text = "# mine\nnever_manage = []\n\n[inbound]\n# my devices\nadmin_from = []\n";
+        let mut doc: toml_edit::DocumentMut = text.parse().unwrap();
+        doc["inbound"]["admin_from"] = toml_list(&["100.64.0.2".parse::<IpAddr>().unwrap()]);
+        doc["web"]["listen"] = toml_list(&["0.0.0.0:7180".parse::<SocketAddr>().unwrap()]);
+        let out = doc.to_string();
+        assert!(out.contains("# my devices"), "{out}");
+        let c: Config = toml::from_str(&out).unwrap();
+        assert_eq!(
+            c.inbound.admin_from,
+            vec!["100.64.0.2".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(c.web.listen.len(), 1);
+    }
 
     #[test]
     fn route_sources() {

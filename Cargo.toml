@@ -1,6 +1,6 @@
 [package]
 name = "blackthorn"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "An isolated hub where AI coding agents keep running and work on your machines over SSH, one way only."
 license = "MIT"
@@ -28,6 +28,7 @@ serde_json = "1.0.154"
 sha1 = "0.10.7"
 subtle = "2.6.1"
 toml = "0.8"
+toml_edit = "0.22"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
