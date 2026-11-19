@@ -16,7 +16,8 @@ jobs:
       # Failures also become annotations (readable on the run page without
       # the full log).
       - name: fmt
-        run: cargo fmt --check || { echo "::error::cargo fmt --check: run cargo fmt"; exit 1; }
+        run: |
+          cargo fmt --check || { echo "::error::cargo fmt --check failed; run cargo fmt"; exit 1; }
       - name: clippy
         run: |
           cargo clippy --all-targets --message-format=short -- -D warnings 2>&1 | tee clippy.log
