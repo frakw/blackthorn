@@ -319,3 +319,8 @@ ol.steps li { margin-bottom: 12px; }
   input, select, button, .btn { font-size: 16px; } /* no zoom-in on focus (iOS) */
   input.code { max-width: none; }
 }
+
+/* "or use a passkey" next to code fields, and passkey login. */
+.passkey-step { align-self: flex-start; font-size: 13px; color: var(--accent) !important; margin-top: 2px; }
+.passkey-login { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
+.passkey-login[hidden] { display: none; }

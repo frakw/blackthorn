@@ -52,3 +52,27 @@ jobs:
           s=${PIPESTATUS[0]}
           grep -E 'FAIL:|^error' e2e.log | head -10 | sed 's/^/::error::/' || true
           exit $s
+
+  # The same static builds as a release, so a tag never finds them broken.
+  musl:
+    runs-on: ubuntu-24.04
+    needs: check
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch }}-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+      - name: build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          cargo build --release --locked --target ${{ matrix.arch }}-unknown-linux-musl 2>&1 | tee build.log
+          s=${PIPESTATUS[0]}
+          grep -E '^error|error:' build.log | head -10 | sed 's/^/::error::/' || true
+          exit $s

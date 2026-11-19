@@ -25,23 +25,77 @@ const CSS: &str = include_str!("assets/app.css");
 const JS: &str = include_str!("assets/app.js");
 const COOKIE: &str = "bt_session";
 
-pub fn serve() -> Result<()> {
+/// What the API tells the web process at start: where to listen, and the
+/// certificate for HTTPS.
+fn web_config() -> Result<(Vec<SocketAddr>, Option<crate::tls::Material>)> {
     let cfg = api::call(&Request {
         token: None,
         csrf: None,
         client: None,
         op: Op::WebConfig,
     })?;
+    if !cfg.ok {
+        anyhow::bail!("{}", cfg.error.unwrap_or_default());
+    }
     let listen: Vec<SocketAddr> =
         serde_json::from_value(cfg.data.get("listen").cloned().unwrap_or_default())
             .context("reading the web config from the API")?;
+    let tls = serde_json::from_value(cfg.data.get("tls").cloned().unwrap_or_default())
+        .context("reading the TLS settings from the API")?;
+    Ok((listen, tls))
+}
+
+/// Served over HTTPS (so passkeys can be offered).
+static HTTPS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn https() -> bool {
+    HTTPS.get().copied().unwrap_or(false)
+}
+
+pub fn serve() -> Result<()> {
+    let (listen, material) = web_config()?;
+    let _ = HTTPS.set(material.is_some());
     if listen.is_empty() {
         anyhow::bail!("web.listen is empty in /etc/blackthorn/config.toml");
     }
+    let tls: Option<http::Tls> = match &material {
+        Some(m) => Some(std::sync::Arc::new(std::sync::RwLock::new(
+            http::tls_config(&m.cert, &m.key)?,
+        ))),
+        None => None,
+    };
+    // A renewed certificate is picked up within ten minutes.
+    if let (Some(tls), Some(mut current)) = (tls.clone(), material.clone()) {
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(600));
+            let Ok((_, Some(m))) = web_config() else {
+                continue;
+            };
+            if m == current {
+                continue;
+            }
+            match http::tls_config(&m.cert, &m.key) {
+                Ok(c) => {
+                    *tls.write().expect("tls lock") = c;
+                    eprintln!("blackthorn web: certificate renewed");
+                    current = m;
+                }
+                Err(e) => eprintln!("blackthorn web: the new certificate is not usable: {e:#}"),
+            }
+        });
+    }
     let mut handles = Vec::new();
     for addr in listen {
-        eprintln!("blackthorn web: listening on http://{addr}/");
-        handles.push(std::thread::spawn(move || http::serve(addr, handle)));
+        match &material {
+            Some(m) => eprintln!(
+                "blackthorn web: listening on {addr} for https://{}:{}/",
+                m.name,
+                addr.port()
+            ),
+            None => eprintln!("blackthorn web: listening on http://{addr}/"),
+        }
+        let tls = tls.clone();
+        handles.push(std::thread::spawn(move || http::serve(addr, tls, handle)));
     }
     for h in handles {
         match h.join() {
@@ -62,10 +116,13 @@ struct Ctx {
     user: String,
     /// The page's path, to mark where you are in the menu.
     path: String,
+    /// The account can step up with a passkey (on HTTPS).
+    passkey: bool,
 }
 
 enum Reply {
     Html(u16, String),
+    Json(u16, String),
     Text(String),
     Svg(String),
     Asset(&'static str, &'static str),
@@ -74,6 +131,7 @@ enum Reply {
 
 fn handle(req: http::Request) -> http::Response {
     let client = Some(req.remote);
+    let secure = req.secure;
     let method = if req.method == "HEAD" {
         "GET"
     } else {
@@ -105,6 +163,10 @@ fn handle(req: http::Request) -> http::Response {
             add("Content-Type", "text/html; charset=utf-8");
             (code, html.into_bytes())
         }
+        Reply::Json(code, j) => {
+            add("Content-Type", "application/json");
+            (code, j.into_bytes())
+        }
         Reply::Text(t) => {
             add("Content-Type", "text/plain; charset=utf-8");
             (200, t.into_bytes())
@@ -120,7 +182,11 @@ fn handle(req: http::Request) -> http::Response {
         Reply::Redirect(to, set_cookie) => {
             add("Location", &to);
             if let Some(c) = set_cookie {
-                add("Set-Cookie", &c);
+                // Over HTTPS the browser must never send it over plain HTTP.
+                add(
+                    "Set-Cookie",
+                    &if secure { format!("{c}; Secure") } else { c },
+                );
             }
             (303, Vec::new())
         }
@@ -220,6 +286,10 @@ fn route(
         ("GET", "/static/logo.svg") => return Reply::Asset("image/svg+xml", LOGO_FILE),
         ("GET", "/login") => return login_page(query.get("err").map(|s| s.as_str())),
         ("POST", "/login") => return login_post(form, client),
+        ("POST", "/login/passkey") => return passkey_login_post(form, client),
+        ("POST", "/passkey/begin") if f(form, "purpose") == "login" => {
+            return passkey_begin(None, client, "login")
+        }
         _ => {}
     }
 
@@ -230,6 +300,7 @@ fn route(
         csrf: String::new(),
         user: String::new(),
         path: path.to_string(),
+        passkey: false,
     };
     if c.token.is_none() {
         return Reply::Redirect("/login".into(), None);
@@ -238,6 +309,7 @@ fn route(
         Ok(v) => {
             c.user = v["user"].as_str().unwrap_or("").to_string();
             c.csrf = v["csrf"].as_str().unwrap_or("").to_string();
+            c.passkey = v["passkey"].as_bool().unwrap_or(false);
         }
         Err(_) => return Reply::Redirect("/login".into(), Some(clear_cookie())),
     }
@@ -378,6 +450,8 @@ fn route(
                 .map(|_| "test sent; it should be on your phone".into()),
         ),
 
+        ("POST", ["passkey", "begin"]) => passkey_begin(Some(&c), client, f(form, "purpose")),
+
         ("GET", ["account"]) => account_page(&c, &flash),
         ("POST", ["account", action]) => account_post(&c, action, form),
 
@@ -492,10 +566,11 @@ fn page_with(c: &Ctx, title: &str, body: &str, flash: &Flash, head: &str) -> Str
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <title>{} · blackthorn</title><link rel=\"stylesheet\" href=\"/static/app.css\">\
          <link rel=\"icon\" href=\"/static/logo.svg\" type=\"image/svg+xml\">{head}\
-         <script src=\"/static/app.js\" defer></script></head><body>\
+         <script src=\"/static/app.js\" defer></script></head><body{}>\
          <header class=\"top\"><div class=\"bar\"><a class=\"brand\" href=\"/\">{LOGO}blackthorn</a>\
          <span class=\"version\" title=\"blackthorn version\">v{VERSION}</span></div>{nav}</header>\
          <main>{fl}{body}</main></body></html>",
+        if c.passkey { " data-passkey=\"1\"" } else { "" },
         esc(title)
     )
 }
@@ -587,8 +662,16 @@ fn login_page(err: Option<&str>) -> Reply {
         csrf: String::new(),
         user: String::new(),
         path: "/login".into(),
+        passkey: false,
     };
-    let body = "<section class=\"card narrow\"><h1>Log in</h1>\
+    let passkey = if https() {
+        "<div class=\"passkey-login\" hidden><button type=\"button\" class=\"primary\" data-passkey-login>Log in with a passkey</button>\
+         <p class=\"hint\">or with your password and authenticator code:</p></div>\
+         <form method=\"post\" action=\"/login/passkey\" id=\"passkey-login\" hidden><input type=\"hidden\" name=\"answer\"></form>"
+    } else {
+        ""
+    };
+    let body = format!("<section class=\"card narrow\"><h1>Log in</h1>{passkey}\
         <form method=\"post\" action=\"/login\" class=\"stack\">\
         <label>Account <input name=\"user\" autocomplete=\"username\" required autofocus></label>\
         <label>Password <input name=\"password\" type=\"password\" autocomplete=\"current-password\" required></label>\
@@ -596,16 +679,52 @@ fn login_page(err: Option<&str>) -> Reply {
         <button class=\"primary\">Log in</button>\
         <p class=\"hint\">Lost your phone? A recovery code works in place of the authenticator code.</p>\
         <p class=\"hint\">No account yet? On the hub, run <code>sudo thorn web user add &lt;name&gt;</code>.</p>\
-        </form></section>";
+        </form></section>");
     let flash = Flash {
         ok: None,
         err: err.map(String::from),
     };
-    Reply::Html(200, page(&c, "Log in", body, &flash))
+    Reply::Html(200, page(&c, "Log in", &body, &flash))
+}
+
+/// A WebAuthn challenge for the page's script, as JSON.
+fn passkey_begin(c: Option<&Ctx>, client: Option<IpAddr>, purpose: &str) -> Reply {
+    let r = api::call(&Request {
+        token: c.and_then(|c| c.token.clone()),
+        csrf: c.map(|c| c.csrf.clone()),
+        client,
+        op: Op::PasskeyBegin {
+            purpose: purpose.into(),
+        },
+    });
+    match r {
+        Ok(r) if r.ok => Reply::Json(200, r.data.to_string()),
+        Ok(r) => Reply::Json(
+            400,
+            serde_json::json!({ "error": r.error.unwrap_or_default() }).to_string(),
+        ),
+        Err(e) => Reply::Json(
+            500,
+            serde_json::json!({ "error": format!("{e:#}") }).to_string(),
+        ),
+    }
+}
+
+fn passkey_login_post(form: &HashMap<String, String>, client: Option<IpAddr>) -> Reply {
+    let answer = match serde_json::from_str(f(form, "answer")) {
+        Ok(a) => a,
+        Err(_) => return Reply::Redirect("/login?err=no%20passkey%20answer".into(), None),
+    };
+    login_reply(api::call(&Request {
+        token: None,
+        csrf: None,
+        client,
+        op: Op::PasskeyLogin { answer },
+    }))
 }
 
 fn login_post(form: &HashMap<String, String>, client: Option<IpAddr>) -> Reply {
-    let r = api::call(&Request {
+    login_reply(api::call(&Request {
         token: None,
         csrf: None,
         client,
@@ -614,7 +733,10 @@ fn login_post(form: &HashMap<String, String>, client: Option<IpAddr>) -> Reply {
             password: f(form, "password").into(),
             code: f(form, "code").into(),
         },
-    });
+    }))
+}
+
+fn login_reply(r: Result<Response>) -> Reply {
     match r {
         Ok(r) if r.ok => {
             let token = r.data["token"].as_str().unwrap_or("").to_string();
@@ -839,6 +961,8 @@ fn spaces_page(c: &Ctx, flash: &Flash) -> Reply {
              <label>Agent <select name=\"agent\">{agents}</select></label></div>\
              <details class=\"more\"><summary>More options</summary><div class=\"stack\">\
              <label>Name <input name=\"name\" placeholder=\"machine-agent\"></label>\
+             <label>Claude: Remote Control name, as the Claude app lists it <input name=\"rc_name\" \
+             placeholder=\"machine-space\" pattern=\"[A-Za-z0-9_\\-][A-Za-z0-9_.\\-]*\" maxlength=\"64\"></label>\
              <label>Extra arguments for the agent <input name=\"args\" placeholder=\"--permission-mode acceptEdits\"></label>\
              <label class=\"check\"><input type=\"checkbox\" name=\"single\"> Claude: one conversation, also typed into on the terminal</label>\
              <label class=\"check\"><input type=\"checkbox\" name=\"local\"> Claude: no Remote Control (only from this hub)</label>\
@@ -1012,12 +1136,22 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
                 "primary",
             )
         };
+        let shown = if s.dir == s.rc_name {
+            format!("The Claude app lists it as <b>{}</b>.", esc(&s.dir))
+        } else {
+            format!(
+                "The Claude app lists it as <b>{}</b> (its folder's name, from before v0.6). \
+                 Give it a Remote Control name to change that.",
+                esc(&s.dir)
+            )
+        };
         b.push_str(&format!(
-            "<section class=\"card\"><h2>Remote Control</h2><p>{text}</p>\
-             <form method=\"post\" action=\"/space/{n}/remote\" class=\"inline\" data-confirm=\"{}? The space restarts.\">{}\
-             <input type=\"hidden\" name=\"on\" value=\"{on}\"><button class=\"{class}\">{label}</button></form></section>",
+            "<section class=\"card\"><h2>Remote Control</h2><p>{text}</p><p class=\"hint\">{shown}</p>\
+             <div class=\"buttons\"><form method=\"post\" action=\"/space/{n}/remote\" class=\"inline\" data-confirm=\"{}? The space restarts.\">{}\
+             <input type=\"hidden\" name=\"on\" value=\"{on}\"><button class=\"{class}\">{label}</button></form>{}</div></section>",
             esc(label),
-            csrf(c)
+            csrf(c),
+            rename_dialog(c, &format!("/space/{n}/rc-name"), "in the Claude app", "rc_name", &s.rc_name, "")
         ));
     }
     b.push_str(&format!(
@@ -1057,18 +1191,20 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
     for ch in &chats {
         let id = esc(&ch.id);
         let hidden = format!("<input type=\"hidden\" name=\"id\" value=\"{id}\">");
-        let side = if ch.main {
+        let side = if ch.main || ch.window {
             "<span class=\"badge\">running now</span>".to_string()
         } else {
-            let open = if one {
+            let confirm = if one {
+                "Continue this chat? The space restarts into it."
+            } else {
+                "Continue this chat? It runs next to the others and shows in the Claude app."
+            };
+            let open = {
                 format!(
                     "<form method=\"post\" action=\"/space/{n}/chat-open\" class=\"inline\" \
-                     data-confirm=\"Continue this chat? The space restarts into it.\">{}{hidden}\
-                     <button class=\"link\">Continue</button></form>",
+                     data-confirm=\"{confirm}\">{}{hidden}<button class=\"link\">Continue</button></form>",
                     csrf(c)
                 )
-            } else {
-                String::new()
             };
             format!(
                 "{open}<form method=\"post\" action=\"/space/{n}/chat-rm\" class=\"inline\" data-confirm=\"Delete the chat {}?\">{}\
@@ -1095,25 +1231,27 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
             ),
         ));
     }
-    let new_chat = if one {
-        format!(
-            "<form method=\"post\" action=\"/space/{n}/chat-new\" class=\"inline\" \
-             data-confirm=\"Start a new chat? The space restarts into it; the current one stays in this list.\">{}\
-             <button class=\"primary\">+ New chat</button></form>",
-            csrf(c)
+    let (confirm, how) = if one {
+        (
+            "Start a new chat? The space restarts into it; the current one stays in this list.".to_string(),
+            "This space runs one chat at a time: start a new one, or continue an earlier one, and the space restarts into it."
+                .to_string(),
         )
     } else {
-        String::new()
-    };
-    let how = if one {
-        "This space runs one chat at a time: start a new one, or continue an earlier one, and the space restarts into it."
-            .to_string()
-    } else {
-        format!(
-            "Start new chats in the Claude app or on claude.ai/code, in the environment <b>{}</b>.",
-            esc(&s.rc_name)
+        (
+            "Start a new chat? It runs next to the others and shows in the Claude app.".to_string(),
+            format!(
+                "Chats started here run next to the ones from the Claude app, and show there too (under <b>{}</b>). \
+                 They run until closed or the space stops.",
+                esc(&s.rc_name)
+            ),
         )
     };
+    let new_chat = format!(
+        "<form method=\"post\" action=\"/space/{n}/chat-new\" class=\"inline\" data-confirm=\"{confirm}\">{}\
+         <button class=\"primary\">+ New chat</button></form>",
+        csrf(c)
+    );
     format!(
         "<section class=\"card\" id=\"chats\"><div class=\"page-head\"><h2>Chats</h2>{new_chat}</div>\
          <p class=\"hint\">{how} Newest first. A new name also shows in Claude Code; deleting removes the hub's copy.</p>{}</section>",
@@ -1265,6 +1403,25 @@ fn space_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>)
                 }),
             )
         }
+        "rc-name" => back(
+            &here,
+            get::<bool>(
+                c,
+                Op::SpaceRename {
+                    old: name.into(),
+                    new: name.into(),
+                    rc_name: Some(f(form, "rc_name").trim().to_string()),
+                    code: f(form, "code").into(),
+                },
+            )
+            .map(|restarted| {
+                if restarted {
+                    "Remote Control name changed; the space restarted under it".into()
+                } else {
+                    "Remote Control name changed".into()
+                }
+            }),
+        ),
         "chat-rename" => back(
             &format!("{here}#chats"),
             get::<String>(
@@ -1289,7 +1446,9 @@ fn space_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>)
             )
             .map(|o| {
                 let what = if action == "chat-new" { "new chat started" } else { "back in that chat" };
-                if o.restarted {
+                if o.window {
+                    format!("{what}; open it in the Claude app")
+                } else if o.restarted {
                     format!("{what}; the space restarted into it")
                 } else {
                     format!("{what}; it runs when the space starts")
@@ -1850,11 +2009,55 @@ fn updating_page(c: &Ctx, tag: &str) -> Reply {
     )
 }
 
+fn passkeys_card(c: &Ctx, acct: &serde_json::Value) -> String {
+    if acct["https"].as_bool() != Some(true) {
+        return "<section class=\"card\" id=\"passkeys\"><h2>Passkeys and security keys</h2><p>They need the web UI on \
+                HTTPS, under a name such as <code>blackthorn.example.com</code>. On the hub: \
+                <code>sudo thorn web https --help</code>.</p></section>"
+            .to_string();
+    }
+    let now = crate::state::now();
+    let mut rows = String::new();
+    for p in acct["passkeys"].as_array().into_iter().flatten() {
+        let id = p["id"].as_str().unwrap_or("");
+        let added = p["added"].as_u64().unwrap_or(0);
+        rows.push_str(&format!(
+            "<li class=\"chat\"><div class=\"chat-main\"><span class=\"chat-title\">{}</span>\
+             <span class=\"item-meta\">added {}</span></div><div class=\"chat-actions\">\
+             <details class=\"pop\"><summary class=\"btn\">Remove</summary><form method=\"post\" action=\"/account/passkey-rm\" \
+             class=\"stack pop-body\">{}<input type=\"hidden\" name=\"id\" value=\"{}\"><h2>Remove passkey {}</h2>{}\
+             <div class=\"buttons\"><button class=\"danger\">Remove</button><button type=\"button\" class=\"link\" data-close hidden>Cancel</button></div>\
+             </form></details></div></li>",
+            esc(p["name"].as_str().unwrap_or("")),
+            ago(now.saturating_sub(added)),
+            csrf(c),
+            esc(id),
+            esc(p["name"].as_str().unwrap_or("")),
+            code_field()
+        ));
+    }
+    format!(
+        "<section class=\"card\" id=\"passkeys\"><h2>Passkeys and security keys</h2><p class=\"hint\">Log in with \
+         your phone's or computer's fingerprint, face or PIN, or a hardware key (with a PIN set), instead of the password \
+         and code; and confirm risky actions with it instead of a code.</p>{}\
+         <form method=\"post\" action=\"/account/passkey-add\" class=\"stack passkey-add\">{}\
+         <input type=\"hidden\" name=\"answer\"><label>Name <input name=\"name\" required maxlength=\"60\" \
+         placeholder=\"iPhone, YubiKey, ...\"></label>{}<p class=\"dialog-error t-bad\" hidden></p>\
+         <div><button class=\"primary\">Add a passkey</button></div><noscript>Adding a passkey needs JavaScript.</noscript>\
+         </form></section>",
+        if rows.is_empty() {
+            "<p>None yet.</p>".to_string()
+        } else {
+            format!("<ul class=\"chats\">{rows}</ul>")
+        },
+        csrf(c),
+        code_field()
+    )
+}
+
 fn account_page(c: &Ctx, flash: &Flash) -> Reply {
-    let left = get::<serde_json::Value>(c, Op::Account)
-        .ok()
-        .and_then(|v| v["recovery_left"].as_u64())
-        .unwrap_or(0);
+    let acct = get::<serde_json::Value>(c, Op::Account).unwrap_or_default();
+    let left = acct["recovery_left"].as_u64().unwrap_or(0);
     let b = format!(
         "<div class=\"page-head\"><h1>Account {}</h1><div class=\"buttons\">{}</div></div><section class=\"row\">\
          <section class=\"card\"><h2>Password</h2><form method=\"post\" action=\"/account/password\" class=\"stack\">{}\
@@ -1868,7 +2071,7 @@ fn account_page(c: &Ctx, flash: &Flash) -> Reply {
          <form method=\"post\" action=\"/account/totp-begin\" class=\"stack\">{}\
          <label>Code from your current authenticator <input name=\"code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" \
          pattern=\"[0-9]{{6}}\" maxlength=\"6\" required class=\"code\"></label>\
-         <div><button>Set up a new authenticator</button></div></form></section></section>\
+         <div><button>Set up a new authenticator</button></div></form></section></section>{}\
          <p class=\"hint\">Accounts are added and removed on the hub itself: <code>sudo thorn web user add &lt;name&gt;</code>, \
          <code>sudo thorn web user rm &lt;name&gt;</code>.</p>",
         esc(&c.user),
@@ -1876,12 +2079,37 @@ fn account_page(c: &Ctx, flash: &Flash) -> Reply {
         csrf(c),
         code_field(),
         csrf(c),
+        passkeys_card(c, &acct),
     );
     Reply::Html(200, page(c, "Account", &b, flash))
 }
 
 fn account_post(c: &Ctx, action: &str, form: &HashMap<String, String>) -> Reply {
     match action {
+        "passkey-add" => back(
+            "/account#passkeys",
+            match serde_json::from_str(f(form, "answer")) {
+                Ok(answer) => get::<String>(
+                    c,
+                    Op::PasskeyAdd {
+                        name: f(form, "name").into(),
+                        answer,
+                        code: f(form, "code").into(),
+                    },
+                ),
+                Err(_) => Err("the browser gave no passkey (it needs JavaScript and HTTPS)".into()),
+            },
+        ),
+        "passkey-rm" => back(
+            "/account#passkeys",
+            get::<String>(
+                c,
+                Op::PasskeyRm {
+                    id: f(form, "id").into(),
+                    code: f(form, "code").into(),
+                },
+            ),
+        ),
         "rename" => back(
             "/account",
             get::<String>(

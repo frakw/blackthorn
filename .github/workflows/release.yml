@@ -27,12 +27,15 @@ jobs:
         run: |
           v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           test "v$v" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME but Cargo.toml says $v"; exit 1; }
-      - name: Cross linker
-        if: matrix.arch == 'aarch64'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      # ring (TLS) compiles some C: musl-gcc for x86_64, the cross
+      # compiler for aarch64.
+      - name: C compilers
+        run: sudo apt-get update && sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
       - name: Build (static, musl)
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
           cargo build --release --locked --target ${{ matrix.arch }}-unknown-linux-musl
           mkdir dist

@@ -2,13 +2,14 @@
 //! connection (`Connection: close`), no chunked bodies, hard limits on
 //! sizes, time and concurrency. Nothing a client sends can take the
 //! listener down: every connection is handled on its own thread and every
-//! error just closes that connection.
+//! error just closes that connection. With a certificate it speaks only
+//! HTTPS (rustls), and the certificate can be swapped while it runs.
 
 use anyhow::{bail, Context, Result};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 const MAX_HEAD: usize = 16 * 1024;
@@ -24,6 +25,32 @@ pub struct Request {
     pub headers: Vec<(String, String)>,
     pub body: String,
     pub remote: IpAddr,
+    /// Came over HTTPS.
+    pub secure: bool,
+}
+
+/// The TLS settings in use, replaced when the certificate is renewed.
+pub type Tls = Arc<RwLock<Arc<rustls::ServerConfig>>>;
+
+/// A rustls server configuration from PEM text.
+pub fn tls_config(cert_pem: &str, key_pem: &str) -> Result<Arc<rustls::ServerConfig>> {
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .collect::<std::result::Result<_, _>>()
+        .context("reading the certificate")?;
+    if certs.is_empty() {
+        bail!("no certificate in the certificate file");
+    }
+    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+        .context("reading the key")?
+        .context("no private key in the key file")?;
+    let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .context("the certificate and key do not go together")?;
+    Ok(Arc::new(cfg))
 }
 
 impl Request {
@@ -42,7 +69,7 @@ pub struct Response {
 }
 
 /// Serves forever on `addr`, calling `handler` for each request.
-pub fn serve<F>(addr: SocketAddr, handler: F) -> Result<()>
+pub fn serve<F>(addr: SocketAddr, tls: Option<Tls>, handler: F) -> Result<()>
 where
     F: Fn(Request) -> Response + Send + Sync + 'static,
 {
@@ -61,8 +88,9 @@ where
         active.fetch_add(1, Ordering::SeqCst);
         let handler = handler.clone();
         let active = active.clone();
+        let tls = tls.as_ref().map(|t| t.read().expect("tls lock").clone());
         std::thread::spawn(move || {
-            if let Err(e) = connection(stream, &*handler) {
+            if let Err(e) = connection(stream, tls, &*handler) {
                 eprintln!("web: connection: {e:#}");
             }
             active.fetch_sub(1, Ordering::SeqCst);
@@ -71,12 +99,40 @@ where
     Ok(())
 }
 
-fn connection<F: Fn(Request) -> Response>(stream: TcpStream, handler: &F) -> Result<()> {
+fn connection<F: Fn(Request) -> Response>(
+    stream: TcpStream,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    handler: &F,
+) -> Result<()> {
     stream.set_read_timeout(Some(TIMEOUT))?;
     stream.set_write_timeout(Some(TIMEOUT))?;
     let remote = stream.peer_addr()?.ip();
-    let mut out = stream.try_clone()?;
-    let resp = match read_request(BufReader::new(stream), remote) {
+    match tls {
+        None => exchange(stream, remote, false, handler),
+        Some(cfg) => {
+            let conn = rustls::ServerConnection::new(cfg)?;
+            let mut s = rustls::StreamOwned::new(conn, stream);
+            exchange(&mut s, remote, true, handler)?;
+            s.conn.send_close_notify();
+            let _ = s.flush();
+            Ok(())
+        }
+    }
+}
+
+/// One request and its response over `stream`.
+fn exchange<S: Read + Write, F: Fn(Request) -> Response>(
+    mut stream: S,
+    remote: IpAddr,
+    secure: bool,
+    handler: &F,
+) -> Result<()> {
+    let req = read_request(BufReader::new(&mut stream), remote).map(|mut r| {
+        r.secure = secure;
+        r
+    });
+    let mut out = stream;
+    let resp = match req {
         Ok(req) => {
             let head = req.method == "HEAD";
             let mut r = handler(req);
@@ -162,6 +218,7 @@ pub fn read_request<R: Read>(r: BufReader<R>, remote: IpAddr) -> Result<Request>
         headers,
         body: String::from_utf8(body).context("body is not UTF-8")?,
         remote,
+        secure: false,
     })
 }
 

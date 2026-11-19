@@ -79,6 +79,114 @@
     });
   });
 
+  // ------------------------------------------------------------ passkeys
+  var canPasskey = !!(window.PublicKeyCredential && navigator.credentials && window.isSecureContext);
+  var enc = function (buf) {
+    var s = "";
+    new Uint8Array(buf).forEach(function (b) { s += String.fromCharCode(b); });
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  };
+  var dec = function (s) {
+    s = s.replace(/-/g, "+").replace(/_/g, "/");
+    while (s.length % 4) s += "=";
+    var b = atob(s), a = new Uint8Array(b.length);
+    for (var i = 0; i < b.length; i++) a[i] = b.charCodeAt(i);
+    return a.buffer;
+  };
+  var csrfValue = function () {
+    var i = document.querySelector("input[name=csrf]");
+    return i ? i.value : "";
+  };
+  // A challenge from the hub: purpose login, register or step_up.
+  var begin = function (purpose) {
+    return fetch("/passkey/begin", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "purpose=" + purpose + "&csrf=" + encodeURIComponent(csrfValue())
+    }).then(function (r) {
+      return r.json().then(function (j) {
+        if (!r.ok) throw new Error(j.error || "the hub refused");
+        return j;
+      });
+    });
+  };
+  var getAnswer = function (o) {
+    return navigator.credentials.get({ publicKey: {
+      challenge: dec(o.challenge), rpId: o.rp_id, userVerification: "required", timeout: 60000,
+      allowCredentials: o.credentials.map(function (id) { return { type: "public-key", id: dec(id) }; })
+    } }).then(function (c) {
+      return JSON.stringify({ id: c.id, client_data: enc(c.response.clientDataJSON),
+        authenticator_data: enc(c.response.authenticatorData), signature: enc(c.response.signature) });
+    });
+  };
+  var createAnswer = function (o) {
+    return navigator.credentials.create({ publicKey: {
+      challenge: dec(o.challenge), rp: { id: o.rp_id, name: o.rp_name },
+      user: { id: dec(o.user_id), name: o.user_name, displayName: o.user_name },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -8 }],
+      authenticatorSelection: { residentKey: "required", userVerification: "required" },
+      attestation: "none", timeout: 60000,
+      excludeCredentials: o.credentials.map(function (id) { return { type: "public-key", id: dec(id) }; })
+    } }).then(function (c) {
+      return JSON.stringify({ id: c.id, client_data: enc(c.response.clientDataJSON),
+        attestation: enc(c.response.attestationObject) });
+    });
+  };
+  var say = function (el, msg) {
+    if (!el) { window.alert(msg); return; }
+    el.textContent = msg; el.hidden = !msg;
+  };
+
+  // Log in with a passkey.
+  var pl = document.querySelector(".passkey-login");
+  var plForm = document.getElementById("passkey-login");
+  if (pl && plForm && canPasskey) {
+    pl.hidden = false;
+    pl.querySelector("[data-passkey-login]").addEventListener("click", function () {
+      begin("login").then(getAnswer).then(function (a) {
+        plForm.querySelector("input[name=answer]").value = a;
+        plForm.submit();
+      }).catch(function (e) { if (e.name !== "NotAllowedError") window.alert(e.message); });
+    });
+  }
+
+  // Add a passkey (the code field above confirms it is you).
+  document.querySelectorAll("form.passkey-add").forEach(function (f) {
+    var err = f.querySelector(".dialog-error");
+    if (!canPasskey) { say(err, "This browser cannot use passkeys here."); return; }
+    f.addEventListener("submit", function (e) {
+      if (f.querySelector("input[name=answer]").value) return;
+      e.preventDefault();
+      say(err, "");
+      begin("register").then(createAnswer).then(function (a) {
+        f.querySelector("input[name=answer]").value = a;
+        f.submit();
+      }).catch(function (x) { say(err, x.name === "NotAllowedError" ? "Cancelled." : x.message); });
+    });
+  });
+
+  // Wherever a fresh code is asked: "Use a passkey" instead.
+  if (document.body.getAttribute("data-passkey") === "1" && canPasskey) {
+    document.querySelectorAll("form input[name=code]").forEach(function (input) {
+      var f = input.form;
+      if (!f || f.classList.contains("passkey-add")) return;
+      var b = document.createElement("button");
+      b.type = "button"; b.className = "link passkey-step"; b.textContent = "or use a passkey";
+      input.parentNode.appendChild(b);
+      b.addEventListener("click", function () {
+        if (!f.reportValidity || !Array.prototype.every.call(f.elements, function (el) {
+          return el === input || !el.willValidate || el.checkValidity();
+        })) { if (f.reportValidity) { input.required = false; f.reportValidity(); input.required = true; } return; }
+        begin("step_up").then(getAnswer).then(function (a) {
+          input.removeAttribute("pattern"); input.removeAttribute("maxlength"); input.required = false;
+          input.type = "hidden"; input.value = a;
+          if (f.getAttribute("data-confirm") && !window.confirm(f.getAttribute("data-confirm"))) return;
+          f.submit();
+        }).catch(function (x) { if (x.name !== "NotAllowedError") window.alert(x.message); });
+      });
+    });
+  }
+
   // ------------------------------------------------------------ the map
   var map = document.getElementById("map");
   if (map) initMap(map);

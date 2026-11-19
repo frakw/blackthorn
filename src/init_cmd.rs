@@ -459,7 +459,9 @@ pub fn tick() -> Result<()> {
     }
     // Notifications go out over the network: not while holding the lock.
     let state = ctx.state.clone();
+    let cfg = ctx.cfg.clone();
     drop(ctx);
+    crate::tls::tick(&cfg);
     crate::notify::tick(&state, &lifted, &ended);
     Ok(())
 }

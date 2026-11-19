@@ -148,24 +148,30 @@ pub fn mkdir(path: &Path, mode: u32) -> Result<()> {
 /// Writes a file atomically with the given mode, owned by root unless
 /// `owner` says otherwise.
 pub fn write_file(path: &Path, content: &str, mode: u32, owner: Option<(u32, u32)>) -> Result<()> {
+    // Some of these files are written into folders a space user owns, so
+    // that user may have put anything at the temporary name: a link to
+    // /etc/shadow, say. The temporary file is created anew (O_EXCL, which
+    // does not follow links), and its mode and owner are set on the open
+    // file, never by path.
     let tmp = path.with_file_name(format!(
         ".{}.thorn-tmp",
         path.file_name().and_then(|n| n.to_str()).unwrap_or("file")
     ));
+    let _ = std::fs::remove_file(&tmp);
     {
         let mut f = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(mode)
             .open(&tmp)
             .with_context(|| format!("writing {}", tmp.display()))?;
         f.write_all(content.as_bytes())?;
+        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        if let Some((uid, gid)) = owner {
+            std::os::unix::fs::fchown(&f, Some(uid), Some(gid))
+                .with_context(|| format!("chown {}", tmp.display()))?;
+        }
         f.sync_all()?;
-    }
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
-    if let Some((uid, gid)) = owner {
-        chown(&tmp, uid, gid)?;
     }
     std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
@@ -183,4 +189,25 @@ pub fn hostname() -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "blackthorn".into())
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+
+    #[test]
+    fn write_file_does_not_follow_a_planted_link() {
+        let d = tempfile::tempdir().unwrap();
+        let victim = d.path().join("victim");
+        std::fs::write(&victim, "keep me").unwrap();
+        let target = d.path().join("CLAUDE.md");
+        std::os::unix::fs::symlink(&victim, d.path().join(".CLAUDE.md.thorn-tmp")).unwrap();
+        write_file(&target, "new", 0o644, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        assert!(!std::fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
 }

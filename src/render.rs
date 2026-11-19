@@ -149,6 +149,9 @@ pub struct Launch {
     pub conversation: String,
     pub capacity: u32,
     pub args: Vec<String>,
+    /// The work folder it runs in.
+    #[serde(default)]
+    pub workdir: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -195,6 +198,7 @@ pub fn launch(name: &str, space: &Space, cfg: &Config) -> Launch {
         conversation: space.conversation.clone(),
         capacity: cfg.capacity,
         args,
+        workdir: space.workdir().display().to_string(),
     }
 }
 
@@ -286,6 +290,7 @@ mod tests {
                     mode: Mode::Server,
                     remote_control: true,
                     rc_name: n.into(),
+                    dir: n.into(),
                     conversation: "c0ffee00-0000-4000-8000-000000000000".into(),
                     args: vec!["--permission-mode".into(), "acceptEdits".into()],
                     created: 0,

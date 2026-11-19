@@ -57,8 +57,163 @@ pub fn user_ls() -> Result<()> {
     }
     for (name, u) in &users.users {
         println!("{name}  ({} recovery codes left)", u.recovery.len());
+        for p in &u.passkeys {
+            println!("  passkey {:<24} {}", p.name, p.id);
+        }
     }
     Ok(())
+}
+
+/// Removes a passkey (a lost phone or key), by its id or name.
+pub fn user_passkey_rm(name: &str, which: &str) -> Result<()> {
+    sys::require_root()?;
+    let mut users = Users::load(users_path())?;
+    let u = users
+        .users
+        .get_mut(name)
+        .with_context(|| format!("no account named {name}"))?;
+    let before = u.passkeys.len();
+    u.passkeys.retain(|p| p.id != which && p.name != which);
+    match before - u.passkeys.len() {
+        0 => bail!("{name} has no passkey {which:?} (thorn web user ls lists them)"),
+        1 => {}
+        n => bail!("{n} passkeys are called {which:?}; give its id instead"),
+    }
+    users.save(users_path())?;
+    println!("passkey {which} removed from {name}");
+    Ok(())
+}
+
+/// What `thorn web https` sets.
+pub enum Https {
+    Show,
+    Off,
+    Tailscale {
+        name: Option<String>,
+    },
+    Files {
+        cert: std::path::PathBuf,
+        key: std::path::PathBuf,
+        name: String,
+    },
+}
+
+/// Turns HTTPS for the web UI on (with certificate files you renew, or
+/// Tailscale's) or off. Passkeys need it.
+pub fn https(how: Https) -> Result<()> {
+    sys::require_root()?;
+    let (cfg, _) = ctx::read_only()?;
+    if let Https::Show = how {
+        let w = &cfg.web;
+        if !w.https() {
+            println!("the web UI is on plain HTTP; turn HTTPS on with:");
+            println!("  sudo thorn web https --cert /path/fullchain.pem --key /path/privkey.pem --name hub.example.com");
+            println!(
+                "  sudo thorn web https --tailscale      (Tailscale's own server, not Headscale)"
+            );
+        } else if w.tls_tailscale {
+            println!("HTTPS with a certificate from Tailscale for {}", w.name);
+        } else {
+            println!(
+                "HTTPS for {} with {} and {}",
+                w.name,
+                w.tls_cert
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                w.tls_key
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            );
+        }
+        for u in crate::tls::urls(w) {
+            println!("  {u}");
+        }
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(paths::CONFIG_FILE).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = text.parse().context("reading config.toml")?;
+    for k in ["name", "tls_cert", "tls_key", "tls_tailscale"] {
+        if let Some(t) = doc.get_mut("web").and_then(|w| w.as_table_like_mut()) {
+            t.remove(k);
+        }
+    }
+    let name = match how {
+        Https::Show => unreachable!(),
+        Https::Off => None,
+        Https::Tailscale { name } => {
+            let name = match name {
+                Some(n) => n,
+                None => crate::tls::tailscale_name()?,
+            };
+            crate::tls::check_name(&name)?;
+            crate::tls::tailscale_cert(&name)?;
+            doc["web"]["name"] = toml_edit::value(name.clone());
+            doc["web"]["tls_tailscale"] = toml_edit::value(true);
+            Some(name)
+        }
+        Https::Files { cert, key, name } => {
+            crate::tls::check_name(&name)?;
+            let c = std::fs::read_to_string(&cert)
+                .with_context(|| format!("reading {}", cert.display()))?;
+            let k = std::fs::read_to_string(&key)
+                .with_context(|| format!("reading {}", key.display()))?;
+            crate::http::tls_config(&c, &k)?;
+            let abs = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            doc["web"]["name"] = toml_edit::value(name.clone());
+            doc["web"]["tls_cert"] = toml_edit::value(abs(&cert).display().to_string());
+            doc["web"]["tls_key"] = toml_edit::value(abs(&key).display().to_string());
+            Some(name)
+        }
+    };
+    let new_text = doc.to_string();
+    let parsed: crate::config::Config =
+        toml::from_str(&new_text).context("the change would break config.toml")?;
+    sys::write_file(Path::new(paths::CONFIG_FILE), &new_text, 0o644, None)?;
+    let _ = sys::systemctl(&["try-restart", units::WEB]);
+    match name {
+        None => println!(
+            "the web UI is on plain HTTP again (passkeys stop working until HTTPS is back)"
+        ),
+        Some(name) => {
+            println!("the web UI now speaks HTTPS only:");
+            for u in crate::tls::urls(&parsed.web) {
+                println!("  {u}");
+            }
+            // The name must lead to where the web UI listens.
+            use std::net::ToSocketAddrs;
+            let port = parsed.web.listen.first().map(|a| a.port()).unwrap_or(443);
+            let found: Vec<std::net::IpAddr> = (name.as_str(), port)
+                .to_socket_addrs()
+                .map(|a| a.map(|x| x.ip()).collect())
+                .unwrap_or_default();
+            let listens: Vec<std::net::IpAddr> = parsed.web.listen.iter().map(|a| a.ip()).collect();
+            if found.is_empty() {
+                println!(
+                    "note: {name} does not resolve here yet; point it (a DNS A record) at {}",
+                    show_ips(&listens)
+                );
+            } else if !listens
+                .iter()
+                .any(|l| l.is_unspecified() || found.contains(l))
+            {
+                println!(
+                    "note: {name} resolves to {}, but the web UI listens on {}",
+                    show_ips(&found),
+                    show_ips(&listens)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn show_ips(ips: &[std::net::IpAddr]) -> String {
+    ips.iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub fn has_accounts() -> Result<bool> {
@@ -99,6 +254,7 @@ fn add_account(name: &str, totp_secret: Option<String>, input: &mut Input) -> Re
             totp_secret: secret,
             recovery: hash_codes(&recovery)?,
             last_step: step,
+            passkeys: Vec::new(),
         },
     );
     users.save(users_path())?;

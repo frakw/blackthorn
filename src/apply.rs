@@ -122,7 +122,7 @@ pub fn space_files(cfg: &Config, state: &State, name: &str, s: &Space, now: u64)
         None,
     )?;
 
-    let workdir = paths::space_workdir(&s.key);
+    let workdir = s.workdir();
     if workdir.exists() {
         sys::write_file(
             &workdir.join(cfg.instructions_file(&s.agent)),

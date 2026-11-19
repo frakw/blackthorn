@@ -20,11 +20,13 @@ mod runner;
 mod space_cmd;
 mod state;
 mod sys;
+mod tls;
 mod units;
 mod view_cmd;
 mod web;
 mod web_cmd;
 mod webauth;
+mod webauthn;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -83,7 +85,9 @@ enum Cmd {
         /// terminal (thorn attach, or the web UI).
         #[arg(long)]
         local: bool,
-        /// Name shown in Remote Control (default: the space name).
+        /// The name the Claude app lists its Remote Control environment by
+        /// (default: <machine>-<space>, or the space name if it starts
+        /// with the machine's). It is also the work folder's name.
         #[arg(long)]
         rc_name: Option<String>,
         /// Extra argument for the agent, e.g. --arg=--permission-mode --arg=acceptEdits.
@@ -99,6 +103,8 @@ enum Cmd {
         purge: bool,
     },
     /// Rename a space (and its Remote Control name, if it was the default).
+    /// `thorn rename SPACE SPACE --rc-name NAME` changes only the name the
+    /// Claude app lists it by; the space restarts, its chats stay.
     Rename {
         old: String,
         new: String,
@@ -225,10 +231,11 @@ enum ChatCmd {
     },
     /// Delete a chat's transcript from the hub.
     Rm { space: String, id: String },
-    /// Start a new conversation in a space that runs one (single mode, or
-    /// Remote Control off). With Remote Control, start chats from the app.
+    /// Start a new chat. A one-conversation space (single mode, Remote
+    /// Control off) restarts into it; a Remote Control space runs it in a
+    /// window of its own, shown in the Claude app.
     New { space: String },
-    /// Go back to an earlier conversation in such a space.
+    /// Go back to an earlier chat, the same way.
     Open { space: String, id: String },
 }
 
@@ -319,6 +326,26 @@ enum WebCmd {
     Enable,
     /// Stop the web UI.
     Disable,
+    /// HTTPS for the web UI (needed for passkeys). Without options: show it.
+    /// With your own certificate (e.g. certbot with a DNS challenge; renew
+    /// it as usual, blackthorn picks it up):
+    ///   thorn web https --cert /etc/letsencrypt/live/hub.example.com/fullchain.pem \
+    ///                   --key /etc/letsencrypt/live/hub.example.com/privkey.pem --name hub.example.com
+    /// Or from Tailscale (its own server, not Headscale): thorn web https --tailscale
+    Https {
+        #[arg(long, requires_all = ["key", "name"], conflicts_with_all = ["tailscale", "off"])]
+        cert: Option<PathBuf>,
+        #[arg(long, requires = "cert")]
+        key: Option<PathBuf>,
+        /// The name the certificate is for, which leads to the hub.
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, conflicts_with = "off")]
+        tailscale: bool,
+        /// Back to plain HTTP.
+        #[arg(long)]
+        off: bool,
+    },
     /// Web UI accounts.
     #[command(subcommand)]
     User(WebUserCmd),
@@ -336,6 +363,8 @@ enum WebUserCmd {
     Rm { name: String },
     /// Rename an account.
     Rename { old: String, new: String },
+    /// Remove a passkey (by its name or id, from `web user ls`).
+    PasskeyRm { name: String, passkey: String },
     /// List accounts.
     Ls,
     /// Change an account's password.
@@ -488,10 +517,31 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Web(w) => match w {
             WebCmd::Enable => web_cmd::enable(),
             WebCmd::Disable => web_cmd::disable(),
+            WebCmd::Https {
+                cert,
+                key,
+                name,
+                tailscale,
+                off,
+            } => web_cmd::https(if off {
+                web_cmd::Https::Off
+            } else if tailscale {
+                web_cmd::Https::Tailscale { name }
+            } else {
+                match (cert, key, name) {
+                    (Some(cert), Some(key), Some(name)) => {
+                        web_cmd::Https::Files { cert, key, name }
+                    }
+                    _ => web_cmd::Https::Show,
+                }
+            }),
             WebCmd::User(u) => match u {
                 WebUserCmd::Add { name, totp_secret } => web_cmd::user_add(&name, totp_secret),
                 WebUserCmd::Rm { name } => web_cmd::user_rm(&name),
                 WebUserCmd::Rename { old, new } => web_cmd::user_rename(&old, &new),
+                WebUserCmd::PasskeyRm { name, passkey } => {
+                    web_cmd::user_passkey_rm(&name, &passkey)
+                }
                 WebUserCmd::Ls => web_cmd::user_ls(),
                 WebUserCmd::Passwd { name } => web_cmd::user_passwd(&name),
                 WebUserCmd::TotpReset { name } => web_cmd::user_totp_reset(&name),
@@ -621,9 +671,19 @@ mod tests {
             ("notify_show", &["notify", "show"]),
             ("notify_set", &["notify", "set"]),
             ("notify_test", &["notify", "test"]),
+            ("passkey_rm", &["web", "user", "passkey-rm"]),
         ];
         // Operations that exist only because of the web: sessions.
-        let web_only = ["web_config", "login", "logout", "whoami"];
+        // Passkeys are made and used in a browser.
+        let web_only = [
+            "web_config",
+            "login",
+            "logout",
+            "whoami",
+            "passkey_begin",
+            "passkey_login",
+            "passkey_add",
+        ];
         for (op, path) in table {
             assert!(has(path), "{op}: missing thorn {}", path.join(" "));
         }

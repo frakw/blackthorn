@@ -34,7 +34,15 @@ pub fn run(key: &str) -> Result<()> {
 
         println!("blackthorn: starting space {}", launch.name);
         let started = Instant::now();
+        // The unit starts in the home; the work folder is named after the
+        // Remote Control name (spaces from before v0.6: "work").
+        let workdir = if launch.workdir.is_empty() {
+            home.join("work")
+        } else {
+            launch.workdir.clone().into()
+        };
         let status = Command::new(&launch.bin)
+            .current_dir(&workdir)
             .args(&args)
             .env("SSH_AUTH_SOCK", paths::agent_socket(key))
             .env("DISABLE_AUTOUPDATER", "1")
@@ -135,6 +143,7 @@ mod tests {
             conversation: "c0ffee00-0000-4000-8000-000000000000".into(),
             capacity: 8,
             args: vec!["--permission-mode".into(), "acceptEdits".into()],
+            workdir: "/var/lib/blackthorn/spaces/k/fig-claude".into(),
         }
     }
 

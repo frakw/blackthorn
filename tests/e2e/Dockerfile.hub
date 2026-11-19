@@ -4,7 +4,7 @@ FROM debian:trixie
 RUN apt-get update \
  && apt-get install -y --no-install-recommends systemd systemd-sysv tmux openssh-client \
       openssh-server libpam-google-authenticator nftables passwd util-linux procps \
-      iproute2 ca-certificates curl hostname \
+      iproute2 ca-certificates curl hostname openssl \
  && rm -rf /var/lib/apt/lists/* \
  && useradd -m -s /bin/bash admin && install -d -o admin -g admin -m 700 /home/admin/.ssh
 STOPSIGNAL SIGRTMIN+3

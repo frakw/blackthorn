@@ -21,6 +21,8 @@ pub const SPACES_DIR: &str = "/var/lib/blackthorn/spaces";
 pub const LAUNCH_DIR: &str = "/var/lib/blackthorn/launch";
 /// What notifications already said, so each thing is said once.
 pub const NOTIFY_SEEN_FILE: &str = "/var/lib/blackthorn/notified.toml";
+/// The web UI's certificate when Tailscale issues it. Root only.
+pub const TLS_DIR: &str = "/var/lib/blackthorn/tls";
 pub const ARCHIVE_DIR: &str = "/var/lib/blackthorn/archive";
 
 /// The root-only API the web UI talks to.
@@ -42,10 +44,6 @@ pub fn pubkey_file(host: &str) -> PathBuf {
 
 pub fn space_home(key: &str) -> PathBuf {
     PathBuf::from(SPACES_DIR).join(key)
-}
-
-pub fn space_workdir(key: &str) -> PathBuf {
-    space_home(key).join("work")
 }
 
 pub fn launch_file(key: &str) -> PathBuf {

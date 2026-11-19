@@ -188,6 +188,24 @@ pub enum Op {
         code: String,
     },
     NotifyTest,
+    /// A WebAuthn challenge: purpose "login" (no session needed),
+    /// "register" or "step_up".
+    PasskeyBegin {
+        purpose: String,
+    },
+    /// Logs in with a passkey (instead of password and code).
+    PasskeyLogin {
+        answer: crate::webauthn::Answer,
+    },
+    PasskeyAdd {
+        name: String,
+        answer: crate::webauthn::Answer,
+        code: String,
+    },
+    PasskeyRm {
+        id: String,
+        code: String,
+    },
     ChatRm {
         name: String,
         id: String,
@@ -243,6 +261,7 @@ impl Op {
                 | Op::UpdateCheck { .. }
                 | Op::Account
                 | Op::NotifyShow
+                | Op::PasskeyLogin { .. }
         )
     }
 
@@ -262,7 +281,9 @@ impl Op {
             | Op::ChatRename { code, .. }
             | Op::HostRename { code, .. }
             | Op::AccountRename { code, .. }
-            | Op::NotifySet { code, .. } => Some(code),
+            | Op::NotifySet { code, .. }
+            | Op::PasskeyAdd { code, .. }
+            | Op::PasskeyRm { code, .. } => Some(code),
             _ => None,
         }
     }
@@ -295,7 +316,12 @@ struct Server {
     update: Option<(u64, ops::UpdateInfo)>,
     /// Authenticator secrets being set up, per account.
     pending_totp: HashMap<String, (String, u64)>,
+    /// WebAuthn challenges handed out: challenge -> (purpose, account,
+    /// expiry). Each is used once.
+    challenges: HashMap<String, (String, Option<String>, u64)>,
 }
+
+const CHALLENGE_TTL: u64 = 300;
 
 const UPDATE_EVERY: u64 = 6 * 3600;
 const PENDING_TOTP: u64 = 10 * 60;
@@ -420,9 +446,15 @@ fn dispatch(req: Request, server: &Mutex<Server>) -> Out {
     let now = crate::state::now();
     match &req.op {
         Op::WebConfig => {
-            let r = ctx::read_only().map(
-                |(cfg, _)| serde_json::json!({ "listen": cfg.web.listen, "hub": sys::hostname() }),
-            );
+            // The web process needs the TLS key to serve HTTPS; it gets it
+            // here because it cannot read the key file itself.
+            let r = ctx::read_only().and_then(|(cfg, _)| {
+                Ok(serde_json::json!({
+                    "listen": cfg.web.listen,
+                    "hub": sys::hostname(),
+                    "tls": crate::tls::material(&cfg)?,
+                }))
+            });
             return (r, None);
         }
         Op::Login {
@@ -435,6 +467,10 @@ fn dispatch(req: Request, server: &Mutex<Server>) -> Out {
                 Some(user.clone()),
             )
         }
+        Op::PasskeyBegin { purpose } if purpose == "login" => {
+            return (passkey_begin(server, "login", None, now), None);
+        }
+        Op::PasskeyLogin { answer } => return passkey_login(server, answer, req.client, now),
         _ => {}
     }
 
@@ -461,7 +497,7 @@ fn dispatch(req: Request, server: &Mutex<Server>) -> Out {
         sess.user.clone()
     };
     if let Some(code) = req.op.step_up_code() {
-        if let Err(e) = check_code(&user, code, now) {
+        if let Err(e) = check_step_up(server, &user, code, now) {
             return (Err(e), Some(user));
         }
     }
@@ -508,6 +544,10 @@ fn login(
     for k in keys {
         s.failures.remove(&k);
     }
+    Ok(new_session(&mut s, user, now))
+}
+
+fn new_session(s: &mut Server, user: &str, now: u64) -> serde_json::Value {
     let token = webauth::random_token();
     let csrf = webauth::random_token();
     s.sessions.insert(
@@ -519,7 +559,176 @@ fn login(
             last_seen: now,
         },
     );
-    Ok(serde_json::json!({ "token": token, "csrf": csrf, "user": user }))
+    serde_json::json!({ "token": token, "csrf": csrf, "user": user })
+}
+
+/// The hub's WebAuthn identity: its HTTPS name and the origins of its pages.
+fn site() -> Result<(String, Vec<String>)> {
+    let (cfg, _) = ctx::read_only()?;
+    if !cfg.web.https() {
+        bail!("passkeys need the web UI on HTTPS (see: thorn web https)");
+    }
+    Ok((cfg.web.name.clone(), crate::tls::origins(&cfg.web)))
+}
+
+fn passkey_begin(
+    server: &Mutex<Server>,
+    purpose: &str,
+    user: Option<&str>,
+    now: u64,
+) -> Result<serde_json::Value> {
+    let (rp_id, _) = site()?;
+    let mut credentials = Vec::new();
+    if let Some(u) = user {
+        let users = Users::load(Path::new(paths::WEB_USERS_FILE))?;
+        let acct = users.users.get(u).context("account removed")?;
+        credentials = acct.passkeys.iter().map(|p| p.id.clone()).collect();
+        if purpose == "step_up" && credentials.is_empty() {
+            bail!("this account has no passkey; use a code from your authenticator app");
+        }
+    }
+    let challenge = crate::webauthn::b64(&webauth::random_bytes::<32>());
+    {
+        let mut s = server.lock().expect("lock");
+        s.challenges.retain(|_, c| c.2 > now);
+        if s.challenges.len() > 1000 {
+            bail!("too many passkey requests at once; try again in a few minutes");
+        }
+        s.challenges.insert(
+            challenge.clone(),
+            (
+                purpose.to_string(),
+                user.map(String::from),
+                now + CHALLENGE_TTL,
+            ),
+        );
+    }
+    let user_name = user.unwrap_or("").to_string();
+    let user_id = if user_name.is_empty() {
+        String::new()
+    } else {
+        use sha2::Digest;
+        let h = sha2::Sha256::digest(format!("blackthorn:{user_name}").as_bytes());
+        crate::webauthn::b64(&h[..16])
+    };
+    json(crate::webauthn::Options {
+        challenge,
+        rp_id,
+        rp_name: format!("blackthorn on {}", sys::hostname()),
+        user_id,
+        user_name,
+        credentials,
+    })
+}
+
+/// Takes back the challenge an answer carries, if it was handed out for
+/// this purpose (and account) and has not expired. Each works once.
+fn take_challenge(
+    server: &Mutex<Server>,
+    answer: &crate::webauthn::Answer,
+    purpose: &str,
+    user: Option<&str>,
+    now: u64,
+) -> Result<String> {
+    let client = crate::webauthn::unb64(&answer.client_data)?;
+    let v: serde_json::Value = serde_json::from_slice(&client).context("clientDataJSON")?;
+    let ch = v["challenge"]
+        .as_str()
+        .unwrap_or("")
+        .trim_end_matches('=')
+        .to_string();
+    let mut s = server.lock().expect("lock");
+    match s.challenges.remove(&ch) {
+        Some((p, u, until)) if p == purpose && u.as_deref() == user && until > now => Ok(ch),
+        _ => bail!("the passkey request expired or was already used; try again"),
+    }
+}
+
+fn passkey_login(
+    server: &Mutex<Server>,
+    answer: &crate::webauthn::Answer,
+    client: Option<IpAddr>,
+    now: u64,
+) -> Out {
+    let ip_key = format!("ip:{}", show(client));
+    {
+        let s = server.lock().expect("lock");
+        if let Some((n, until)) = s.failures.get(&ip_key) {
+            if *n >= MAX_FAILURES && now < *until {
+                let mins = (until - now).div_ceil(60);
+                return (
+                    Err(anyhow::anyhow!(
+                        "too many failed logins; try again in {mins} minutes"
+                    )),
+                    None,
+                );
+            }
+        }
+    }
+    let r = (|| -> Result<String> {
+        let ch = take_challenge(server, answer, "login", None, now)?;
+        let (rp_id, origins) = site()?;
+        let site = crate::webauthn::Site {
+            rp_id: &rp_id,
+            origins: &origins,
+        };
+        let path = Path::new(paths::WEB_USERS_FILE);
+        let mut users = Users::load(path)?;
+        let id = answer.id.trim_end_matches('=');
+        let (name, u) = users
+            .users
+            .iter_mut()
+            .find(|(_, u)| u.passkeys.iter().any(|p| p.id == id))
+            .context("this passkey is not registered here")?;
+        let name = name.clone();
+        let pk = u.passkeys.iter_mut().find(|p| p.id == id).expect("found");
+        pk.counter = crate::webauthn::verify(answer, &ch, &site, pk)?;
+        users.save(path)?;
+        Ok(name)
+    })();
+    let mut s = server.lock().expect("lock");
+    match r {
+        Ok(user) => {
+            s.failures.remove(&ip_key);
+            eprintln!("api: {user} logged in with a passkey");
+            (Ok(new_session(&mut s, &user, now)), Some(user))
+        }
+        Err(e) => {
+            let f = s.failures.entry(ip_key).or_insert((0, 0));
+            if now >= f.1 && f.0 >= MAX_FAILURES {
+                *f = (0, 0);
+            }
+            f.0 += 1;
+            f.1 = now + LOCKOUT;
+            (Err(e), None)
+        }
+    }
+}
+
+/// A fresh TOTP code, or a passkey answer (JSON), for an operation that
+/// can do harm.
+fn check_step_up(server: &Mutex<Server>, user: &str, code: &str, now: u64) -> Result<()> {
+    if !code.trim_start().starts_with('{') {
+        return check_code(user, code, now);
+    }
+    let answer: crate::webauthn::Answer = serde_json::from_str(code).context("passkey answer")?;
+    let ch = take_challenge(server, &answer, "step_up", Some(user), now)?;
+    let (rp_id, origins) = site()?;
+    let site = crate::webauthn::Site {
+        rp_id: &rp_id,
+        origins: &origins,
+    };
+    let path = Path::new(paths::WEB_USERS_FILE);
+    let mut users = Users::load(path)?;
+    let u = users.users.get_mut(user).context("account removed")?;
+    let id = answer.id.trim_end_matches('=');
+    let pk = u
+        .passkeys
+        .iter_mut()
+        .find(|p| p.id == id)
+        .context("that passkey is not one of this account's")?;
+    pk.counter = crate::webauthn::verify(&answer, &ch, &site, pk)?;
+    users.save(path)
 }
 
 /// Password, then a TOTP code or one unused recovery code.
@@ -587,7 +796,12 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
             let csrf = req
                 .token
                 .and_then(|t| s.sessions.get(&t).map(|x| x.csrf.clone()));
-            json(serde_json::json!({ "user": user, "csrf": csrf }))
+            drop(s);
+            // Whether this account can step up with a passkey.
+            let passkey = ctx::read_only().is_ok_and(|(c, _)| c.web.https())
+                && Users::load(Path::new(paths::WEB_USERS_FILE))
+                    .is_ok_and(|u| u.users.get(user).is_some_and(|x| !x.passkeys.is_empty()));
+            json(serde_json::json!({ "user": user, "csrf": csrf, "passkey": passkey }))
         }
         Op::Overview => {
             let cached = {
@@ -715,6 +929,52 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
             json(crate::notify::view())
         }
         Op::NotifyTest => json(crate::notify::test()?),
+        Op::PasskeyLogin { .. } => unreachable!("handled before"),
+        Op::PasskeyBegin { purpose } => match purpose.as_str() {
+            "register" | "step_up" => passkey_begin(server, &purpose, Some(user), now),
+            _ => bail!("unknown passkey purpose"),
+        },
+        Op::PasskeyAdd { name, answer, .. } => {
+            let name = name.trim();
+            if name.is_empty() || name.chars().count() > 60 || name.chars().any(char::is_control) {
+                bail!("give the passkey a name of 1 to 60 characters, such as \"iPhone\" or \"YubiKey\"");
+            }
+            let ch = take_challenge(server, &answer, "register", Some(user), now)?;
+            let (rp_id, origins) = site()?;
+            let site = crate::webauthn::Site {
+                rp_id: &rp_id,
+                origins: &origins,
+            };
+            let pk = crate::webauthn::register(&answer, &ch, &site, name, now)?;
+            let path = Path::new(paths::WEB_USERS_FILE);
+            let mut users = Users::load(path)?;
+            if users
+                .users
+                .values()
+                .any(|u| u.passkeys.iter().any(|p| p.id == pk.id))
+            {
+                bail!("this passkey is already registered");
+            }
+            let u = users.users.get_mut(user).context("account removed")?;
+            if u.passkeys.len() >= 20 {
+                bail!("an account holds at most 20 passkeys");
+            }
+            u.passkeys.push(pk);
+            users.save(path)?;
+            json(format!("passkey {name} added"))
+        }
+        Op::PasskeyRm { id, .. } => {
+            let path = Path::new(paths::WEB_USERS_FILE);
+            let mut users = Users::load(path)?;
+            let u = users.users.get_mut(user).context("account removed")?;
+            let before = u.passkeys.len();
+            u.passkeys.retain(|p| p.id != id);
+            if u.passkeys.len() == before {
+                bail!("no such passkey");
+            }
+            users.save(path)?;
+            json("passkey removed")
+        }
         Op::ChatRm { name, id } => json(ops::chat_rm(&name, &id)?),
         Op::SpaceRemote { name, on } => json(ops::space_set_remote(&name, on)?),
         Op::UpdateCheck { refresh } => {
@@ -747,7 +1007,20 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
         Op::Account => {
             let users = Users::load(Path::new(paths::WEB_USERS_FILE))?;
             let u = users.users.get(user).context("account removed")?;
-            json(serde_json::json!({ "user": user, "recovery_left": u.recovery.len() }))
+            let passkeys: Vec<serde_json::Value> = u
+                .passkeys
+                .iter()
+                .map(|p| serde_json::json!({ "id": p.id, "name": p.name, "added": p.added }))
+                .collect();
+            let https = ctx::read_only()
+                .map(|(c, _)| c.web.https())
+                .unwrap_or(false);
+            json(serde_json::json!({
+                "user": user,
+                "recovery_left": u.recovery.len(),
+                "passkeys": passkeys,
+                "https": https,
+            }))
         }
         Op::AccountPassword { current, new, .. } => {
             let path = Path::new(paths::WEB_USERS_FILE);
@@ -954,6 +1227,16 @@ pub fn all_op_names() -> Vec<String> {
             code: s(),
         },
         Op::NotifyTest,
+        Op::PasskeyBegin { purpose: s() },
+        Op::PasskeyLogin {
+            answer: Default::default(),
+        },
+        Op::PasskeyAdd {
+            name: s(),
+            answer: Default::default(),
+            code: s(),
+        },
+        Op::PasskeyRm { id: s(), code: s() },
         Op::ChatRm { name: s(), id: s() },
         Op::SpaceRemote {
             name: s(),
@@ -1017,7 +1300,11 @@ pub fn all_op_names() -> Vec<String> {
             | Op::AccountRename { .. }
             | Op::NotifyShow
             | Op::NotifySet { .. }
-            | Op::NotifyTest => {}
+            | Op::NotifyTest
+            | Op::PasskeyBegin { .. }
+            | Op::PasskeyLogin { .. }
+            | Op::PasskeyAdd { .. }
+            | Op::PasskeyRm { .. } => {}
         }
     }
     all.iter().map(Op::name).collect()

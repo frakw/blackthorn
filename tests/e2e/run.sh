@@ -208,13 +208,17 @@ echo "$a1" | grep -q -- '^remote-control --name t1-claude --spawn same-dir --cap
 k2=$(key_of t2-claude)
 a2=$(hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args")
 echo "$a2" | grep -q -- '--session-id .* --remote-control t2-hub' && ok "t2-claude: single mode, Remote Control name t2-hub" || fail "t2-claude: single mode, Remote Control name t2-hub"
-hub test -f "/var/lib/blackthorn/spaces/$k1/work/CLAUDE.md" && ok "instructions written to CLAUDE.md" || fail "instructions written to CLAUDE.md"
+hub test -f "/var/lib/blackthorn/spaces/$k1/t1-claude/CLAUDE.md" && ok "instructions in CLAUDE.md, in a folder named for the Claude app" || fail "instructions written to CLAUDE.md"
+hub grep -q "\"/var/lib/blackthorn/spaces/$k1/t1-claude\"" "/var/lib/blackthorn/spaces/$k1/.claude.json" && ok "that folder is trusted" || fail "folder trust"
+hub runuser -u "bt-$k1" -- ln -s /etc/shadow "/var/lib/blackthorn/spaces/$k1/t1-claude/.CLAUDE.md.thorn-tmp"
+thorn apply >/dev/null
+hub sh -c 'head -1 /etc/shadow | grep -q "^root:"' && [ "$(hub stat -c %U /etc/shadow)" = root ] && ok "a link planted where root writes CLAUDE.md is not followed" || fail "/etc/shadow was touched through a planted link"
 
 say "bridges are one-way and end at once"
 thorn bridge add t1-claude t2-claude --for 1h >/dev/null
 expect_reach 15 t1-claude t2 ok
 expect_reach 5 t2-claude t1 FAIL
-hub grep -q 'temporary bridge' "/var/lib/blackthorn/spaces/$k1/work/CLAUDE.md" && ok "CLAUDE.md lists the bridged machine" || fail "CLAUDE.md lists the bridged machine"
+hub grep -q 'temporary bridge' "/var/lib/blackthorn/spaces/$k1/t1-claude/CLAUDE.md" && ok "CLAUDE.md lists the bridged machine" || fail "CLAUDE.md lists the bridged machine"
 thorn bridge rm t1-claude t2-claude >/dev/null
 expect_reach 10 t1-claude t2 FAIL
 
@@ -265,7 +269,10 @@ hub test -e /etc/shadow && ok "and nothing else was touched" || fail "/etc/shado
 hub rm -f "$dir/5b2e1d3f-1111-4222-8333-444455556666.jsonl"
 
 say "new chats: in a one-conversation space, and not with Remote Control"
-thorn chat new t1-claude 2>&1 | grep -q "from the Claude app" && ok "with Remote Control, new chats start in the Claude app" || fail "chat new in server mode"
+thorn chat new t1-claude | grep -q "window of its own" && ok "with Remote Control, a new chat runs in a window of its own" || fail "chat new in server mode"
+sleep 2
+hub tmux -S "/run/blackthorn/$k1/tmux.sock" list-windows -F '#{window_name}' | grep -q '^chat-' && ok "next to the Remote Control server" || fail "chat window"
+hub grep -q -- "^--session-id [0-9a-f-]* --remote-control t1-claude" "/var/lib/blackthorn/spaces/$k1/fake-claude.args" && ok "on Remote Control too, so it shows in the Claude app" || fail "chat window args: $(hub tail -3 "/var/lib/blackthorn/spaces/$k1/fake-claude.args")"
 old=$(hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args" | grep -o -- '--session-id [0-9a-f-]*' | cut -d' ' -f2)
 [ -n "$old" ] || old=$(hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args" | grep -o -- '--resume [0-9a-f-]*' | cut -d' ' -f2)
 dir2="/var/lib/blackthorn/spaces/$k2/.claude/projects/-var-lib-blackthorn-spaces-$k2-work"
@@ -357,6 +364,11 @@ say "rename keeps the space and restarts with the new Remote Control name"
 thorn rename t1-claude t1-main >/dev/null
 sleep 3
 hub tail -1 "/var/lib/blackthorn/spaces/$k1/fake-claude.args" | grep -q -- '--name t1-main' && ok "t1-main restarted with the new name" || fail "t1-main restarted with the new name"
+hub test -f "/var/lib/blackthorn/spaces/$k1/t1-main/CLAUDE.md" && ! hub test -e "/var/lib/blackthorn/spaces/$k1/t1-claude" && ok "its folder moved along (the Claude app lists it by that name)" || fail "folder after rename"
+thorn rename t1-main t1-main --rc-name ops-box >/dev/null
+sleep 3
+hub test -d "/var/lib/blackthorn/spaces/$k1/ops-box" && hub tail -1 "/var/lib/blackthorn/spaces/$k1/fake-claude.args" | grep -q -- '--name ops-box' && ok "a Remote Control name of its own" || fail "rc-name rename"
+expect_reach 20 t1-main t1 ok
 expect_reach 15 t1-main t1 ok
 
 say "SSH two-factor: undone automatically unless confirmed"
@@ -375,6 +387,19 @@ thorn harden confirm >/dev/null
 sleep 2
 hub test -f /etc/ssh/sshd_config.d/10-blackthorn.conf && ok "confirmed change stays" || fail "confirmed change stays"
 thorn harden undo >/dev/null
+
+say "HTTPS with your own certificate"
+hub sh -c 'cd /root && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 -subj /CN=hub.test -addext subjectAltName=DNS:hub.test -keyout key.pem -out cert.pem 2>/dev/null'
+thorn web https --cert /root/cert.pem --key /root/key.pem --name hub.test | grep -q "https://hub.test:7180/" && ok "thorn web https" || fail "web https"
+for _ in $(seq 20); do admin curl -sk --resolve "hub.test:7180:$HUB" -o /dev/null "https://hub.test:7180/login" && break; sleep 0.5; done
+admin curl -sk --resolve "hub.test:7180:$HUB" "https://hub.test:7180/login" | grep -q "Log in with a passkey" && ok "the web UI speaks HTTPS and offers passkeys" || fail "https login page"
+r=$(admin curl -sk --resolve "hub.test:7180:$HUB" -D - -o /dev/null --data-urlencode "user=frakw" --data-urlencode "password=$PASSWORD" --data-urlencode "code=$(fresh_code $WEB_SECRET)" "https://hub.test:7180/login")
+echo "$r" | grep -qi "set-cookie: bt_session=.*; Secure" && ok "the session cookie is Secure" || fail "secure cookie: $r"
+r=$(admin curl -sk --resolve "hub.test:7180:$HUB" --data-urlencode "purpose=login" "https://hub.test:7180/passkey/begin")
+echo "$r" | grep -q '"rp_id":"hub.test"' && ok "a passkey challenge for hub.test" || fail "passkey begin: $r"
+admin curl -s -m 5 "http://$HUB:7180/login" >/dev/null 2>&1 && fail "plain HTTP still answers" || ok "no plain HTTP any more"
+thorn web https --off | grep -q "plain HTTP" && ok "thorn web https --off" || fail "https off"
+for _ in $(seq 20); do admin curl -s -o /dev/null "http://$HUB:7180/login" && break; sleep 0.5; done
 
 say "reboot: everything comes back by itself"
 docker restart "$P-hub" >/dev/null

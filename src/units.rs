@@ -117,7 +117,7 @@ Type=forking
 User=bt-%i
 Group=bt-%i
 Environment=HOME=/var/lib/blackthorn/spaces/%i
-WorkingDirectory=/var/lib/blackthorn/spaces/%i/work
+WorkingDirectory=/var/lib/blackthorn/spaces/%i
 RuntimeDirectory=blackthorn/%i
 RuntimeDirectoryMode=0700
 ExecStart=/usr/bin/tmux -S /run/blackthorn/%i/tmux.sock new-session -d -s main -x 200 -y 50 /usr/local/bin/thorn _run %i
@@ -240,7 +240,10 @@ mod tests {
         use crate::paths;
         let s = space();
         assert!(s.contains(&paths::tmux_socket("%i").display().to_string()));
-        assert!(s.contains(&paths::space_workdir("%i").display().to_string()));
+        assert!(s.contains(&format!(
+            "WorkingDirectory={}\n",
+            paths::space_home("%i").display()
+        )));
         assert!(api().contains("RuntimeDirectory=blackthorn-api"));
         assert!(paths::API_SOCKET.starts_with(paths::API_DIR));
         assert!(web().contains(&format!("User={}", paths::WEB_USER)));

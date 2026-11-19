@@ -46,7 +46,7 @@ pub fn login(name: &str) -> Result<()> {
         .arg("DISABLE_AUTOUPDATER=1")
         .arg(&cfg.claude_bin)
         .args(["auth", "login", "--claudeai"])
-        .current_dir(paths::space_workdir(&s.key))
+        .current_dir(s.workdir())
         .status()
         .context("running claude auth login")?;
     if !status.success() {
@@ -288,7 +288,13 @@ pub fn chat_open(space: &str, id: Option<&str>) -> Result<()> {
     } else {
         "new chat"
     };
-    if o.restarted {
+    if o.window {
+        println!(
+            "{space}: {what} {} in a window of its own; it shows in the Claude app \
+             (or: sudo thorn attach {space}, then Ctrl-b n)",
+            &o.id[..8]
+        );
+    } else if o.restarted {
         println!("{space}: {what} {} (restarted into it)", &o.id[..8]);
     } else {
         println!("{space}: {what} {}; it starts with the space", &o.id[..8]);

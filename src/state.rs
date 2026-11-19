@@ -107,8 +107,15 @@ pub struct Space {
     /// (the web UI or `thorn attach`).
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub remote_control: bool,
-    /// Name shown in Remote Control on your phone or laptop.
+    /// Name shown in Remote Control on your phone or laptop. The Claude app
+    /// names the environment after the work folder, so it is also that
+    /// folder's name (`dir`) for spaces made since v0.6.
     pub rc_name: String,
+    /// The work folder in the space's home: the Remote Control name, or
+    /// "work" for spaces made before v0.6 (until their Remote Control name
+    /// is changed).
+    #[serde(default = "work_dir")]
+    pub dir: String,
     /// The conversation a single-mode space resumes.
     pub conversation: String,
     /// Extra arguments for the agent, e.g. ["--permission-mode", "acceptEdits"].
@@ -317,14 +324,26 @@ pub fn validate_name(kind: &str, name: &str) -> Result<()> {
 }
 
 /// Remote Control names are shown to you and passed to claude as one argument.
+fn work_dir() -> String {
+    "work".into()
+}
+
+impl Space {
+    /// Where the agent runs: its work folder.
+    pub fn workdir(&self) -> std::path::PathBuf {
+        crate::paths::space_home(&self.key).join(&self.dir)
+    }
+}
+
 pub fn validate_rc_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
+        && !name.starts_with('.')
         && name.len() <= 64
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
     if !ok {
-        bail!("Remote Control name {name:?} is not allowed: use letters, digits, '-', '_' and '.'");
+        bail!("Remote Control name {name:?} is not allowed: use letters, digits, '-', '_' and '.' (not first)");
     }
     Ok(())
 }
@@ -373,6 +392,7 @@ mod tests {
             mode: Mode::Server,
             remote_control: true,
             rc_name: format!("{host}-claude"),
+            dir: format!("{host}-claude"),
             conversation: "7bb9dc88-2ec5-4933-90b6-b872466876b2".into(),
             args: vec![],
             created: 0,

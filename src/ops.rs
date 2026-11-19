@@ -50,6 +50,9 @@ pub struct SpaceView {
     #[serde(default = "crate::render::yes")]
     pub remote_control: bool,
     pub rc_name: String,
+    /// What the Claude app calls its environment: the work folder's name.
+    #[serde(default)]
+    pub dir: String,
     /// "running", "stopped", "failed", "needs login", ...
     pub state: String,
     pub memory_mb: Option<u64>,
@@ -125,6 +128,7 @@ pub fn overview(with_version: bool) -> Result<Overview> {
                 mode: s.mode,
                 remote_control: s.remote_control,
                 rc_name: s.rc_name.clone(),
+                dir: s.dir.clone(),
                 state: state_str,
                 memory_mb: sys::unit_memory(&unit).map(|b| b / 1_048_576),
                 chats_24h: (s.agent == CLAUDE).then(|| recent_chats(&s.key, t)),
@@ -355,7 +359,18 @@ pub fn space_new(o: NewSpace) -> Result<String> {
     if ctx.state.spaces.contains_key(&name) {
         bail!("there is already a space named {name:?}; choose another with --name");
     }
-    let rc_name = o.rc_name.unwrap_or_else(|| name.clone());
+    // The Claude app lists Remote Control environments by this name:
+    // machine and space ("fig-claude" already says both).
+    let rc_name = o
+        .rc_name
+        .filter(|r| !r.trim().is_empty())
+        .unwrap_or_else(|| {
+            if name.starts_with(&o.host) {
+                name.clone()
+            } else {
+                format!("{}-{name}", o.host)
+            }
+        });
     validate_rc_name(&rc_name)?;
     if ctx.state.spaces.values().any(|s| s.rc_name == rc_name) {
         bail!("another space already uses the Remote Control name {rc_name:?}");
@@ -375,7 +390,7 @@ pub fn space_new(o: NewSpace) -> Result<String> {
     let ids = sys::create_user(&paths::unix_user(&key), &home)?;
     sys::mkdir(&home, 0o700)?;
     sys::chown(&home, ids.uid, ids.gid)?;
-    let workdir = paths::space_workdir(&key);
+    let workdir = home.join(&rc_name);
     sys::mkdir(&workdir, 0o755)?;
     sys::chown(&workdir, ids.uid, ids.gid)?;
     if agent == CLAUDE {
@@ -393,6 +408,7 @@ pub fn space_new(o: NewSpace) -> Result<String> {
         agent,
         mode: if o.single { Mode::Single } else { Mode::Server },
         remote_control: !o.local,
+        dir: rc_name.clone(),
         rc_name,
         conversation: uuid::Uuid::new_v4().to_string(),
         args: o.args,
@@ -451,20 +467,40 @@ pub fn space_rm(name: &str, purge: bool) -> Result<Option<PathBuf>> {
     Ok(Some(dest))
 }
 
-/// Renames a space. Returns whether it was restarted to show a new Remote
-/// Control name.
+/// The default Remote Control name of a space on a machine.
+pub fn default_rc_name(host: &str, space: &str) -> String {
+    if space.starts_with(host) {
+        space.to_string()
+    } else {
+        format!("{host}-{space}")
+    }
+}
+
+/// How Claude Code names a project's folder under ~/.claude/projects.
+fn project_dir_name(path: &Path) -> String {
+    path.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// Renames a space (`new` may equal `old`), and/or its Remote Control name
+/// (`rc_name`; by default it follows the space's name if it was the
+/// default). A new Remote Control name moves the work folder, which the
+/// Claude app names the environment after, and Claude Code's records of
+/// it, so the chats stay. Returns whether the space was restarted.
 pub fn space_rename(old: &str, new: &str, rc_name: Option<String>) -> Result<bool> {
     let mut ctx = Ctx::open()?;
     validate_name("space", new)?;
-    if ctx.state.spaces.contains_key(new) {
+    if new != old && ctx.state.spaces.contains_key(new) {
         bail!("there is already a space named {new:?}");
     }
     let mut s = ctx.state.space(old)?.clone();
     let old_rc = s.rc_name.clone();
-    if let Some(rc) = rc_name {
-        s.rc_name = rc;
-    } else if s.rc_name == old {
-        s.rc_name = new.to_string();
+    if let Some(rc) = rc_name.filter(|r| !r.trim().is_empty()) {
+        s.rc_name = rc.trim().to_string();
+    } else if s.rc_name == old || s.rc_name == default_rc_name(&s.host, old) {
+        s.rc_name = default_rc_name(&s.host, new);
     }
     validate_rc_name(&s.rc_name)?;
     if ctx
@@ -478,6 +514,19 @@ pub fn space_rename(old: &str, new: &str, rc_name: Option<String>) -> Result<boo
             s.rc_name
         );
     }
+    if new == old && s.rc_name == old_rc {
+        return Ok(false);
+    }
+    let unit = paths::space_unit(&s.key);
+    let was_running = sys::unit_state(&unit) == "active";
+    let move_dir = s.agent == CLAUDE && s.rc_name != old_rc && s.dir != s.rc_name;
+    if move_dir {
+        if was_running {
+            sys::systemctl(&["stop", &unit])?;
+        }
+        move_workdir(&s, &s.rc_name)?;
+        s.dir = s.rc_name.clone();
+    }
     ctx.state.spaces.remove(old);
     ctx.state.spaces.insert(new.to_string(), s.clone());
     for b in ctx.state.bridges.iter_mut() {
@@ -490,12 +539,98 @@ pub fn space_rename(old: &str, new: &str, rc_name: Option<String>) -> Result<boo
     }
     ctx.commit()?;
     drop(ctx);
-    let unit = paths::space_unit(&s.key);
-    if s.rc_name != old_rc && sys::unit_state(&unit) == "active" {
+    if move_dir && was_running {
+        sys::systemctl(&["start", &unit])?;
+        return Ok(true);
+    }
+    if s.rc_name != old_rc && was_running {
         sys::systemctl(&["restart", &unit])?;
         return Ok(true);
     }
     Ok(false)
+}
+
+/// Renames a space's work folder to `dir`, with Claude Code's project
+/// folder for it (its chats) and its trust of the folder. Root acts inside
+/// the space's home: it only renames entries there, and refuses links.
+fn move_workdir(s: &Space, dir: &str) -> Result<()> {
+    let home = paths::space_home(&s.key);
+    let from = s.workdir();
+    let to = home.join(dir);
+    let is_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+    if std::fs::symlink_metadata(&to).is_ok() {
+        bail!("{} already exists in the space's home", to.display());
+    }
+    if is_dir(&from) {
+        std::fs::rename(&from, &to)?;
+    } else {
+        let ids =
+            sys::lookup_user(&paths::unix_user(&s.key)).context("the space user is missing")?;
+        sys::mkdir(&to, 0o755)?;
+        sys::chown(&to, ids.uid, ids.gid)?;
+    }
+    let projects = home.join(".claude/projects");
+    let (pf, pt) = (
+        projects.join(project_dir_name(&from)),
+        projects.join(project_dir_name(&to)),
+    );
+    if is_dir(&projects) && is_dir(&pf) && std::fs::symlink_metadata(&pt).is_err() {
+        std::fs::rename(&pf, &pt)?;
+    }
+    trust_folder(s, &to)
+}
+
+/// Marks a folder as trusted in the space's ~/.claude.json, so Claude Code
+/// starts there without asking.
+fn trust_folder(s: &Space, dir: &Path) -> Result<()> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let path = paths::space_home(&s.key).join(".claude.json");
+    let uid = space_uid(&s.key)?;
+    let mut text = String::new();
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+    {
+        let m = f.metadata()?;
+        if !m.is_file() || m.uid() != uid {
+            bail!("{} is not the space's own file", path.display());
+        }
+        f.read_to_string(&mut text)?;
+    }
+    let mut v: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({}));
+    if !v.is_object() {
+        v = serde_json::json!({});
+    }
+    let key = dir.to_string_lossy().to_string();
+    let projects = v
+        .as_object_mut()
+        .expect("object")
+        .entry("projects")
+        .or_insert_with(|| serde_json::json!({}));
+    if !projects.is_object() {
+        *projects = serde_json::json!({});
+    }
+    let entry = projects
+        .as_object_mut()
+        .expect("object")
+        .entry(key)
+        .or_insert_with(|| serde_json::json!({}));
+    if !entry.is_object() {
+        *entry = serde_json::json!({});
+    }
+    entry["hasTrustDialogAccepted"] = serde_json::json!(true);
+    let gid = sys::lookup_user(&paths::unix_user(&s.key))
+        .map(|u| u.gid)
+        .unwrap_or(uid);
+    sys::write_file(
+        &path,
+        &serde_json::to_string_pretty(&v)?,
+        0o600,
+        Some((uid, gid)),
+    )
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -628,6 +763,10 @@ pub struct Chat {
     pub kb: u64,
     /// The one conversation a single-mode or local-only space resumes.
     pub main: bool,
+    /// Running in a window of its own (started from the hub in a Remote
+    /// Control space).
+    #[serde(default)]
+    pub window: bool,
 }
 
 /// Transcripts: ~/.claude/projects/<dir>/<uuid>.jsonl, real files and
@@ -768,6 +907,7 @@ pub fn chat_list(name: &str) -> Result<Vec<Chat>> {
         );
     }
     let main = main_conversation(s);
+    let windows = chat_windows(&s.key);
     let mut chats: Vec<Chat> = chat_files(&s.key)
         .into_iter()
         .filter_map(|(id, p)| {
@@ -782,6 +922,7 @@ pub fn chat_list(name: &str) -> Result<Vec<Chat>> {
             Some(Chat {
                 title: chat_title(&text).unwrap_or_else(|| "(no messages yet)".into()),
                 main: main == Some(id.as_str()),
+                window: windows.iter().any(|w| id.starts_with(w.as_str())),
                 id,
                 modified,
                 kb: meta.len().div_ceil(1024),
@@ -880,6 +1021,93 @@ pub struct ChatOpened {
     pub id: String,
     /// The space was running and was restarted into the chat.
     pub restarted: bool,
+    /// It runs in a window of its own (a Remote Control space).
+    #[serde(default)]
+    pub window: bool,
+}
+
+/// The first 8 characters of the chats running in windows of their own.
+fn chat_windows(key: &str) -> Vec<String> {
+    let sock = paths::tmux_socket(key);
+    let Some(sock) = sock.to_str().filter(|_| sock.exists()) else {
+        return Vec::new();
+    };
+    sys::output(
+        "tmux",
+        &["-S", sock, "list-windows", "-F", "#{window_name}"],
+    )
+    .unwrap_or_default()
+    .lines()
+    .filter_map(|l| l.strip_prefix("chat-"))
+    .map(String::from)
+    .collect()
+}
+
+/// A Remote Control space: a new chat (or an earlier one) in a window of
+/// its own next to the Remote Control server, itself on Remote Control,
+/// so it shows in the Claude app. It runs until it is closed or the space
+/// stops.
+fn open_window(name: &str, s: &Space, cfg: &Config, id: Option<&str>) -> Result<ChatOpened> {
+    let sock = paths::tmux_socket(&s.key);
+    if !sock.exists() || sys::unit_state(&paths::space_unit(&s.key)) != "active" {
+        bail!("space {name} is not running; start it first");
+    }
+    let (id, resume) = match id {
+        None => (uuid::Uuid::new_v4().to_string(), false),
+        Some(i) => {
+            let (id, path) = find_chat(&s.key, i)?;
+            let recent = std::fs::symlink_metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|e| e < Duration::from_secs(600));
+            if recent {
+                bail!("this chat was in use in the last 10 minutes; continue it in the Claude app");
+            }
+            (id, true)
+        }
+    };
+    if chat_windows(&s.key)
+        .iter()
+        .any(|w| id.starts_with(w.as_str()))
+    {
+        bail!("this chat is already running");
+    }
+    let l = render::launch(name, s, cfg);
+    let window = format!("chat-{}", &id[..8]);
+    let home = paths::space_home(&s.key);
+    let workdir = s.workdir();
+    let env_home = format!("HOME={}", home.display());
+    let env_agent = format!("SSH_AUTH_SOCK={}", paths::agent_socket(&s.key).display());
+    let mut args: Vec<&str> = vec![
+        "-S",
+        sock.to_str().context("socket path")?,
+        "new-window",
+        "-d",
+        "-n",
+        &window,
+        "-c",
+        workdir.to_str().context("work path")?,
+        "-e",
+        &env_home,
+        "-e",
+        &env_agent,
+        "-e",
+        "DISABLE_AUTOUPDATER=1",
+        "--",
+        &l.bin,
+        if resume { "--resume" } else { "--session-id" },
+        &id,
+        "--remote-control",
+        &l.rc_name,
+    ];
+    args.extend(l.args.iter().map(String::as_str));
+    sys::run("tmux", &args)?;
+    Ok(ChatOpened {
+        id,
+        restarted: false,
+        window: true,
+    })
 }
 
 /// Makes a one-conversation space (single mode, or without Remote Control)
@@ -896,11 +1124,9 @@ pub fn chat_open(name: &str, id: Option<&str>) -> Result<ChatOpened> {
         );
     }
     if main_conversation(&s).is_none() {
-        bail!(
-            "space {name} serves many chats through Remote Control: start a new one from the \
-             Claude app (claude.ai or the phone app), in its environment {:?}",
-            s.rc_name
-        );
+        let cfg = ctx.cfg.clone();
+        drop(ctx);
+        return open_window(name, &s, &cfg, id);
     }
     let id = match id {
         None => uuid::Uuid::new_v4().to_string(),
@@ -910,6 +1136,7 @@ pub fn chat_open(name: &str, id: Option<&str>) -> Result<ChatOpened> {
         return Ok(ChatOpened {
             id,
             restarted: false,
+            window: false,
         });
     }
     ctx.state
@@ -924,7 +1151,11 @@ pub fn chat_open(name: &str, id: Option<&str>) -> Result<ChatOpened> {
     if restarted {
         sys::systemctl(&["restart", &unit])?;
     }
-    Ok(ChatOpened { id, restarted })
+    Ok(ChatOpened {
+        id,
+        restarted,
+        window: false,
+    })
 }
 
 /// Turns Remote Control on or off for a Claude space. Returns whether the
@@ -1170,7 +1401,7 @@ pub fn login_start(name: &str) -> Result<String> {
         .args(["new-session", "-d", "-s", "main", "-x", "500", "-y", "50"])
         .arg(&cfg.claude_bin)
         .args(["auth", "login", "--claudeai"])
-        .current_dir(paths::space_workdir(&s.key))
+        .current_dir(s.workdir())
         .status()
         .context("starting claude auth login")?;
     if !status.success() {
@@ -1938,6 +2169,7 @@ mod tests {
         let mut cfg = Config {
             web: crate::config::Web {
                 listen: vec!["0.0.0.0:7180".parse().unwrap()],
+                ..Default::default()
             },
             ..Config::default()
         };

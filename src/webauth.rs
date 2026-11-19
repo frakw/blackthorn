@@ -33,6 +33,10 @@ pub struct User {
     /// The last TOTP time step accepted, so a code works only once.
     #[serde(default)]
     pub last_step: u64,
+    /// Passkeys and security keys: each logs in on its own, and stands in
+    /// for a TOTP code where one is asked again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub passkeys: Vec<crate::webauthn::Passkey>,
 }
 
 impl Users {

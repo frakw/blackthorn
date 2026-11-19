@@ -721,6 +721,7 @@ mod tests {
             mode: Mode::Server,
             remote_control: n != "fig-aider",
             rc_name: n.into(),
+            dir: n.into(),
             state: st.into(),
             memory_mb: Some(300),
             chats_24h: Some(2),

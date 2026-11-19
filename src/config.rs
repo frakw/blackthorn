@@ -64,6 +64,28 @@ pub struct Web {
     /// Where the web UI listens, e.g. ["100.64.0.10:7180"] (the hub's
     /// tailnet address). Empty: the web UI is off.
     pub listen: Vec<SocketAddr>,
+    /// HTTPS (needed for passkeys): the name the web UI is reached by, such
+    /// as "blackthorn.example.com", which its certificate is for.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// The certificate chain and key (PEM), e.g. from certbot. Read again
+    /// when they change, so renewing them is enough.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_cert: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_key: Option<PathBuf>,
+    /// Or: get the certificate from Tailscale (`tailscale cert`; needs
+    /// Tailscale's own coordination server with HTTPS on, not Headscale).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tls_tailscale: bool,
+}
+
+impl Web {
+    /// Served over HTTPS.
+    pub fn https(&self) -> bool {
+        !self.name.is_empty()
+            && (self.tls_tailscale || (self.tls_cert.is_some() && self.tls_key.is_some()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -155,6 +177,7 @@ impl Config {
         let cfg = Config {
             web: Web {
                 listen: listen.to_vec(),
+                ..Web::default()
             },
             ..Config::default()
         };
