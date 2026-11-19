@@ -1,13 +1,19 @@
-//! `thorn _run <key>`: runs inside the session's tmux pane, as the session
-//! user, and keeps Claude Code running.
+//! `thorn _run <key>`: runs inside the space's tmux pane, as the space user,
+//! and keeps the agent running.
 //!
-//! - claude exits 0 (you typed /exit): the session ends; `thorn start`
-//!   brings it back, and so does the next boot.
-//! - claude exits with an error or is killed: wait, then resume the same
-//!   conversation, backing off up to five minutes.
+//! - Claude, server mode: `claude remote-control` serves many chats. When it
+//!   stops for any reason it is started again in the same directory, which
+//!   brings back the chats it was serving (Claude Code keeps them for about
+//!   four hours).
+//! - Claude, single mode: one conversation. Exit 0 (you typed /exit) ends
+//!   the space until `thorn start` or the next boot; an error resumes the
+//!   same conversation.
+//! - Other agents: restarted whenever they exit.
+//!
+//! Restarts back off from 5 seconds up to five minutes.
 
 use crate::paths;
-use crate::render::Launch;
+use crate::render::{Launch, LaunchKind};
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
@@ -15,21 +21,18 @@ use std::time::{Duration, Instant};
 
 pub fn run(key: &str) -> Result<()> {
     let launch_path = paths::launch_file(key);
-    let home = paths::session_home(key);
+    let home = paths::space_home(key);
     let mut failures: u32 = 0;
     loop {
         // Re-read every time: an administrator may have changed the args.
         let text = std::fs::read_to_string(&launch_path)
             .with_context(|| format!("reading {}", launch_path.display()))?;
         let launch: Launch = toml::from_str(&text)?;
-        let args = claude_args(&launch, conversation_exists(&home, &launch.conversation));
+        let args = agent_args(&launch, conversation_exists(&home, &launch.conversation));
 
-        println!(
-            "blackthorn: starting session {} ({})",
-            launch.name, launch.rc_name
-        );
+        println!("blackthorn: starting space {}", launch.name);
         let started = Instant::now();
-        let status = Command::new(&launch.claude_bin)
+        let status = Command::new(&launch.bin)
             .args(&args)
             .env("SSH_AUTH_SOCK", paths::agent_socket(key))
             .env("DISABLE_AUTOUPDATER", "1")
@@ -37,9 +40,9 @@ pub fn run(key: &str) -> Result<()> {
             .status();
 
         match status {
-            Ok(s) if s.success() => {
+            Ok(s) if s.success() && launch.kind == LaunchKind::ClaudeSingle => {
                 println!(
-                    "blackthorn: claude exited normally; session {} ends.",
+                    "blackthorn: claude exited normally; space {} ends.",
                     launch.name
                 );
                 println!(
@@ -48,8 +51,8 @@ pub fn run(key: &str) -> Result<()> {
                 );
                 return Ok(());
             }
-            Ok(s) => eprintln!("blackthorn: claude exited with {s}"),
-            Err(e) => eprintln!("blackthorn: could not run {}: {e}", launch.claude_bin),
+            Ok(s) => eprintln!("blackthorn: {} exited with {s}", launch.bin),
+            Err(e) => eprintln!("blackthorn: could not run {}: {e}", launch.bin),
         }
         if started.elapsed() > Duration::from_secs(600) {
             failures = 0;
@@ -61,17 +64,26 @@ pub fn run(key: &str) -> Result<()> {
     }
 }
 
-pub fn claude_args(launch: &Launch, resume: bool) -> Vec<String> {
-    let mut args = Vec::new();
-    if resume {
-        args.push("--resume".to_string());
-    } else {
-        // First start: create the conversation under our id.
-        args.push("--session-id".to_string());
+pub fn agent_args(launch: &Launch, resume: bool) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    match launch.kind {
+        LaunchKind::ClaudeServer => {
+            args.extend([
+                "remote-control".into(),
+                "--name".into(),
+                launch.rc_name.clone(),
+            ]);
+            args.extend(["--spawn".into(), "same-dir".into()]);
+            args.extend(["--capacity".into(), launch.capacity.to_string()]);
+        }
+        LaunchKind::ClaudeSingle => {
+            // First start: create the conversation under our id.
+            args.push(if resume { "--resume" } else { "--session-id" }.into());
+            args.push(launch.conversation.clone());
+            args.extend(["--remote-control".into(), launch.rc_name.clone()]);
+        }
+        LaunchKind::Command => {}
     }
-    args.push(launch.conversation.clone());
-    args.push("--remote-control".to_string());
-    args.push(launch.rc_name.clone());
     args.extend(launch.args.iter().cloned());
     args
 }
@@ -101,31 +113,59 @@ fn conversation_exists(home: &Path, id: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn launch() -> Launch {
+    fn launch(kind: LaunchKind) -> Launch {
         Launch {
-            name: "ops".into(),
+            name: "fig-claude".into(),
+            kind,
+            bin: "/usr/local/bin/claude".into(),
+            rc_name: "fig-claude".into(),
             conversation: "c0ffee00-0000-4000-8000-000000000000".into(),
-            rc_name: "ops-hub".into(),
-            claude_bin: "/usr/local/bin/claude".into(),
+            capacity: 8,
             args: vec!["--permission-mode".into(), "acceptEdits".into()],
         }
     }
 
     #[test]
-    fn first_start_creates_then_resumes() {
-        let first = claude_args(&launch(), false);
+    fn server_mode() {
         assert_eq!(
-            first,
+            agent_args(&launch(LaunchKind::ClaudeServer), false),
             vec![
-                "--session-id",
-                "c0ffee00-0000-4000-8000-000000000000",
-                "--remote-control",
-                "ops-hub",
+                "remote-control",
+                "--name",
+                "fig-claude",
+                "--spawn",
+                "same-dir",
+                "--capacity",
+                "8",
                 "--permission-mode",
                 "acceptEdits"
             ]
         );
-        assert_eq!(claude_args(&launch(), true)[0], "--resume");
+    }
+
+    #[test]
+    fn single_mode_creates_then_resumes() {
+        let l = launch(LaunchKind::ClaudeSingle);
+        assert_eq!(
+            agent_args(&l, false),
+            vec![
+                "--session-id",
+                "c0ffee00-0000-4000-8000-000000000000",
+                "--remote-control",
+                "fig-claude",
+                "--permission-mode",
+                "acceptEdits"
+            ]
+        );
+        assert_eq!(agent_args(&l, true)[0], "--resume");
+    }
+
+    #[test]
+    fn other_agents_get_only_their_args() {
+        assert_eq!(
+            agent_args(&launch(LaunchKind::Command), false),
+            vec!["--permission-mode", "acceptEdits"]
+        );
     }
 
     #[test]
@@ -142,7 +182,7 @@ mod tests {
         assert!(!conversation_exists(home.path(), id));
         let dir = home
             .path()
-            .join(".claude/projects/-var-lib-blackthorn-sessions-x-work");
+            .join(".claude/projects/-var-lib-blackthorn-spaces-x-work");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(format!("{id}.jsonl")), "{}").unwrap();
         assert!(conversation_exists(home.path(), id));

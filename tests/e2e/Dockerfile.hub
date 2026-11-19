@@ -1,8 +1,11 @@
-# A throwaway blackthorn hub for tests: Debian with systemd as PID 1.
+# A throwaway blackthorn hub for tests: Debian with systemd as PID 1, plus
+# sshd and the TOTP PAM module for the `thorn harden ssh` test.
 FROM debian:trixie
 RUN apt-get update \
  && apt-get install -y --no-install-recommends systemd systemd-sysv tmux openssh-client \
-      nftables passwd util-linux procps iproute2 ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+      openssh-server libpam-google-authenticator nftables passwd util-linux procps \
+      iproute2 ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd -m -s /bin/bash admin && install -d -o admin -g admin -m 700 /home/admin/.ssh
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]

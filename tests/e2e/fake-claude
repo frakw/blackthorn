@@ -1,8 +1,20 @@
 #!/bin/sh
-# Stands in for Claude Code in tests: records how it was started, then keeps
-# trying every target host and logs which ones it can reach.
+# Stands in for Claude Code in tests: records how it was started, signs in
+# with the code "good-code", and otherwise keeps trying both target hosts,
+# logging which ones it can reach.
 echo "$*" >> "$HOME/fake-claude.args"
-case "$1" in auth) exit 0 ;; --version) echo "0.0.0 (fake)"; exit 0 ;; esac
+case "$1" in
+  --version) echo "0.0.0 (fake)"; exit 0 ;;
+  auth)
+    echo "Opening browser to sign in..."
+    echo "If the browser didn't open, visit: https://claude.example/oauth/authorize?code=true&state=e2e"
+    printf "Paste code here if prompted > "
+    read -r code
+    [ "$code" = "good-code" ] || { echo "invalid code"; exit 1; }
+    mkdir -p "$HOME/.claude" && echo '{}' > "$HOME/.claude/.credentials.json"
+    echo "Login successful."
+    exit 0 ;;
+esac
 while true; do
   for h in t1 t2; do
     if ssh -o ConnectTimeout=3 "$h" true 2>/dev/null; then r=ok; else r=FAIL; fi

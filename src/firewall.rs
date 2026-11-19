@@ -1,18 +1,23 @@
-//! The nftables ruleset that limits where session users can connect.
+//! The nftables ruleset of the hub.
 //!
-//! Every session runs as its own Unix user. Packets from those users are
-//! matched by uid in the output hook; packets from anyone else (root, you,
-//! tailscaled) are left alone. A session may send only:
+//! Output: every space runs as its own Unix user. Packets from those users
+//! are matched by uid; packets from anyone else (root, you, tailscaled) are
+//! left alone. A space may send only:
 //!   - to loopback,
 //!   - DNS to the configured nameservers,
 //!   - HTTPS anywhere (if enabled; Claude Code needs Anthropic),
-//!   - to the address and SSH port of each host granted to it and not blocked.
+//!   - to the address and SSH port of each host it may reach (its own
+//!     machine, and bridged ones) that is not blocked.
 //!
-//! Everything else is rejected.
+//! Everything else is rejected. There is deliberately no "established
+//! connections are fine" rule there: when a host is blocked or a bridge
+//! ends, packets on connections already open to it are rejected too, so the
+//! cut is immediate.
 //!
-//! There is deliberately no "established connections are fine" rule: when a
-//! host is blocked or revoked, packets on connections already open to it are
-//! rejected too, so the cut is immediate.
+//! Input: managed machines (and `never_manage`/`deny_from` addresses) can
+//! never open a connection to the hub; replies to the hub's own connections
+//! still arrive. If admin addresses are configured, only they may reach the
+//! admin ports (SSH, web UI).
 
 use anyhow::{bail, Context, Result};
 use std::fmt::Write as _;
@@ -23,17 +28,27 @@ use std::process::{Command, Stdio};
 pub const TABLE: &str = "blackthorn";
 
 #[derive(Debug, Clone)]
-pub struct SessionRules {
+pub struct SpaceRules {
     pub name: String,
     pub uid: u32,
     pub allow: Vec<(String, IpAddr, u16)>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct InboundPlan {
+    /// Never accepted: managed machines and configured addresses.
+    pub deny_from: Vec<IpAddr>,
+    /// If not empty, the only sources allowed on `admin_ports`.
+    pub admin_from: Vec<IpAddr>,
+    pub admin_ports: Vec<u16>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Plan {
-    pub sessions: Vec<SessionRules>,
+    pub spaces: Vec<SpaceRules>,
     pub dns: Vec<IpAddr>,
     pub https_anywhere: bool,
+    pub inbound: InboundPlan,
 }
 
 fn addr_match(a: &IpAddr) -> String {
@@ -58,11 +73,18 @@ pub fn render(plan: &Plan) -> String {
     let _ = writeln!(out, "table inet {TABLE} {{");
     out.push_str("\tchain output {\n");
     out.push_str("\t\ttype filter hook output priority filter; policy accept;\n");
+    if !plan.spaces.is_empty() {
+        let uids = set(plan.spaces.iter().map(|s| s.uid));
+        // Only packets that belong to a space user's socket go to the
+        // restricted chain. Everything else, including packets the kernel
+        // sends with no socket attached (such as the last packets of a
+        // connection another program already closed), is left alone.
+        let _ = writeln!(out, "\t\tmeta skuid {uids} jump spaces");
+    }
+    out.push_str("\t}\n");
 
-    if !plan.sessions.is_empty() {
-        let uids = set(plan.sessions.iter().map(|s| s.uid));
-        let _ = writeln!(out, "\t\t# Only session users are restricted.");
-        let _ = writeln!(out, "\t\tmeta skuid != {uids} accept");
+    if !plan.spaces.is_empty() {
+        out.push_str("\tchain spaces {\n");
         out.push_str("\t\toifname \"lo\" accept\n");
 
         let dns4: Vec<_> = plan.dns.iter().filter(|a| a.is_ipv4()).collect();
@@ -84,8 +106,8 @@ pub fn render(plan: &Plan) -> String {
         if plan.https_anywhere {
             out.push_str("\t\ttcp dport 443 accept\n");
         }
-        for s in &plan.sessions {
-            let _ = writeln!(out, "\t\t# session {}", s.name);
+        for s in &plan.spaces {
+            let _ = writeln!(out, "\t\t# space {}", s.name);
             for (host, addr, port) in &s.allow {
                 let _ = writeln!(
                     out,
@@ -99,9 +121,46 @@ pub fn render(plan: &Plan) -> String {
         }
         out.push_str("\t\tmeta l4proto tcp counter reject with tcp reset\n");
         out.push_str("\t\tcounter reject with icmpx type admin-prohibited\n");
+        out.push_str("\t}\n");
     }
-    out.push_str("\t}\n}\n");
+    render_input(&mut out, &plan.inbound);
+    out.push_str("}\n");
     out
+}
+
+fn split(addrs: &[IpAddr]) -> (Vec<&IpAddr>, Vec<&IpAddr>) {
+    addrs.iter().partition(|a| a.is_ipv4())
+}
+
+fn render_input(out: &mut String, p: &InboundPlan) {
+    out.push_str("\tchain input {\n");
+    out.push_str("\t\ttype filter hook input priority filter; policy accept;\n");
+    out.push_str("\t\tiifname \"lo\" accept\n");
+    out.push_str("\t\t# Replies to connections the hub opened.\n");
+    out.push_str("\t\tct state established,related accept\n");
+    let (d4, d6) = split(&p.deny_from);
+    if !d4.is_empty() || !d6.is_empty() {
+        out.push_str("\t\t# Managed machines never open connections to the hub.\n");
+    }
+    if !d4.is_empty() {
+        let _ = writeln!(out, "\t\tip saddr {} counter drop", set(d4));
+    }
+    if !d6.is_empty() {
+        let _ = writeln!(out, "\t\tip6 saddr {} counter drop", set(d6));
+    }
+    if !p.admin_from.is_empty() && !p.admin_ports.is_empty() {
+        let ports = set(&p.admin_ports);
+        let (a4, a6) = split(&p.admin_from);
+        out.push_str("\t\t# Admin ports: your devices only.\n");
+        if !a4.is_empty() {
+            let _ = writeln!(out, "\t\ttcp dport {ports} ip saddr {} accept", set(a4));
+        }
+        if !a6.is_empty() {
+            let _ = writeln!(out, "\t\ttcp dport {ports} ip6 saddr {} accept", set(a6));
+        }
+        let _ = writeln!(out, "\t\ttcp dport {ports} counter drop");
+    }
+    out.push_str("\t}\n");
 }
 
 pub fn apply(ruleset: &str) -> Result<()> {
@@ -155,8 +214,8 @@ mod tests {
 
     fn plan() -> Plan {
         Plan {
-            sessions: vec![
-                SessionRules {
+            spaces: vec![
+                SpaceRules {
                     name: "ops".into(),
                     uid: 990,
                     allow: vec![
@@ -164,7 +223,7 @@ mod tests {
                         ("nas".into(), "fd7a:115c:a1e0::5".parse().unwrap(), 2222),
                     ],
                 },
-                SessionRules {
+                SpaceRules {
                     name: "idle".into(),
                     uid: 991,
                     allow: vec![],
@@ -175,13 +234,48 @@ mod tests {
                 "fd7a::53".parse().unwrap(),
             ],
             https_anywhere: true,
+            inbound: InboundPlan {
+                deny_from: vec!["100.80.0.3".parse().unwrap(), "fd7a::5".parse().unwrap()],
+                admin_from: vec!["100.64.0.2".parse().unwrap()],
+                admin_ports: vec![22, 7180],
+            },
+        }
+    }
+
+    fn empty() -> Plan {
+        Plan {
+            spaces: vec![],
+            dns: vec![],
+            https_anywhere: true,
+            inbound: InboundPlan::default(),
         }
     }
 
     #[test]
-    fn restricts_only_session_uids() {
+    fn inbound_refuses_managed_machines_and_limits_admin_ports() {
         let r = render(&plan());
-        assert!(r.contains("meta skuid != { 990, 991 } accept"));
+        let input = &r[r.find("chain input").unwrap()..];
+        assert!(input.contains("ct state established,related accept"));
+        assert!(input.contains("ip saddr { 100.80.0.3 } counter drop"));
+        assert!(input.contains("ip6 saddr { fd7a::5 } counter drop"));
+        assert!(input.contains("tcp dport { 22, 7180 } ip saddr { 100.64.0.2 } accept"));
+        assert!(input.contains("tcp dport { 22, 7180 } counter drop"));
+        // Drops of managed machines come before any accept of admin ports.
+        assert!(input.find("100.80.0.3").unwrap() < input.find("100.64.0.2").unwrap());
+        // No admin list: admin ports are left open.
+        let mut p = plan();
+        p.inbound.admin_from.clear();
+        assert!(!render(&p).contains("dport { 22"));
+    }
+
+    #[test]
+    fn restricts_only_space_uids() {
+        let r = render(&plan());
+        assert!(r.contains("meta skuid { 990, 991 } jump spaces"));
+        // Nothing else in the output hook: packets without a space user's
+        // socket (including those with no socket at all) are accepted.
+        let output = &r[r.find("chain output").unwrap()..r.find("chain spaces").unwrap()];
+        assert!(!output.contains("reject"));
     }
 
     #[test]
@@ -195,7 +289,8 @@ mod tests {
     #[test]
     fn no_established_shortcut_and_ends_in_reject() {
         let r = render(&plan());
-        assert!(!r.contains("established"));
+        let spaces = &r[r.find("chain spaces").unwrap()..r.find("chain input").unwrap()];
+        assert!(!spaces.contains("established"));
         let last_rule = r
             .lines()
             .rev()
@@ -223,21 +318,12 @@ mod tests {
     #[ignore]
     fn nft_accepts_the_ruleset() {
         check(&render(&plan())).unwrap();
-        check(&render(&Plan {
-            sessions: vec![],
-            dns: vec![],
-            https_anywhere: true,
-        }))
-        .unwrap();
+        check(&render(&empty())).unwrap();
     }
 
     #[test]
     fn empty_plan_restricts_nobody() {
-        let r = render(&Plan {
-            sessions: vec![],
-            dns: vec![],
-            https_anywhere: true,
-        });
+        let r = render(&empty());
         assert!(!r.contains("skuid"));
         assert!(!r.contains("reject"));
         assert!(r.contains("policy accept"));

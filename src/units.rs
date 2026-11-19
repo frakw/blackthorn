@@ -1,17 +1,22 @@
 //! systemd units installed by `thorn init`.
 //!
-//! Each session is two template instances keyed by the session key:
-//!   blackthorn-agent@<key>    ssh-agent holding the keys of the hosts the
-//!                             session may reach (loaded by root)
-//!   blackthorn-session@<key>  tmux server whose only pane runs Claude Code
-//! Both run as the session's own user. They require the firewall unit, so a
-//! session never runs without its egress rules in place.
+//! Each space is two template instances keyed by the space key:
+//!   blackthorn-agent@<key>  ssh-agent holding the keys of the hosts the
+//!                           space may reach (loaded by root)
+//!   blackthorn-space@<key>  tmux server whose only pane runs the agent
+//! Both run as the space's own user. They require the firewall unit, so a
+//! space never runs without its egress rules in place.
+//!
+//! The web UI is two units: blackthorn-api (root, a Unix socket only) and
+//! blackthorn-web (an unprivileged user, the HTTP listener).
 
 pub const FIREWALL: &str = "blackthorn-firewall.service";
 pub const TICK_SERVICE: &str = "blackthorn-tick.service";
 pub const TICK_TIMER: &str = "blackthorn-tick.timer";
 pub const AGENT_TEMPLATE: &str = "blackthorn-agent@.service";
-pub const SESSION_TEMPLATE: &str = "blackthorn-session@.service";
+pub const SPACE_TEMPLATE: &str = "blackthorn-space@.service";
+pub const API: &str = "blackthorn-api.service";
+pub const WEB: &str = "blackthorn-web.service";
 
 pub fn all() -> Vec<(&'static str, String)> {
     vec![
@@ -19,7 +24,9 @@ pub fn all() -> Vec<(&'static str, String)> {
         (TICK_SERVICE, tick_service()),
         (TICK_TIMER, tick_timer()),
         (AGENT_TEMPLATE, agent()),
-        (SESSION_TEMPLATE, session()),
+        (SPACE_TEMPLATE, space()),
+        (API, api()),
+        (WEB, web()),
     ]
 }
 
@@ -27,7 +34,7 @@ fn firewall() -> String {
     // No ExecStop: stopping this unit leaves the rules loaded (fail closed).
     "# Installed by thorn init.
 [Unit]
-Description=blackthorn: egress rules for session users
+Description=blackthorn: firewall (space egress, hub inbound)
 DefaultDependencies=no
 After=local-fs.target
 Before=network-pre.target
@@ -47,7 +54,7 @@ WantedBy=multi-user.target
 fn tick_service() -> String {
     "# Installed by thorn init.
 [Unit]
-Description=blackthorn: lift expired host blocks and refresh the firewall
+Description=blackthorn: lift expired blocks and bridges, refresh the firewall
 
 [Service]
 Type=oneshot
@@ -75,10 +82,10 @@ WantedBy=timers.target
 fn agent() -> String {
     "# Installed by thorn init.
 [Unit]
-Description=blackthorn: ssh-agent for session %i
+Description=blackthorn: ssh-agent for space %i
 Requires=blackthorn-firewall.service
 After=blackthorn-firewall.service
-PartOf=blackthorn-session@%i.service
+PartOf=blackthorn-space@%i.service
 
 [Service]
 Type=simple
@@ -86,9 +93,9 @@ User=bt-%i
 Group=bt-%i
 RuntimeDirectory=blackthorn-agent/%i
 RuntimeDirectoryMode=0700
-# ssh-agent marks itself non-dumpable, so the session user cannot read keys
+# ssh-agent marks itself non-dumpable, so the space user cannot read keys
 # out of its memory. Keys are added by root below and never touch the
-# session user's files.
+# space user's files.
 ExecStart=/usr/bin/ssh-agent -D -a /run/blackthorn-agent/%i/agent.sock
 ExecStartPost=+/usr/local/bin/thorn _load-keys %i
 Restart=on-failure
@@ -97,10 +104,10 @@ RestartSec=5
     .to_string()
 }
 
-fn session() -> String {
+fn space() -> String {
     "# Installed by thorn init.
 [Unit]
-Description=blackthorn: Claude Code session %i
+Description=blackthorn: space %i
 Requires=blackthorn-firewall.service blackthorn-agent@%i.service
 After=blackthorn-firewall.service blackthorn-agent@%i.service network-online.target tailscaled.service
 Wants=network-online.target
@@ -109,21 +116,21 @@ Wants=network-online.target
 Type=forking
 User=bt-%i
 Group=bt-%i
-Environment=HOME=/var/lib/blackthorn/sessions/%i
-WorkingDirectory=/var/lib/blackthorn/sessions/%i/work
+Environment=HOME=/var/lib/blackthorn/spaces/%i
+WorkingDirectory=/var/lib/blackthorn/spaces/%i/work
 RuntimeDirectory=blackthorn/%i
 RuntimeDirectoryMode=0700
 ExecStart=/usr/bin/tmux -S /run/blackthorn/%i/tmux.sock new-session -d -s main -x 200 -y 50 /usr/local/bin/thorn _run %i
 ExecStop=/usr/bin/tmux -S /run/blackthorn/%i/tmux.sock kill-server
-# claude exiting with an error is retried inside the pane by thorn _run;
-# this restarts the whole session only if tmux itself fails.
+# The agent exiting is handled inside the pane by thorn _run; this restarts
+# the whole space only if tmux itself fails.
 Restart=on-failure
 RestartSec=10
 
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/lib/blackthorn/sessions/%i /run/blackthorn-agent/%i
+ReadWritePaths=/var/lib/blackthorn/spaces/%i /run/blackthorn-agent/%i
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
@@ -137,13 +144,85 @@ WantedBy=multi-user.target
     .to_string()
 }
 
+fn api() -> String {
+    // Root, because it creates users and manages units. It listens only on
+    // a Unix socket that the web user's group may open, and checks the
+    // password and TOTP code itself, so the web process cannot act alone.
+    "# Installed by thorn init.
+[Unit]
+Description=blackthorn: API for the web UI (root, Unix socket only)
+After=blackthorn-firewall.service
+
+[Service]
+Type=simple
+Group=blackthorn-web
+RuntimeDirectory=blackthorn-api
+RuntimeDirectoryMode=0750
+ExecStart=/usr/local/bin/thorn _api
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"
+    .to_string()
+}
+
+fn web() -> String {
+    // The part that parses HTTP from the network: unprivileged and boxed in.
+    // If its listen address does not exist yet (the tailnet is still coming
+    // up), it fails and is retried.
+    "# Installed by thorn init.
+[Unit]
+Description=blackthorn: web UI
+Requires=blackthorn-api.service
+After=blackthorn-api.service network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=blackthorn-web
+Group=blackthorn-web
+ExecStart=/usr/local/bin/thorn _web
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+InaccessiblePaths=/etc/blackthorn /var/lib/blackthorn
+
+[Install]
+WantedBy=multi-user.target
+"
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn sessions_require_firewall_and_agent() {
-        let s = session();
+    fn spaces_require_firewall_and_agent() {
+        let s = space();
         assert!(s.contains("Requires=blackthorn-firewall.service blackthorn-agent@%i.service"));
         assert!(s.contains("User=bt-%i"));
         let a = agent();
@@ -159,9 +238,12 @@ mod tests {
     #[test]
     fn paths_agree_with_paths_module() {
         use crate::paths;
-        let s = session();
+        let s = space();
         assert!(s.contains(&paths::tmux_socket("%i").display().to_string()));
-        assert!(s.contains(&paths::session_workdir("%i").display().to_string()));
+        assert!(s.contains(&paths::space_workdir("%i").display().to_string()));
+        assert!(api().contains("RuntimeDirectory=blackthorn-api"));
+        assert!(paths::API_SOCKET.starts_with(paths::API_DIR));
+        assert!(web().contains(&format!("User={}", paths::WEB_USER)));
         assert!(agent().contains(&paths::agent_socket("%i").display().to_string()));
     }
 }

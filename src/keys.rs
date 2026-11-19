@@ -1,4 +1,4 @@
-//! SSH keys: one key pair per host, kept by root, handed to sessions only
+//! SSH keys: one key pair per host, kept by root, handed to spaces only
 //! through their ssh-agent.
 
 use crate::paths;
@@ -50,9 +50,19 @@ pub fn public_key(host: &str) -> Result<String> {
 }
 
 /// The line to put in the remote user's ~/.ssh/authorized_keys. `restrict`
-/// turns off port, agent and X11 forwarding and pty allocation for this key.
-pub fn authorized_keys_line(host: &str) -> Result<String> {
-    Ok(format!("restrict {}", public_key(host)?))
+/// turns off port, agent and X11 forwarding and pty allocation for this key;
+/// `from` limits it to the hub's addresses, so a copy is useless elsewhere.
+pub fn authorized_keys_line(host: &str, from: &[IpAddr]) -> Result<String> {
+    Ok(key_line(&public_key(host)?, from))
+}
+
+pub fn key_line(public_key: &str, from: &[IpAddr]) -> String {
+    if from.is_empty() {
+        format!("restrict {public_key}")
+    } else {
+        let list: Vec<String> = from.iter().map(|a| a.to_string()).collect();
+        format!("from=\"{}\",restrict {public_key}", list.join(","))
+    }
 }
 
 /// The host's public keys as "<type> <base64>", fetched with ssh-keyscan.
@@ -133,7 +143,7 @@ pub fn fingerprints(host_keys: &[String]) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Replaces everything in a session's agent with the keys of `hosts`.
+/// Replaces everything in a space's agent with the keys of `hosts`.
 /// Does nothing if the agent is not running.
 pub fn sync_agent(key: &str, hosts: &[&str]) -> Result<()> {
     let sock = paths::agent_socket(key);
@@ -190,6 +200,19 @@ pub fn wait_for_socket(key: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_lines() {
+        assert_eq!(
+            key_line("ssh-ed25519 AAAA c", &[]),
+            "restrict ssh-ed25519 AAAA c"
+        );
+        let from = ["100.64.0.10".parse().unwrap(), "fd7a::a".parse().unwrap()];
+        assert_eq!(
+            key_line("ssh-ed25519 AAAA c", &from),
+            "from=\"100.64.0.10,fd7a::a\",restrict ssh-ed25519 AAAA c"
+        );
+    }
 
     #[test]
     fn keyscan_output() {

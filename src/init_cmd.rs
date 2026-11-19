@@ -1,10 +1,9 @@
-//! thorn init, thorn status, and the internal commands systemd runs.
+//! thorn init, apply, firewall, and the internal commands systemd runs.
 
 use crate::config::Config;
 use crate::ctx::{self, Ctx};
-use crate::host_cmd::describe_block;
 use crate::state::{now, StateLock};
-use crate::{apply, firewall, keys, paths, session_cmd, sys, units};
+use crate::{apply, firewall, keys, paths, sys, units};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -50,7 +49,7 @@ pub fn init(claude_from: Option<PathBuf>) -> Result<()> {
         (paths::CONFIG_DIR, 0o755),
         (paths::KEYS_DIR, 0o700),
         (paths::STATE_DIR, 0o755),
-        (paths::SESSIONS_DIR, 0o755),
+        (paths::SPACES_DIR, 0o755),
         (paths::LAUNCH_DIR, 0o755),
     ] {
         sys::mkdir(Path::new(dir), mode)?;
@@ -85,6 +84,12 @@ pub fn init(claude_from: Option<PathBuf>) -> Result<()> {
         );
     }
 
+    // The unprivileged user the web UI runs as (created now so the API
+    // unit's Group= exists even if the web UI is never turned on).
+    if sys::lookup_user(paths::WEB_USER).is_none() {
+        sys::create_user(paths::WEB_USER, std::path::Path::new("/nonexistent"))?;
+    }
+
     for (name, text) in units::all() {
         sys::write_file(
             &Path::new(paths::SYSTEMD_DIR).join(name),
@@ -101,10 +106,15 @@ pub fn init(claude_from: Option<PathBuf>) -> Result<()> {
     }
     sys::systemctl(&["enable", "--now", units::FIREWALL, units::TICK_TIMER])?;
 
+    if sys::unit_state(units::WEB) == "active" {
+        sys::systemctl(&["restart", units::API, units::WEB])?;
+    }
+
     println!("\nblackthorn is ready. Next:");
-    println!("  sudo thorn host add <name> user@<address>     register a machine");
-    println!("  sudo thorn new <session> --host <name>        create a session");
-    println!("  sudo thorn login <session>                    sign it in and start it");
+    println!("  sudo thorn host add <name> user@<address>   register a machine");
+    println!("  sudo thorn new <name>                       create a space on it (Claude)");
+    println!("  sudo thorn login <name>-claude              sign it in; it starts right after");
+    println!("  sudo thorn web user add <you>               then: sudo thorn web enable");
     Ok(())
 }
 
@@ -119,76 +129,13 @@ fn install_file(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn status() -> Result<()> {
-    let (cfg, state) = ctx::read_only()?;
-    let t = now();
-    let fw = if firewall::show().is_ok() {
-        "loaded"
-    } else {
-        "NOT LOADED (sessions are unrestricted!)"
-    };
-    println!("firewall:    {fw}");
-    println!("block timer: {}", sys::unit_state(units::TICK_TIMER));
-    let claude = sys::output(
-        "timeout",
-        &[
-            "10",
-            cfg.claude_bin.to_str().unwrap_or("claude"),
-            "--version",
-        ],
-    )
-    .map(|v| v.trim().to_string())
-    .unwrap_or_else(|_| format!("missing ({})", cfg.claude_bin.display()));
-    println!("claude:      {claude}");
-    println!(
-        "egress:      https {}, dns {}",
-        if cfg.egress.https_anywhere {
-            "anywhere"
-        } else {
-            "off"
-        },
-        if cfg.egress.dns.is_empty() {
-            "from /etc/resolv.conf".to_string()
-        } else {
-            format!("{:?}", cfg.egress.dns)
-        }
-    );
-    if let Ok(mem) = std::fs::read_to_string("/proc/meminfo") {
-        if let Some(avail) = mem.lines().find(|l| l.starts_with("MemAvailable:")) {
-            let kb: u64 = avail
-                .split_whitespace()
-                .nth(1)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            println!("memory:      {} MB available", kb / 1024);
-        }
-    }
-    println!();
-    session_cmd::ls()?;
-    let blocked: Vec<String> = state
-        .hosts
-        .iter()
-        .filter(|(_, h)| h.blocked(t))
-        .map(|(n, h)| {
-            format!(
-                "{n}: {}",
-                describe_block(h.block.as_ref().expect("blocked"), t)
-            )
-        })
-        .collect();
-    if !blocked.is_empty() {
-        println!("\nblocked hosts:");
-        for b in blocked {
-            println!("  {b}");
-        }
-    }
-    Ok(())
-}
-
 pub fn apply_all() -> Result<()> {
     let ctx = Ctx::open()?;
     apply::firewall_rules(&ctx.cfg, &ctx.state, ctx.now, true)?;
     apply::everything(&ctx.cfg, &ctx.state, ctx.now)?;
+    drop(ctx);
+    // Picks up a changed listen address.
+    sys::systemctl(&["try-restart", units::WEB])?;
     println!("applied");
     Ok(())
 }
@@ -215,30 +162,37 @@ pub fn firewall_show(planned: bool) -> Result<()> {
     Ok(())
 }
 
-/// Every minute: lift expired blocks, and reload the firewall if anything it
-/// depends on changed (such as the nameservers in /etc/resolv.conf).
+/// Every minute: lift expired blocks, end expired bridges, and reload the
+/// firewall if anything it depends on changed (such as the nameservers in
+/// /etc/resolv.conf).
 pub fn tick() -> Result<()> {
     let mut ctx = Ctx::open()?;
     let lifted = ctx.state.expire_blocks(ctx.now);
-    if lifted.is_empty() {
+    let ended = ctx.state.expire_bridges(ctx.now);
+    if lifted.is_empty() && ended.is_empty() {
         apply::firewall_rules(&ctx.cfg, &ctx.state, ctx.now, false)?;
-    } else {
-        ctx.commit()?;
-        println!("block lifted: {}", lifted.join(", "));
+        return Ok(());
+    }
+    ctx.commit()?;
+    for h in lifted {
+        println!("block lifted: {h}");
+    }
+    for b in ended {
+        println!("bridge ended: {b}");
     }
     Ok(())
 }
 
-/// ExecStartPost of the agent unit: load the session's keys.
+/// ExecStartPost of the agent unit: load the space's keys.
 pub fn load_keys(key: &str) -> Result<()> {
     sys::require_root()?;
     let (_, state) = ctx::read_only()?;
-    let Some((_, s)) = state.session_by_key(key) else {
-        bail!("no session with key {key}");
+    let Some((name, _)) = state.space_by_key(key) else {
+        bail!("no space with key {key}");
     };
     keys::wait_for_socket(key)?;
     let hosts: Vec<&str> = state
-        .reachable_hosts(s, now())
+        .reachable_hosts(name, now())
         .into_iter()
         .map(|(n, _)| n)
         .collect();

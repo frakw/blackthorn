@@ -1,0 +1,8 @@
+# Your laptop, for tests: SSH and a browser stand-in (curl), and oathtool
+# playing the authenticator app.
+FROM debian:trixie
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssh-client curl oathtool ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /root/.ssh && ssh-keygen -q -t ed25519 -N '' -f /root/.ssh/id_ed25519
+CMD ["sleep", "infinity"]

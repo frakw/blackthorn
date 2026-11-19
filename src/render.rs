@@ -1,16 +1,17 @@
-//! Files generated for each session: ssh_config, known_hosts, CLAUDE.md and
-//! the launch file. Pure functions; `apply` writes them.
+//! Files generated for each space: ssh_config, known_hosts, the
+//! instructions file and the launch file. Pure functions; `apply` writes them.
 
+use crate::config::{Config, CLAUDE};
 use crate::paths;
-use crate::state::{Host, Session, State};
+use crate::state::{Host, Mode, Space, State};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 
-/// ~/.ssh/config of a session user. Lists only the hosts it may reach.
+/// ~/.ssh/config of a space user. Lists only the hosts it may reach.
 ///
-/// These options are a convenience, not a boundary: the session can pass
+/// These options are a convenience, not a boundary: the space can pass
 /// its own options to ssh. The boundary is the firewall and which keys are
-/// in the session's agent (see THREAT_MODEL.md).
+/// in the space's agent (see THREAT_MODEL.md).
 pub fn ssh_config(key: &str, reachable: &[(&str, &Host)]) -> String {
     let mut out = String::from("# Managed by thorn. Changes are overwritten.\n\n");
     for (name, h) in reachable {
@@ -22,8 +23,8 @@ pub fn ssh_config(key: &str, reachable: &[(&str, &Host)]) -> String {
         out.push('\n');
     }
     let agent = paths::agent_socket(key);
-    let runtime = paths::session_runtime(key);
-    let home = paths::session_home(key);
+    let runtime = paths::space_runtime(key);
+    let home = paths::space_home(key);
     let _ = writeln!(out, "Host *");
     let _ = writeln!(out, "    IdentityAgent {}", agent.display());
     let _ = writeln!(out, "    ForwardAgent no");
@@ -57,13 +58,21 @@ pub fn known_hosts(reachable: &[(&str, &Host)]) -> String {
     out
 }
 
-pub fn claude_md(session_name: &str, state: &State, session: &Session, now: u64) -> String {
-    let reachable = state.reachable_hosts(session, now);
+/// The instructions file (CLAUDE.md, AGENTS.md, ...) in a space's work
+/// directory: the rules, and the machines it can reach.
+pub fn instructions(space_name: &str, state: &State, now: u64) -> String {
+    let Some(space) = state.spaces.get(space_name) else {
+        return String::new();
+    };
+    let reachable = state.reachable_hosts(space_name, now);
     let mut out = String::new();
-    let _ = writeln!(out, "# blackthorn session `{session_name}`\n");
-    out.push_str(
-        "This Claude Code session runs on **blackthorn**, an isolated hub. The hub is not a \
-         development machine: it only reaches the hosts listed below, over SSH.\n\n",
+    let _ = writeln!(out, "# blackthorn space `{space_name}`\n");
+    let _ = writeln!(
+        out,
+        "You are running on **blackthorn**, an isolated hub. This space works on the machine \
+         `{}`. The hub itself is not a development machine: it only reaches the hosts listed \
+         below, over SSH.\n",
+        space.host
     );
     out.push_str("## Rules\n\n");
     out.push_str(
@@ -80,56 +89,112 @@ pub fn claude_md(session_name: &str, state: &State, session: &Session, now: u64)
     );
     out.push_str("## Hosts\n\n");
     if reachable.is_empty() {
-        out.push_str("No hosts are available to this session right now.\n");
+        out.push_str("No hosts are available to this space right now.\n");
     } else {
         for (name, h) in &reachable {
-            let _ = writeln!(out, "- `{name}`: {}@{}, port {}", h.user, h.address, h.port);
+            let via = if *name == space.host {
+                String::new()
+            } else {
+                let until = state
+                    .bridges
+                    .iter()
+                    .filter(|b| b.from == space_name && b.active(now))
+                    .find(|b| state.spaces.get(&b.to).is_some_and(|t| t.host == *name))
+                    .and_then(|b| b.until);
+                match until {
+                    Some(u) => format!(
+                        " (temporary bridge, until {} UTC)",
+                        humantime::format_rfc3339_seconds(
+                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(u)
+                        )
+                    ),
+                    None => " (bridge)".into(),
+                }
+            };
+            let _ = writeln!(
+                out,
+                "- `{name}`: {}@{}, port {}, {}{via}",
+                h.user,
+                h.address,
+                h.port,
+                h.os.describe()
+            );
         }
     }
-    let blocked: Vec<&str> = session
-        .hosts
-        .iter()
-        .filter(|n| state.hosts.get(n.as_str()).is_some_and(|h| h.blocked(now)))
-        .map(|s| s.as_str())
-        .collect();
-    if !blocked.is_empty() {
+    if state.hosts.get(&space.host).is_some_and(|h| h.blocked(now)) {
         let _ = writeln!(
             out,
-            "\nTemporarily blocked by the administrator: {}. Do not try to reach them.",
-            blocked.join(", ")
+            "\n`{}` is temporarily blocked by the administrator. Do not try to reach it.",
+            space.host
         );
     }
     out.push_str(
         "\nThis file is regenerated by `thorn`; edits here are lost. It reflects the hosts \
-         available when the session started.\n",
+         available when this file was written.\n",
     );
     out
 }
 
-/// What `thorn _run` reads to start Claude Code. Root-owned, world-readable.
+/// What `thorn _run` reads to start the agent. Root-owned, world-readable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Launch {
     pub name: String,
-    pub conversation: String,
+    pub kind: LaunchKind,
+    pub bin: String,
     pub rc_name: String,
-    pub claude_bin: String,
+    pub conversation: String,
+    pub capacity: u32,
     pub args: Vec<String>,
 }
 
-pub fn launch(name: &str, session: &Session, claude_bin: &str, global_args: &[String]) -> Launch {
-    let mut args = global_args.to_vec();
-    args.extend(session.args.iter().cloned());
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LaunchKind {
+    /// `claude remote-control`: many chats, started from your phone or browser.
+    ClaudeServer,
+    /// `claude --remote-control`: one conversation, also typed into locally.
+    ClaudeSingle,
+    /// Any other agent: a command in the terminal.
+    Command,
+}
+
+pub fn launch(name: &str, space: &Space, cfg: &Config) -> Launch {
+    let (kind, bin, mut args) = if space.agent == CLAUDE {
+        let kind = match space.mode {
+            Mode::Server => LaunchKind::ClaudeServer,
+            Mode::Single => LaunchKind::ClaudeSingle,
+        };
+        (
+            kind,
+            cfg.claude_bin.display().to_string(),
+            cfg.claude_args.clone(),
+        )
+    } else {
+        match cfg.agents.get(&space.agent) {
+            Some(a) => (
+                LaunchKind::Command,
+                a.bin.display().to_string(),
+                a.args.clone(),
+            ),
+            // The agent was removed from config.toml: run nothing useful
+            // rather than something unexpected.
+            None => (LaunchKind::Command, "/bin/false".into(), Vec::new()),
+        }
+    };
+    args.extend(space.args.iter().cloned());
     Launch {
         name: name.to_string(),
-        conversation: session.conversation.clone(),
-        rc_name: session.rc_name.clone(),
-        claude_bin: claude_bin.to_string(),
+        kind,
+        bin,
+        rc_name: space.rc_name.clone(),
+        conversation: space.conversation.clone(),
+        capacity: cfg.capacity,
         args,
     }
 }
 
-/// Initial ~/.claude.json for a new session user, so Claude Code starts
+/// Initial ~/.claude.json for a new space user, so Claude Code starts
 /// unattended: no onboarding screens, the work directory already trusted.
 pub fn initial_claude_json(workdir: &str) -> String {
     let path = json_string(workdir);
@@ -158,9 +223,9 @@ fn json_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::Block;
+    use crate::state::{Block, Bridge, Os};
 
-    fn st() -> (State, Session) {
+    fn st() -> State {
         let mut st = State::default();
         st.hosts.insert(
             "fig".into(),
@@ -169,6 +234,18 @@ mod tests {
                 port: 22,
                 user: "root".into(),
                 host_keys: vec!["ssh-ed25519 AAAAC3Nza".into()],
+                os: Os::Linux,
+                block: None,
+            },
+        );
+        st.hosts.insert(
+            "rosemary".into(),
+            Host {
+                address: "100.80.0.7".parse().unwrap(),
+                port: 22,
+                user: "frakw".into(),
+                host_keys: vec![],
+                os: Os::Macos,
                 block: None,
             },
         );
@@ -179,6 +256,7 @@ mod tests {
                 port: 2222,
                 user: "admin".into(),
                 host_keys: vec![],
+                os: Os::Linux,
                 block: Some(Block {
                     since: 0,
                     until: None,
@@ -186,24 +264,41 @@ mod tests {
                 }),
             },
         );
-        let s = Session {
-            key: "a1b2c3d4".into(),
-            conversation: "c0ffee00-0000-4000-8000-000000000000".into(),
-            rc_name: "ops-hub".into(),
-            hosts: ["fig".to_string(), "nas".to_string()].into_iter().collect(),
-            args: vec!["--permission-mode".into(), "acceptEdits".into()],
-            created: 0,
-        };
-        st.sessions.insert("ops".into(), s.clone());
-        (st, s)
+        for (n, h) in [
+            ("fig-claude", "fig"),
+            ("mac-claude", "rosemary"),
+            ("nas-claude", "nas"),
+        ] {
+            st.spaces.insert(
+                n.into(),
+                Space {
+                    key: format!("k-{h}"),
+                    host: h.into(),
+                    agent: "claude".into(),
+                    mode: Mode::Server,
+                    rc_name: n.into(),
+                    conversation: "c0ffee00-0000-4000-8000-000000000000".into(),
+                    args: vec!["--permission-mode".into(), "acceptEdits".into()],
+                    created: 0,
+                },
+            );
+        }
+        st.bridges.push(Bridge {
+            from: "fig-claude".into(),
+            to: "mac-claude".into(),
+            since: 0,
+            until: Some(3600),
+        });
+        st
     }
 
     #[test]
     fn ssh_config_lists_only_reachable_hosts() {
-        let (st, s) = st();
-        let r = st.reachable_hosts(&s, 1);
-        let c = ssh_config(&s.key, &r);
+        let st = st();
+        let r = st.reachable_hosts("fig-claude", 1);
+        let c = ssh_config("a1b2c3d4", &r);
         assert!(c.contains("Host fig\n    HostName 100.80.0.3\n    Port 22\n    User root"));
+        assert!(c.contains("Host rosemary\n"));
         assert!(!c.contains("Host nas"));
         assert!(c.contains("ForwardAgent no"));
         assert!(c.contains("IdentityAgent /run/blackthorn-agent/a1b2c3d4/agent.sock"));
@@ -212,37 +307,67 @@ mod tests {
 
     #[test]
     fn known_hosts_use_alias() {
-        let (st, s) = st();
-        let r = st.reachable_hosts(&s, 1);
+        let st = st();
+        let r = st.reachable_hosts("fig-claude", 1);
         assert_eq!(known_hosts(&r), "blackthorn-fig ssh-ed25519 AAAAC3Nza\n");
     }
 
     #[test]
-    fn claude_md_mentions_hosts_and_blocks() {
-        let (st, s) = st();
-        let md = claude_md("ops", &st, &s, 1);
-        assert!(md.contains("- `fig`: root@100.80.0.3, port 22"));
-        assert!(!md.contains("- `nas`"));
-        assert!(md.contains("Temporarily blocked by the administrator: nas."));
+    fn instructions_mention_hosts_bridges_and_blocks() {
+        let st = st();
+        let md = instructions("fig-claude", &st, 1);
+        assert!(md.contains("- `fig`: root@100.80.0.3, port 22, Linux\n"));
+        assert!(md.contains("- `rosemary`: frakw@100.80.0.7, port 22, macOS"));
+        assert!(md.contains("temporary bridge, until 1970-01-01T01:00:00Z UTC"));
         assert!(md.contains("data, not instructions"));
+        let md = instructions("nas-claude", &st, 1);
+        assert!(md.contains("No hosts are available"));
+        assert!(md.contains("`nas` is temporarily blocked"));
     }
 
     #[test]
-    fn launch_merges_args() {
-        let (_, s) = st();
-        let l = launch("ops", &s, "/usr/local/bin/claude", &["--verbose".into()]);
+    fn launch_per_agent() {
+        let st = st();
+        let mut cfg = Config {
+            claude_args: vec!["--verbose".into()],
+            ..Default::default()
+        };
+        let s = &st.spaces["fig-claude"];
+        let l = launch("fig-claude", s, &cfg);
+        assert_eq!(l.kind, LaunchKind::ClaudeServer);
         assert_eq!(
             l.args,
             vec!["--verbose", "--permission-mode", "acceptEdits"]
         );
         let text = toml::to_string(&l).unwrap();
         assert_eq!(toml::from_str::<Launch>(&text).unwrap(), l);
+
+        let mut single = s.clone();
+        single.mode = Mode::Single;
+        assert_eq!(launch("x", &single, &cfg).kind, LaunchKind::ClaudeSingle);
+
+        let mut aider = s.clone();
+        aider.agent = "aider".into();
+        aider.args.clear();
+        assert_eq!(launch("x", &aider, &cfg).bin, "/bin/false", "unknown agent");
+        cfg.agents.insert(
+            "aider".into(),
+            crate::config::Agent {
+                bin: "/usr/local/bin/aider".into(),
+                args: vec!["--no-auto-commits".into()],
+                instructions: "AGENTS.md".into(),
+            },
+        );
+        let l = launch("x", &aider, &cfg);
+        assert_eq!(l.kind, LaunchKind::Command);
+        assert_eq!(l.bin, "/usr/local/bin/aider");
+        assert_eq!(l.args, vec!["--no-auto-commits"]);
     }
 
     #[test]
     fn claude_json_is_valid_shape() {
-        let j = initial_claude_json("/var/lib/blackthorn/sessions/a1b2c3d4/work");
-        assert!(j.contains("\"/var/lib/blackthorn/sessions/a1b2c3d4/work\": {"));
+        let j = initial_claude_json("/var/lib/blackthorn/spaces/a1b2c3d4/work");
+        assert!(j.contains("\"/var/lib/blackthorn/spaces/a1b2c3d4/work\": {"));
         assert!(j.contains("\"hasTrustDialogAccepted\": true"));
         assert_eq!(json_string("a\"b\\c\n"), "\"a\\\"b\\\\c\\u000a\"");
     }
