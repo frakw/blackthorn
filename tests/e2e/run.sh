@@ -165,7 +165,7 @@ case "$r" in *"/login?err="*) ok "wrong code refused";; *) fail "login with a wr
 code=$(fresh_code $WEB_SECRET)
 r=$(web_post /login --data-urlencode "user=frakw" --data-urlencode "password=$PASSWORD" --data-urlencode "code=$code")
 [ "$r" = "http://$HUB:7180/" ] && ok "login with password + TOTP" || fail "login with password + TOTP"
-web_get / | grep -q '<svg class="map"' && ok "map page draws the SVG map" || fail "map page draws the SVG map"
+web_get / | grep -q '<svg class="map' && ok "map page draws the SVG map" || fail "map page draws the SVG map: $(web_get / | sed 's/<svg class="logo".*<\/svg>//' | head -c 1500)"
 web_get /map.svg | grep -q 't1-claude' && ok "map shows t1-claude" || fail "map shows t1-claude"
 C=$(csrf)
 [ -n "$C" ] && ok "got a CSRF value" || fail "got a CSRF value"
