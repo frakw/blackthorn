@@ -66,6 +66,7 @@ pub enum Op {
         old: String,
         new: String,
         rc_name: Option<String>,
+        code: String,
     },
     SpaceControl {
         action: Action,
@@ -162,7 +163,31 @@ pub enum Op {
         name: String,
         id: String,
         title: String,
+        code: String,
     },
+    /// A new conversation (id None), or an earlier one, becomes the one a
+    /// one-conversation space runs.
+    ChatOpen {
+        name: String,
+        id: Option<String>,
+    },
+    HostRename {
+        old: String,
+        new: String,
+        code: String,
+    },
+    AccountRename {
+        new: String,
+        code: String,
+    },
+    NotifyShow,
+    NotifySet {
+        url: String,
+        /// None keeps the current token.
+        token: Option<String>,
+        code: String,
+    },
+    NotifyTest,
     ChatRm {
         name: String,
         id: String,
@@ -217,6 +242,7 @@ impl Op {
                 | Op::ChatList { .. }
                 | Op::UpdateCheck { .. }
                 | Op::Account
+                | Op::NotifyShow
         )
     }
 
@@ -231,7 +257,12 @@ impl Op {
             | Op::ConfigSet { code, .. }
             | Op::Update { code, .. }
             | Op::AccountPassword { code, .. }
-            | Op::AccountTotpBegin { code } => Some(code),
+            | Op::AccountTotpBegin { code }
+            | Op::SpaceRename { code, .. }
+            | Op::ChatRename { code, .. }
+            | Op::HostRename { code, .. }
+            | Op::AccountRename { code, .. }
+            | Op::NotifySet { code, .. } => Some(code),
             _ => None,
         }
     }
@@ -580,7 +611,9 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
         }
         Op::SpaceNew { space } => json(ops::space_new(space)?),
         Op::SpaceRm { name, purge, .. } => json(ops::space_rm(&name, purge)?),
-        Op::SpaceRename { old, new, rc_name } => json(ops::space_rename(
+        Op::SpaceRename {
+            old, new, rc_name, ..
+        } => json(ops::space_rename(
             &old,
             &new,
             rc_name.filter(|r| !r.is_empty()),
@@ -658,7 +691,30 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
         Op::ConfigShow => json(ops::config_show()?),
         Op::TailnetPeers => json(ops::tailnet_peers()),
         Op::ChatList { name } => json(ops::chat_list(&name)?),
-        Op::ChatRename { name, id, title } => json(ops::chat_rename(&name, &id, &title)?),
+        Op::ChatRename {
+            name, id, title, ..
+        } => json(ops::chat_rename(&name, &id, &title)?),
+        Op::ChatOpen { name, id } => json(ops::chat_open(&name, id.as_deref())?),
+        Op::HostRename { old, new, .. } => json(ops::host_rename(&old, &new)?),
+        Op::AccountRename { new, .. } => {
+            crate::web_cmd::rename_account(user, &new)?;
+            let mut s = server.lock().expect("lock");
+            for sess in s.sessions.values_mut() {
+                if sess.user == user {
+                    sess.user = new.clone();
+                }
+            }
+            if let Some(p) = s.pending_totp.remove(user) {
+                s.pending_totp.insert(new.clone(), p);
+            }
+            json(new)
+        }
+        Op::NotifyShow => json(crate::notify::view()),
+        Op::NotifySet { url, token, .. } => {
+            crate::notify::set(&url, token.as_deref())?;
+            json(crate::notify::view())
+        }
+        Op::NotifyTest => json(crate::notify::test()?),
         Op::ChatRm { name, id } => json(ops::chat_rm(&name, &id)?),
         Op::SpaceRemote { name, on } => json(ops::space_set_remote(&name, on)?),
         Op::UpdateCheck { refresh } => {
@@ -798,6 +854,7 @@ pub fn all_op_names() -> Vec<String> {
             old: s(),
             new: s(),
             rc_name: None,
+            code: s(),
         },
         Op::SpaceControl {
             action: Action::Start,
@@ -875,7 +932,28 @@ pub fn all_op_names() -> Vec<String> {
             name: s(),
             id: s(),
             title: s(),
+            code: s(),
         },
+        Op::ChatOpen {
+            name: s(),
+            id: None,
+        },
+        Op::HostRename {
+            old: s(),
+            new: s(),
+            code: s(),
+        },
+        Op::AccountRename {
+            new: s(),
+            code: s(),
+        },
+        Op::NotifyShow,
+        Op::NotifySet {
+            url: s(),
+            token: None,
+            code: s(),
+        },
+        Op::NotifyTest,
         Op::ChatRm { name: s(), id: s() },
         Op::SpaceRemote {
             name: s(),
@@ -933,7 +1011,13 @@ pub fn all_op_names() -> Vec<String> {
             | Op::Account
             | Op::AccountPassword { .. }
             | Op::AccountTotpBegin { .. }
-            | Op::AccountTotpFinish { .. } => {}
+            | Op::AccountTotpFinish { .. }
+            | Op::ChatOpen { .. }
+            | Op::HostRename { .. }
+            | Op::AccountRename { .. }
+            | Op::NotifyShow
+            | Op::NotifySet { .. }
+            | Op::NotifyTest => {}
         }
     }
     all.iter().map(Op::name).collect()

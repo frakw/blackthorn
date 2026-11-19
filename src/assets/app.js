@@ -33,6 +33,26 @@
 
   // Copy buttons. The clipboard API needs HTTPS; plain HTTP falls back to
   // selecting the text and the older copy command.
+  // Rename pop-ups (<details class="pop">): focus the name, and close with
+  // Cancel or Escape.
+  document.querySelectorAll("details.pop").forEach(function (d) {
+    var cancel = d.querySelector("[data-close]");
+    if (cancel) {
+      cancel.hidden = false;
+      cancel.addEventListener("click", function () { d.open = false; });
+    }
+    d.addEventListener("toggle", function () {
+      if (!d.open) return;
+      document.querySelectorAll("details.pop[open]").forEach(function (o) { if (o !== d) o.open = false; });
+      var i = d.querySelector("input:not([type=hidden])");
+      if (i) { i.focus(); i.select(); }
+    });
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key !== "Escape") return;
+    document.querySelectorAll("details.pop[open]").forEach(function (o) { o.open = false; });
+  });
+
   document.querySelectorAll("button[data-copy]").forEach(function (b) {
     b.hidden = false;
     b.addEventListener("click", function () {
@@ -64,8 +84,8 @@
   if (map) initMap(map);
 
   function initMap(wrap) {
-    var POS = "bt-map-pos", VIEW = "bt-map-view";
-    var NW = 230, SLOT_Y = 42;
+    var POS = "bt-map-pos2", VIEW = "bt-map-view2"; // v0.5 layout
+    var NW = 230, SLOT_Y = 42, SLOT_ROW = 18, PAD = 16, FRAME_TITLE = 26;
     var svg, view, nodes, busy = false;
     var tools = document.querySelector(".graph-tools");
     if (tools) tools.hidden = false;
@@ -101,11 +121,35 @@
       return "M" + x1 + "," + y1 + " C" + (x1 + dx) + "," + y1 + " " + (x2 - dx) + "," + y2 + " " + x2 + "," + y2;
     }
 
+    function height(n) { return n.g.querySelector(".node-body").height.baseVal.value; }
+
+    // Frames follow their nodes.
+    function frames() {
+      svg.querySelectorAll(".frame[data-members]").forEach(function (f) {
+        var b = null;
+        f.getAttribute("data-members").split(" ").forEach(function (id) {
+          var n = nodes[id];
+          if (!n) return;
+          var r = { x1: n.x, y1: n.y, x2: n.x + n.w, y2: n.y + height(n) };
+          b = b ? { x1: Math.min(b.x1, r.x1), y1: Math.min(b.y1, r.y1), x2: Math.max(b.x2, r.x2), y2: Math.max(b.y2, r.y2) } : r;
+        });
+        if (!b) return;
+        var rect = f.querySelector(".frame-body"), t = f.querySelector(".frame-title");
+        var x = b.x1 - PAD, y = b.y1 - PAD - FRAME_TITLE;
+        rect.setAttribute("x", x); rect.setAttribute("y", y);
+        rect.setAttribute("width", b.x2 - b.x1 + 2 * PAD);
+        rect.setAttribute("height", b.y2 - b.y1 + 2 * PAD + FRAME_TITLE);
+        if (t) { t.setAttribute("x", x + 12); t.setAttribute("y", y + 18); }
+      });
+    }
+
     function wires() {
+      frames();
       svg.querySelectorAll(".wires [data-from]").forEach(function (el) {
         var a = nodes[el.getAttribute("data-from")], b = nodes[el.getAttribute("data-to")];
         if (!a || !b) return;
-        var x1 = a.x + a.w, y1 = a.y + SLOT_Y, x2 = b.x, y2 = b.y + SLOT_Y;
+        var fp = +el.getAttribute("data-fp") || 0, tp = +el.getAttribute("data-tp") || 0;
+        var x1 = a.x + a.w, y1 = a.y + SLOT_Y + fp * SLOT_ROW, x2 = b.x, y2 = b.y + SLOT_Y + tp * SLOT_ROW;
         if (el.tagName.toLowerCase() === "path") {
           el.setAttribute("d", curve(x1, y1, x2, y2));
         } else {
@@ -118,8 +162,8 @@
     function bounds() {
       var b = null;
       Object.keys(nodes).forEach(function (id) {
-        var n = nodes[id], h = n.g.querySelector(".node-body").height.baseVal.value;
-        var r = { x1: n.x, y1: n.y, x2: n.x + n.w, y2: n.y + h };
+        var n = nodes[id];
+        var r = { x1: n.x, y1: n.y - PAD - FRAME_TITLE, x2: n.x + n.w, y2: n.y + height(n) + PAD };
         b = b ? { x1: Math.min(b.x1, r.x1), y1: Math.min(b.y1, r.y1), x2: Math.max(b.x2, r.x2), y2: Math.max(b.y2, r.y2) } : r;
       });
       return b;

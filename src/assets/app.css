@@ -23,6 +23,12 @@
   --title-hub: #d5e7dc;
   --title-space: #dfe0f3;
   --title-host: #ece4d6;
+  --title-app: #f3e3d8;
+  --title-model: #f0dccd;
+  --frame-machine: rgba(47, 107, 79, .07);
+  --frame-machine-line: rgba(47, 107, 79, .35);
+  --frame-cloud: rgba(201, 100, 66, .07);
+  --frame-cloud-line: rgba(201, 100, 66, .35);
   --wire: #7d8a84;
   color-scheme: light;
 }
@@ -50,6 +56,12 @@
     --title-hub: #21402f;
     --title-space: #2e3158;
     --title-host: #45392a;
+    --title-app: #4a3226;
+    --title-model: #553425;
+    --frame-machine: rgba(95, 174, 134, .08);
+    --frame-machine-line: rgba(95, 174, 134, .35);
+    --frame-cloud: rgba(224, 128, 96, .08);
+    --frame-cloud-line: rgba(224, 128, 96, .35);
     --wire: #8b9a93;
     color-scheme: dark;
   }
@@ -115,6 +127,28 @@ main { max-width: 1180px; margin: 0 auto; padding: 18px 16px 40px; }
 a.item-name:hover { color: var(--accent); }
 .item-meta { color: var(--dim); font-size: 13.5px; margin: 0; overflow-wrap: anywhere; }
 .item .buttons { margin-top: auto; padding-top: 4px; }
+/* The whole card opens the item; its buttons stay clickable above that. */
+.item { position: relative; transition: border-color .12s; }
+.item:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
+.item a.item-name::after { content: ""; position: absolute; inset: 0; border-radius: var(--radius); }
+.item .buttons, .item a:not(.item-name), .item form { position: relative; z-index: 1; }
+
+/* "+ New space", "+ Add a machine": folded forms at the top of a list. */
+details.card.add > summary { cursor: pointer; font-weight: 650; list-style: none; color: var(--accent); }
+details.card.add > summary::-webkit-details-marker { display: none; }
+details.card.add[open] > summary { margin-bottom: 12px; }
+
+/* Rename pop-ups: an open <details> drawn as a dialog over a dimmed page.
+   Clicking the dim area hits the summary, which closes it. */
+details.pop { display: inline-block; }
+details.pop > summary { list-style: none; }
+details.pop > summary::-webkit-details-marker { display: none; }
+details.pop[open] > summary::before { content: ""; position: fixed; inset: 0; background: rgba(0, 0, 0, .35); z-index: 20; cursor: default; }
+details.pop > .pop-body { position: fixed; z-index: 21; left: 50%; top: 18vh; transform: translateX(-50%);
+  width: min(420px, calc(100vw - 32px)); background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 16px 18px; box-shadow: 0 10px 30px rgba(0, 0, 0, .25); text-align: left; }
+details.pop .pop-body h2 { margin: 0; font-size: 17px; }
+.chat-actions details.pop > summary.btn { font-size: 13.5px; padding: 3px 10px; }
 .badge { font-size: 12px; border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; color: var(--dim); white-space: nowrap; }
 .badge.local { border-color: color-mix(in srgb, var(--berry) 50%, var(--line)); color: var(--berry); }
 .page-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
@@ -132,9 +166,6 @@ li.chat:first-child { border-top: 0; }
 .chat-main { display: flex; flex-direction: column; min-width: 0; flex: 1 1 260px; }
 .chat-title { overflow-wrap: anywhere; }
 .chat-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-details.rename summary { cursor: pointer; color: var(--dim); font-size: 14px; list-style: none; }
-details.rename[open] summary { margin-bottom: 6px; }
-details.rename form { min-width: 240px; }
 .danger-text { color: var(--bad) !important; }
 
 /* Copy buttons next to commands and keys. */
@@ -193,6 +224,14 @@ svg.map .node-title { fill: var(--title-devices); }
 svg.map .kind-hub .node-title { fill: var(--title-hub); }
 svg.map .kind-space .node-title { fill: var(--title-space); }
 svg.map .kind-host .node-title { fill: var(--title-host); }
+svg.map .kind-app .node-title { fill: var(--title-app); }
+svg.map .kind-model .node-title { fill: var(--title-model); }
+svg.map .frame-body { stroke-width: 1.4; stroke-dasharray: 6 4; }
+svg.map .kind-machine .frame-body { fill: var(--frame-machine); stroke: var(--frame-machine-line); }
+svg.map .kind-cloud .frame-body { fill: var(--frame-cloud); stroke: var(--frame-cloud-line); }
+svg.map .frame-title { fill: var(--dim); font-weight: 650; font-size: 13px; }
+svg.map .icons { fill: none; stroke: var(--dim); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+svg.map .arrow { fill: var(--wire); }
 svg.map .node-name { font-weight: 650; font-size: 13px; }
 svg.map a .node-name { text-decoration: underline; text-decoration-color: transparent; }
 svg.map a:hover .node-name { fill: var(--accent); text-decoration-color: currentColor; }

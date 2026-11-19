@@ -105,8 +105,13 @@ That one line:
 3. installs Claude Code with Anthropic's installer, unless it is already
    there, and puts it at `/usr/local/bin/claude`, root-owned, so spaces run
    it but cannot change it;
-4. runs `thorn init`: systemd units, the firewall, and the web UI, turned on;
-5. asks for your web account: a password, then a QR code for your
+4. offers to install Tailscale when it is missing (with Tailscale's own
+   installer; for Headscale it asks for your server's URL), so only your
+   own devices can reach the hub;
+5. runs `thorn init`: systemd units, the firewall, and the web UI, turned on;
+6. lists your tailnet's devices and asks which may administer the hub (its
+   SSH and web UI); managed machines are shown but can never be picked;
+7. asks for your web account: a password, then a QR code for your
    authenticator app.
 
 It ends by printing the web UI's address. Open it, log in, and do the rest
@@ -115,7 +120,8 @@ there: add a machine, create a space on it, sign it in to Claude.
 Run the same line again to upgrade, or press **Update** on the web UI's
 Settings page when it says a new release is out (`sudo thorn update` does the
 same); your configuration stays as it is. To update Claude Code: `... | sh -s -- --update-claude`. Other options:
-`--version v0.3.0`, `--no-claude`, `--no-web`, and `--binary ./thorn` to
+`--version v0.3.0`, `--no-claude`, `--no-web`, `--tailscale` /
+`--no-tailscale`, `--login-server URL` (your Headscale), and `--binary ./thorn` to
 install a binary you built yourself (`cargo build --release`; the hub needs
 no compiler).
 
@@ -150,24 +156,31 @@ sudo thorn bridge add fig-claude nas-claude --for 30m
 
 The web UI is the everyday way to run blackthorn, on a laptop or a phone:
 
-- **Map**: your devices, the hub, its spaces and their machines as boxes and
-  wires, like a node editor. Drag boxes around, pan and zoom; the layout is
-  remembered in your browser.
-- **Spaces**: each one's chats (rename, delete), a live view of its
-  terminal, Claude sign-in, bridges, and Remote Control on or off.
+- **Map**: your devices, the hub (blackthorn and its spaces, framed as one
+  machine), the Claude app and the models your spaces use (framed as
+  Anthropic's cloud), and the machines the spaces work on, as boxes and
+  wires like a node editor. Arrows point from whoever opens the connection.
+  Drag boxes around, pan and zoom; the layout is remembered in your browser.
+- **Spaces**: each one's chats (new, continue, rename, delete), a live view
+  of its terminal, Claude sign-in, bridges, and Remote Control on or off.
 - **Machines**: the key line to install (with a Copy button), checking the
-  machine's host keys, blocks.
+  machine's host keys, blocks, renaming.
 - **Settings**: who may connect, never_manage and the web address, edited
   as lists of addresses with a picker that knows your tailnet's devices and
   whether they are online; and the blackthorn version, with one-click
   updates.
-- **Account**: change your password, or move to a new authenticator app.
+- **Notifications** (on the Settings page): pushed to your phone through
+  [ntfy](https://ntfy.sh) (ntfy.sh or your own server) when a managed
+  machine tries to connect to the hub, a space fails or must sign in again,
+  a block or bridge ends, or a new release is out.
+- **Account**: rename it, change your password, or move to a new
+  authenticator app.
 
 The command line can do everything it can, for when it is down.
 
-Logins need the password and a TOTP code; deleting a space, removing a
-machine, opening a bridge and accepting new host keys ask for a fresh code
-again. The HTTP-facing process runs as an unprivileged, sandboxed user and
+Logins need the password and a TOTP code; deleting or renaming anything,
+removing a machine, opening a bridge, accepting new host keys and changing
+settings ask for a fresh code again. The HTTP-facing process runs as an unprivileged, sandboxed user and
 cannot act on its own: a root process behind a Unix socket checks every
 login and code.
 
@@ -221,14 +234,16 @@ restores the old settings at any time.
 | `thorn screen SPACE` / `thorn send SPACE TEXT` | Read or type into the terminal without attaching |
 | `thorn rename OLD NEW [--rc-name N]` | Rename; same chats |
 | `thorn chat ls SPACE` / `chat rename SPACE ID NAME` / `chat rm SPACE ID` | A space's Claude chats |
+| `thorn chat new SPACE` / `chat open SPACE ID` | A one-conversation space: start a new chat, or go back to one |
 | `thorn remote SPACE on\|off` | Remote Control on, or off: one local conversation, only from the hub |
 | `thorn rm SPACE [--purge]` | Delete; files are archived unless `--purge` |
 | `thorn bridge add FROM TO [--for 1h]` / `bridge rm` / `bridge ls` | Let one space reach another space's machine for a while |
 | `thorn host add NAME USER@IP [--port P]` | Register a machine and create its key |
-| `thorn host ls` / `host check` / `host pubkey` / `host rescan` / `host rm` | Manage machines |
+| `thorn host ls` / `host check` / `host pubkey` / `host rescan` / `host rename` / `host rm` | Manage machines |
 | `thorn host set-address NAME USER@IP [--port P]` | Move a machine to a new address (e.g. LAN to tailnet); its spaces stay |
 | `thorn host block NAME [--for 30m] [--reason R]` / `host unblock` | Cut a machine off from every space |
-| `thorn web enable\|disable` / `web user add\|rm\|ls\|passwd\|totp-reset` | The web UI and its accounts |
+| `thorn web enable\|disable` / `web user add\|rm\|ls\|rename\|passwd\|totp-reset` | The web UI and its accounts |
+| `thorn notify set [URL] [--token]` / `notify show\|test\|off` | Notifications to an ntfy topic (no URL: a new random topic on ntfy.sh) |
 | `thorn config show` / `config set KEY VALUE` | The settings the web UI can change: admin devices, never_manage, web address, ... |
 | `thorn harden ssh --totp\|--fido` / `harden confirm\|undo` | Two-factor SSH to the hub |
 | `thorn firewall show [--planned]` / `firewall apply` | Inspect or reload the rules |

@@ -8,6 +8,8 @@ pub const CONFIG_FILE: &str = "/etc/blackthorn/config.toml";
 pub const KEYS_DIR: &str = "/etc/blackthorn/keys";
 /// Web UI accounts: password hashes and TOTP secrets. Root only.
 pub const WEB_USERS_FILE: &str = "/etc/blackthorn/web-users.toml";
+/// Where notifications go (the ntfy topic and token). Root only.
+pub const NOTIFY_FILE: &str = "/etc/blackthorn/notify.toml";
 
 pub const STATE_DIR: &str = "/var/lib/blackthorn";
 pub const STATE_FILE: &str = "/var/lib/blackthorn/state.toml";
@@ -17,6 +19,8 @@ pub const SPACES_DIR: &str = "/var/lib/blackthorn/spaces";
 /// What `thorn _run` needs to start a space, readable by the space user
 /// but writable only by root.
 pub const LAUNCH_DIR: &str = "/var/lib/blackthorn/launch";
+/// What notifications already said, so each thing is said once.
+pub const NOTIFY_SEEN_FILE: &str = "/var/lib/blackthorn/notified.toml";
 pub const ARCHIVE_DIR: &str = "/var/lib/blackthorn/archive";
 
 /// The root-only API the web UI talks to.

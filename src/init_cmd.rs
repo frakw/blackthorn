@@ -127,6 +127,14 @@ pub fn init(opts: InitOpts) -> Result<()> {
     }
     sys::systemctl(&["enable", "--now", units::FIREWALL, units::TICK_TIMER])?;
 
+    // Who may administer the hub, asked while someone is at the terminal
+    // and nobody is listed yet.
+    if std::io::stdin().is_terminal() && cfg.inbound.admin_from.is_empty() {
+        if let Err(e) = ask_admin_devices() {
+            println!("admin devices not set: {e:#}");
+        }
+    }
+
     if web_on {
         sys::systemctl(&["enable", "--now", units::API, units::WEB])?;
     } else if sys::unit_state(units::WEB) == "active" {
@@ -171,6 +179,167 @@ pub fn init(opts: InitOpts) -> Result<()> {
         println!("  sudo thorn login <name>-claude              sign it in; it starts right after");
     }
     Ok(())
+}
+
+/// Lists the tailnet's devices (and where this SSH session comes from) and
+/// lets you pick the ones that may reach the hub's SSH and web UI. Managed
+/// machines are shown but cannot be picked: they must never reach the hub.
+fn ask_admin_devices() -> Result<()> {
+    use std::io::Write;
+    let here = ssh_sources();
+    let (_, state) = ctx::read_only()?;
+    let managed: Vec<IpAddr> = state.hosts.values().map(|h| h.address).collect();
+    // (label, address, picked by default)
+    let mut choices: Vec<(String, IpAddr, bool)> = Vec::new();
+    let mut shown_managed = Vec::new();
+    for p in ops::tailnet_peers().into_iter().filter(|p| !p.hub) {
+        let Some(ip) = p
+            .ips
+            .iter()
+            .find(|i| i.is_ipv4())
+            .or(p.ips.first())
+            .copied()
+        else {
+            continue;
+        };
+        if p.ips.iter().any(|i| managed.contains(i)) {
+            shown_managed.push(format!("{} {ip}", p.name));
+            continue;
+        }
+        let you = p.ips.iter().any(|i| here.contains(i));
+        let label = format!(
+            "{:<20} {:<16} {}{}",
+            p.name,
+            ip,
+            if p.online { "online" } else { "offline" },
+            if you {
+                "   <- you are connected from here"
+            } else {
+                ""
+            }
+        );
+        choices.push((label, ip, you));
+    }
+    for ip in &here {
+        if !choices.iter().any(|c| c.1 == *ip) && !managed.contains(ip) {
+            choices.push((
+                format!(
+                    "{:<20} {ip:<16}    <- you are connected from here",
+                    "(this SSH session)"
+                ),
+                *ip,
+                true,
+            ));
+        }
+    }
+    if choices.is_empty() {
+        return Ok(());
+    }
+    println!(
+        "\nWhich devices may administer this hub (its SSH and web UI)? Everything else is refused."
+    );
+    for (i, (label, _, _)) in choices.iter().enumerate() {
+        println!("  {:>2}) {label}", i + 1);
+    }
+    for m in &shown_managed {
+        println!("   -) {m}   (a managed machine: never allowed)");
+    }
+    let defaults: Vec<String> = choices
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.2)
+        .map(|(i, _)| (i + 1).to_string())
+        .collect();
+    loop {
+        print!(
+            "Numbers separated by spaces, \"all\", or \"none\" to leave it open [{}]: ",
+            if defaults.is_empty() {
+                "none".to_string()
+            } else {
+                defaults.join(" ")
+            }
+        );
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            return Ok(());
+        }
+        let line = line.trim();
+        let picked: Vec<IpAddr> = match line {
+            "" if defaults.is_empty() => Vec::new(),
+            "" => choices.iter().filter(|c| c.2).map(|c| c.1).collect(),
+            "none" => Vec::new(),
+            "all" => choices.iter().map(|c| c.1).collect(),
+            _ => {
+                let nums: Option<Vec<usize>> = line
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|x| !x.is_empty())
+                    .map(|x| {
+                        x.parse::<usize>()
+                            .ok()
+                            .filter(|n| (1..=choices.len()).contains(n))
+                    })
+                    .collect();
+                match nums {
+                    Some(n) => n.into_iter().map(|i| choices[i - 1].1).collect(),
+                    None => {
+                        println!("numbers from 1 to {}, please", choices.len());
+                        continue;
+                    }
+                }
+            }
+        };
+        if picked.is_empty() {
+            println!("left open: any device that can reach the hub may try to log in (change it in Settings)");
+            return Ok(());
+        }
+        let value = picked
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        match ops::config_set(
+            &[("inbound.admin_from".to_string(), value.clone())],
+            here.first().copied(),
+            false,
+        ) {
+            Ok(_) => {
+                println!("only these may administer the hub now: {value}");
+                return Ok(());
+            }
+            Err(e) => println!("{e:#}"),
+        }
+    }
+}
+
+/// Addresses of the SSH sessions open to this machine right now.
+fn ssh_sources() -> Vec<IpAddr> {
+    let mut out: Vec<IpAddr> = ops::ssh_client().into_iter().collect();
+    if let Ok(text) = sys::output("ss", &["-Htn", "state", "established", "( sport = :22 )"]) {
+        for ip in parse_ss_peers(&text) {
+            if !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+    }
+    out
+}
+
+/// The peer addresses in `ss -Htn state established` output.
+fn parse_ss_peers(text: &str) -> Vec<IpAddr> {
+    text.lines()
+        .filter_map(|l| {
+            let peer = l.split_whitespace().last()?;
+            let (host, _port) = peer.rsplit_once(':')?;
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            let host = host.split('%').next()?;
+            let ip: IpAddr = host.parse().ok()?;
+            Some(match ip {
+                IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+                v4 => v4,
+            })
+        })
+        .collect()
 }
 
 /// Where a new web UI listens: the hub's tailnet address when Tailscale is
@@ -279,15 +448,19 @@ pub fn tick() -> Result<()> {
     let ended = ctx.state.expire_bridges(ctx.now);
     if lifted.is_empty() && ended.is_empty() {
         apply::firewall_rules(&ctx.cfg, &ctx.state, ctx.now, false)?;
-        return Ok(());
+    } else {
+        ctx.commit()?;
+        for h in &lifted {
+            println!("block lifted: {h}");
+        }
+        for b in &ended {
+            println!("bridge ended: {b}");
+        }
     }
-    ctx.commit()?;
-    for h in lifted {
-        println!("block lifted: {h}");
-    }
-    for b in ended {
-        println!("bridge ended: {b}");
-    }
+    // Notifications go out over the network: not while holding the lock.
+    let state = ctx.state.clone();
+    drop(ctx);
+    crate::notify::tick(&state, &lifted, &ended);
     Ok(())
 }
 
@@ -305,4 +478,24 @@ pub fn load_keys(key: &str) -> Result<()> {
         .map(|(n, _)| n)
         .collect();
     keys::sync_agent(key, &hosts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_session_sources() {
+        let ss = "0      0      100.80.0.6:22      100.80.0.2:51515\n\
+                  0      52     [::ffff:192.168.10.106]:22 [::ffff:192.168.10.5]:40000\n\
+                  0      0      [fd7a:115c::6]:22  [fd7a:115c::2]:6000\n";
+        assert_eq!(
+            parse_ss_peers(ss),
+            vec![
+                "100.80.0.2".parse::<IpAddr>().unwrap(),
+                "192.168.10.5".parse().unwrap(),
+                "fd7a:115c::2".parse().unwrap()
+            ]
+        );
+    }
 }

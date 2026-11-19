@@ -1,8 +1,8 @@
-# Your laptop, for tests: SSH and a browser stand-in (curl), and oathtool
-# playing the authenticator app.
+# Your laptop, for tests: SSH and a browser stand-in (curl), oathtool
+# playing the authenticator app, and nc standing in for an ntfy server.
 FROM debian:trixie
 RUN apt-get update \
- && apt-get install -y --no-install-recommends openssh-client curl oathtool ca-certificates \
+ && apt-get install -y --no-install-recommends openssh-client curl oathtool ca-certificates netcat-openbsd \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /root/.ssh && ssh-keygen -q -t ed25519 -N '' -f /root/.ssh/id_ed25519
 CMD ["sleep", "infinity"]

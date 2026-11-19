@@ -5,9 +5,10 @@
 #
 # It installs the few packages blackthorn needs, downloads `thorn` and checks
 # it against the release's SHA256SUMS, installs Claude Code if it is missing,
-# and runs `thorn init`, which turns the web UI on and (at a terminal) asks for
-# your first web account. Running it again upgrades `thorn` and leaves your
-# configuration alone.
+# offers to install Tailscale (at a terminal, when it is missing), and runs
+# `thorn init`, which turns the web UI on and (at a terminal) asks which
+# devices may administer the hub and for your first web account. Running it
+# again upgrades `thorn` and leaves your configuration alone.
 #
 # Options, given as  ... | sh -s -- OPTIONS
 #   --version vX.Y.Z   install that release instead of the latest
@@ -15,6 +16,9 @@
 #   --no-claude        do not install Claude Code
 #   --update-claude    install the latest Claude Code even if one is there
 #   --no-web           leave the web UI off on a first install
+#   --tailscale        install Tailscale without asking (if missing)
+#   --no-tailscale     do not offer Tailscale
+#   --login-server URL Tailscale coordination server (e.g. your headscale)
 #
 # BLACKTHORN_DOWNLOAD overrides where release files come from (a mirror).
 set -eu
@@ -33,11 +37,14 @@ blackthorn installer:  curl -fsSL .../install.sh | sh -s -- [OPTIONS]
   --no-claude        do not install Claude Code
   --update-claude    install the latest Claude Code even if one is there
   --no-web           leave the web UI off on a first install
+  --tailscale        install Tailscale without asking (if missing)
+  --no-tailscale     do not offer Tailscale
+  --login-server URL Tailscale coordination server (e.g. your headscale)
 EOF
 }
 
 main() {
-  version=latest binary="" claude=auto web=""
+  version=latest binary="" claude=auto web="" tailscale=ask login_server=""
   while [ $# -gt 0 ]; do
     case $1 in
       --version) [ $# -ge 2 ] || die "--version needs a value"; version=$2; shift 2 ;;
@@ -45,6 +52,9 @@ main() {
       --no-claude) claude=no; shift ;;
       --update-claude) claude=update; shift ;;
       --no-web) web=--no-web; shift ;;
+      --tailscale) tailscale=yes; shift ;;
+      --no-tailscale) tailscale=no; shift ;;
+      --login-server) [ $# -ge 2 ] || die "--login-server needs a URL"; login_server=$2; shift 2 ;;
       -h | --help) usage; exit 0 ;;
       *) die "unknown option: $1 (see --help)" ;;
     esac
@@ -70,6 +80,7 @@ main() {
   chmod 755 "$tmp"
 
   packages
+  tailscale_setup
 
   if [ -n "$binary" ]; then
     say "using $binary"
@@ -88,7 +99,7 @@ main() {
   # init asks for the first web account, so give it the terminal (standard
   # input is this script when piped from curl).
   say "setting up blackthorn"
-  if (: </dev/tty) 2>/dev/null; then
+  if tty_ok; then
     $SUDO "$tmp/thorn" init "$@" </dev/tty
   else
     $SUDO "$tmp/thorn" init "$@" </dev/null
@@ -113,6 +124,43 @@ packages() {
     $SUDO pacman -S --needed --noconfirm tmux openssh nftables coreutils </dev/null
   else
     die "install these yourself, then run this again:$missing"
+  fi
+}
+
+# Someone at the terminal to ask (stdin is this script when piped from curl).
+tty_ok() { (: </dev/tty) 2>/dev/null; }
+
+ask() { # ask "question" default -> answer in $REPLY
+  printf '%s ' "$1" >/dev/tty
+  read -r REPLY </dev/tty || REPLY=""
+  [ -n "$REPLY" ] || REPLY=$2
+}
+
+# Tailscale lets only your own devices reach the hub, without opening any
+# port to the internet. Offered when it is missing; installed with
+# Tailscale's own installer (their package repository).
+tailscale_setup() {
+  [ "$tailscale" != no ] || return 0
+  have tailscale && return 0
+  if [ "$tailscale" = ask ]; then
+    tty_ok || return 0
+    echo "Tailscale is not installed. With it, only your own devices can reach this hub (no port open to the internet)." >/dev/tty
+    ask "Install Tailscale now? [Y/n]" y
+    case $REPLY in [Nn]*) return 0 ;; esac
+    if [ -z "$login_server" ]; then
+      ask "Coordination server: Enter for Tailscale's own, or your headscale URL (https://...):" ""
+      login_server=$REPLY
+    fi
+  fi
+  say "installing Tailscale"
+  curl -fsSL https://tailscale.com/install.sh -o "$tmp/tailscale-install.sh" || die "could not download the Tailscale installer"
+  $SUDO sh "$tmp/tailscale-install.sh" </dev/null || die "the Tailscale installer failed"
+  tty_ok || { echo "Tailscale installed; connect it with: sudo tailscale up"; return 0; }
+  say "connecting to your tailnet (open the link it shows to approve this machine)"
+  if [ -n "$login_server" ]; then
+    $SUDO tailscale up --login-server "$login_server" </dev/tty || echo "warning: tailscale up failed; run it again later" >&2
+  else
+    $SUDO tailscale up </dev/tty || echo "warning: tailscale up failed; run it again later" >&2
   fi
 }
 

@@ -145,6 +145,7 @@ say "the hub refuses connections from managed machines"
 tcp_open "$P-admin" "$HUB" 22 && ok "admin device reaches hub ssh" || fail "admin device reaches hub ssh"
 if tcp_open "$P-t1" "$HUB" 22; then fail "t1 opened a connection to the hub"; else ok "t1 cannot connect to the hub"; fi
 if tcp_open "$P-t1" "$HUB" 7180; then fail "t1 reached the web port"; else ok "t1 cannot reach the web port"; fi
+hub nft list set inet blackthorn tried4 | grep -q "$T1" && ok "and the hub noted that t1 tried (for notifications)" || fail "tried4 set has t1"
 
 say "spaces"
 thorn new t1 | grep -q "created space t1-claude" && ok "thorn new t1 creates t1-claude" || fail "thorn new t1 creates t1-claude"
@@ -167,6 +168,7 @@ r=$(web_post /login --data-urlencode "user=frakw" --data-urlencode "password=$PA
 [ "$r" = "http://$HUB:7180/" ] && ok "login with password + TOTP" || fail "login with password + TOTP"
 web_get / | grep -q '<svg class="map' && ok "map page draws the SVG map" || fail "map page draws the SVG map: $(web_get / | sed 's/<svg class="logo".*<\/svg>//' | head -c 1500)"
 web_get /map.svg | grep -q 't1-claude' && ok "map shows t1-claude" || fail "map shows t1-claude"
+web_get /map.svg | grep -q 'class="frame kind-machine"' && ok "the map frames what runs on the hub" || fail "map frame"
 C=$(csrf)
 [ -n "$C" ] && ok "got a CSRF value" || fail "got a CSRF value"
 r=$(web_post /space/t1-claude/login --data-urlencode "csrf=wrong")
@@ -248,7 +250,9 @@ hub runuser -u "bt-$k1" -- ln -s /etc/shadow "$dir/5b2e1d3f-1111-4222-8333-44445
 thorn chat ls t1-claude | grep -q "check the disks" && ok "thorn chat ls names a chat by its first message" || fail "chat ls"
 thorn chat ls t1-claude | grep -q "5b2e1d3f" && fail "chat ls followed a planted link" || ok "chat ls skips links the space user planted"
 thorn chat rename t1-claude 5b2e1d3f "x" 2>&1 | grep -q "no chat" && ok "and will not write through one" || fail "rename through a link"
-r=$(web_post /space/t1-claude/chat-rename --data-urlencode "csrf=$C" --data-urlencode "id=$cid" --data-urlencode "title=disk check")
+r=$(web_post /space/t1-claude/chat-rename --data-urlencode "csrf=$C" --data-urlencode "id=$cid" --data-urlencode "title=disk check" --data-urlencode "code=000000")
+case "$r" in *"fresh%20code"*) ok "renaming needs a fresh code";; *) fail "chat rename without a code: $r";; esac
+r=$(web_post /space/t1-claude/chat-rename --data-urlencode "csrf=$C" --data-urlencode "id=$cid" --data-urlencode "title=disk check" --data-urlencode "code=$(fresh_code $WEB_SECRET)")
 case "$r" in *"ok=chat%20renamed"*) ok "chat renamed from the web";; *) fail "chat rename: $r";; esac
 hub tail -1 "$dir/$cid.jsonl" | grep -q '"customTitle":"disk check"' && ok "named the way Claude Code's /rename does" || fail "custom-title line"
 web_get /space/t1-claude | grep -q "disk check" && ok "the space page lists the chat by its new name" || fail "chats on the space page"
@@ -259,6 +263,53 @@ case "$r" in *"ok=chat%20deleted"*) ok "an old chat deleted from the web";; *) f
 hub test -e "$dir/$cid.jsonl" && fail "the transcript is still there" || ok "its transcript is gone"
 hub test -e /etc/shadow && ok "and nothing else was touched" || fail "/etc/shadow is gone"
 hub rm -f "$dir/5b2e1d3f-1111-4222-8333-444455556666.jsonl"
+
+say "new chats: in a one-conversation space, and not with Remote Control"
+thorn chat new t1-claude 2>&1 | grep -q "from the Claude app" && ok "with Remote Control, new chats start in the Claude app" || fail "chat new in server mode"
+old=$(hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args" | grep -o -- '--session-id [0-9a-f-]*' | cut -d' ' -f2)
+[ -n "$old" ] || old=$(hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args" | grep -o -- '--resume [0-9a-f-]*' | cut -d' ' -f2)
+dir2="/var/lib/blackthorn/spaces/$k2/.claude/projects/-var-lib-blackthorn-spaces-$k2-work"
+hub runuser -u "bt-$k2" -- sh -c "mkdir -p '$dir2' && echo '{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"the first chat\"}}' > '$dir2/$old.jsonl'"
+thorn chat new t2-claude | grep -q "new chat" && ok "thorn chat new" || fail "thorn chat new"
+sleep 3
+a=$(hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args")
+case "$a" in "--session-id $old"*) fail "still the old chat: $a";; --session-id*) ok "restarted into a new conversation";; *) fail "chat new: $a";; esac
+r=$(web_post /space/t2-claude/chat-open --data-urlencode "csrf=$C" --data-urlencode "id=$old")
+case "$r" in *"ok=back%20in%20that%20chat"*) ok "continued the earlier chat from the web";; *) fail "chat open: $r";; esac
+sleep 3
+hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args" | grep -q -- "^--resume $old" && ok "resumed it" || fail "resume: $(hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args")"
+expect_reach 20 t2-claude t2 ok
+
+say "renames ask for a code: machine and account"
+r=$(web_post /host/t2/rename --data-urlencode "csrf=$C" --data-urlencode "new=t2b" --data-urlencode "code=$(fresh_code $WEB_SECRET)")
+case "$r" in *"/host/t2b?ok="*) ok "machine renamed from the web";; *) fail "host rename: $r";; esac
+hub grep -q "^Host t2b" "/var/lib/blackthorn/spaces/$k2/.ssh/config" && ok "its space reaches it by the new name" || fail "ssh config after host rename"
+hub test -f /etc/blackthorn/keys/t2b && ok "its key moved along" || fail "key after host rename"
+thorn host rename t2b t2 | grep -q "is now t2" && ok "thorn host rename" || fail "thorn host rename"
+expect_reach 20 t2-claude t2 ok
+r=$(web_post /account/rename --data-urlencode "csrf=$C" --data-urlencode "new=frakw-2" --data-urlencode "code=$(fresh_code $WEB_SECRET)")
+case "$r" in *"ok=you%20are%20now%20frakw-2"*) ok "account renamed from the web";; *) fail "account rename: $r";; esac
+web_get /account | grep -q "Account frakw-2" && ok "and still logged in under the new name" || fail "session after account rename"
+thorn web user rename frakw-2 frakw | grep -q "is now frakw" && ok "thorn web user rename" || fail "thorn web user rename"
+admin rm -f /tmp/jar
+r=$(web_post /login --data-urlencode "user=frakw" --data-urlencode "password=$PASSWORD" --data-urlencode "code=$(fresh_code $WEB_SECRET)")
+[ "$r" = "http://$HUB:7180/" ] && ok "log in again under the old name" || fail "login after rename: $r"
+C=$(csrf)
+
+say "notifications to an ntfy server"
+docker exec -d "$P-admin" sh -c "while true; do printf 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' | nc -l -q1 8099 >> /tmp/ntfy.req; done"
+sleep 1
+thorn notify set "http://$ADMIN:8099/bt-e2e-topic" | grep -q "notifications go to" && ok "thorn notify set" || fail "notify set"
+hub stat -c %a /etc/blackthorn/notify.toml | grep -q 600 && ok "the topic is kept root-only" || fail "notify.toml mode"
+web_get /settings | grep -q "bt-e2e-topic" && ok "the settings page shows where they go" || fail "notify card"
+r=$(web_post /notify/test --data-urlencode "csrf=$C")
+case "$r" in *"ok=test%20sent"*) ok "a test sent from the web";; *) fail "notify test: $r";; esac
+admin grep -q "Notifications work." /tmp/ntfy.req && ok "the ntfy server got it" || fail "ntfy request: $(admin cat /tmp/ntfy.req)"
+tcp_open "$P-t1" "$HUB" 22 || true
+got=""
+for _ in $(seq 75); do admin grep -q "machine t1 ($T1) tried to connect to the hub" /tmp/ntfy.req && { got=1; break; }; sleep 1; done
+[ -n "$got" ] && ok "a managed machine trying to connect back is reported" || fail "connect-back notification: $(admin cat /tmp/ntfy.req)"
+thorn notify off | grep -q off && ok "thorn notify off" || fail "notify off"
 
 say "Remote Control off and on again"
 thorn remote t1-claude off | grep -q "Remote Control off" && ok "thorn remote off" || fail "thorn remote off"

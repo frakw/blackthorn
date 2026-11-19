@@ -281,6 +281,21 @@ pub fn chat_rm(space: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn chat_open(space: &str, id: Option<&str>) -> Result<()> {
+    let o = ops::chat_open(space, id)?;
+    let what = if id.is_some() {
+        "back to chat"
+    } else {
+        "new chat"
+    };
+    if o.restarted {
+        println!("{space}: {what} {} (restarted into it)", &o.id[..8]);
+    } else {
+        println!("{space}: {what} {}; it starts with the space", &o.id[..8]);
+    }
+    Ok(())
+}
+
 pub fn remote(name: &str, on: bool) -> Result<()> {
     let restarted = ops::space_set_remote(name, on)?;
     let again = if restarted { " (restarted)" } else { "" };

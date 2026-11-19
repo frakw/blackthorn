@@ -57,6 +57,9 @@ pub struct SpaceView {
     pub chats_24h: Option<usize>,
     /// Hosts it can reach right now.
     pub reachable: Vec<String>,
+    /// The model it last answered with ("Opus 5.5"), Claude only.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +128,10 @@ pub fn overview(with_version: bool) -> Result<Overview> {
                 state: state_str,
                 memory_mb: sys::unit_memory(&unit).map(|b| b / 1_048_576),
                 chats_24h: (s.agent == CLAUDE).then(|| recent_chats(&s.key, t)),
+                model: (s.agent == CLAUDE)
+                    .then(|| last_model(&s.key))
+                    .flatten()
+                    .map(|m| model_name(&m)),
                 reachable: state
                     .reachable_hosts(name, t)
                     .into_iter()
@@ -209,6 +216,66 @@ fn recent_chats(key: &str, now: u64) -> usize {
                 .is_ok_and(|m| m >= cutoff)
         })
         .count()
+}
+
+/// The model a Claude space last answered with, from the end of its newest
+/// transcript.
+fn last_model(key: &str) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::OpenOptionsExt;
+    const TAIL: u64 = 256 * 1024;
+    let newest = chat_files(key)
+        .into_iter()
+        .filter_map(|(_, p)| Some((std::fs::symlink_metadata(&p).ok()?.modified().ok()?, p)))
+        .max_by_key(|(m, _)| *m)?
+        .1;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(newest)
+        .ok()?;
+    let len = f.metadata().ok()?.len();
+    if len > TAIL {
+        f.seek(SeekFrom::Start(len - TAIL)).ok()?;
+    }
+    let mut buf = Vec::new();
+    f.take(TAIL).read_to_end(&mut buf).ok()?;
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .rev()
+        .filter(|l| l.contains("\"assistant\"") && l.contains("\"model\""))
+        .find_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).ok()?;
+            let m = v["message"]["model"].as_str()?;
+            m.starts_with("claude").then(|| m.to_string())
+        })
+}
+
+/// "claude-opus-5-5" -> "Opus 5.5", "claude-3-5-sonnet-20241022" ->
+/// "Sonnet 3.5"; anything else as it is.
+pub fn model_name(id: &str) -> String {
+    let Some(rest) = id.strip_prefix("claude-") else {
+        return id.to_string();
+    };
+    let parts: Vec<&str> = rest.split('-').collect();
+    let Some(family) = parts
+        .iter()
+        .find(|p| p.chars().all(|c| c.is_ascii_alphabetic()))
+    else {
+        return id.to_string();
+    };
+    let version: Vec<&str> = parts
+        .iter()
+        .filter(|p| !p.is_empty() && p.len() <= 2 && p.chars().all(|c| c.is_ascii_digit()))
+        .copied()
+        .collect();
+    let mut name: String = family[..1].to_ascii_uppercase();
+    name.push_str(&family[1..]);
+    if !version.is_empty() {
+        name.push(' ');
+        name.push_str(&version.join("."));
+    }
+    name
 }
 
 pub fn describe_until(until: Option<u64>, now: u64) -> String {
@@ -807,6 +874,59 @@ pub fn chat_rm(name: &str, id: &str) -> Result<String> {
     Ok(id)
 }
 
+/// What `chat_open` did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatOpened {
+    pub id: String,
+    /// The space was running and was restarted into the chat.
+    pub restarted: bool,
+}
+
+/// Makes a one-conversation space (single mode, or without Remote Control)
+/// run a new conversation (`id` None) or an earlier one. The chat it ran
+/// before stays in the list. With Remote Control in server mode there is
+/// nothing to switch: new chats are started from the Claude app.
+pub fn chat_open(name: &str, id: Option<&str>) -> Result<ChatOpened> {
+    let mut ctx = Ctx::open()?;
+    let s = ctx.state.space(name)?.clone();
+    if s.agent != CLAUDE {
+        bail!(
+            "space {name} runs {}; only Claude spaces have chats",
+            s.agent
+        );
+    }
+    if main_conversation(&s).is_none() {
+        bail!(
+            "space {name} serves many chats through Remote Control: start a new one from the \
+             Claude app (claude.ai or the phone app), in its environment {:?}",
+            s.rc_name
+        );
+    }
+    let id = match id {
+        None => uuid::Uuid::new_v4().to_string(),
+        Some(i) => find_chat(&s.key, i)?.0,
+    };
+    if id == s.conversation {
+        return Ok(ChatOpened {
+            id,
+            restarted: false,
+        });
+    }
+    ctx.state
+        .spaces
+        .get_mut(name)
+        .expect("checked")
+        .conversation = id.clone();
+    ctx.commit()?;
+    drop(ctx);
+    let unit = paths::space_unit(&s.key);
+    let restarted = sys::unit_state(&unit) == "active";
+    if restarted {
+        sys::systemctl(&["restart", &unit])?;
+    }
+    Ok(ChatOpened { id, restarted })
+}
+
 /// Turns Remote Control on or off for a Claude space. Returns whether the
 /// space was restarted for it.
 pub fn space_set_remote(name: &str, on: bool) -> Result<bool> {
@@ -1384,6 +1504,49 @@ pub fn host_rm(name: &str) -> Result<()> {
     keys::remove(name)
 }
 
+/// Renames a machine. Its spaces keep working on it; what they call it in
+/// SSH (`ssh <name>`) and in their instructions changes with it.
+pub fn host_rename(old: &str, new: &str) -> Result<()> {
+    let mut ctx = Ctx::open()?;
+    validate_name("host", new)?;
+    if ctx.state.hosts.contains_key(new) {
+        bail!("there is already a machine named {new:?}");
+    }
+    let h = ctx.state.host(old)?.clone();
+    let moves = [
+        (paths::key_file(old), paths::key_file(new)),
+        (paths::pubkey_file(old), paths::pubkey_file(new)),
+    ];
+    for (_, to) in &moves {
+        if to.exists() {
+            bail!("{} is in the way; move it aside first", to.display());
+        }
+    }
+    let move_keys = |back: bool| -> Result<()> {
+        for (a, b) in &moves {
+            let (from, to) = if back { (b, a) } else { (a, b) };
+            if from.exists() {
+                std::fs::rename(from, to)
+                    .with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
+            }
+        }
+        Ok(())
+    };
+    move_keys(false)?;
+    ctx.state.hosts.remove(old);
+    ctx.state.hosts.insert(new.to_string(), h);
+    for s in ctx.state.spaces.values_mut() {
+        if s.host == old {
+            s.host = new.to_string();
+        }
+    }
+    if let Err(e) = ctx.commit() {
+        let _ = move_keys(true);
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Cuts every space off from a machine, now. Returns when the block ends.
 pub fn host_block(name: &str, secs: Option<u64>, reason: Option<String>) -> Result<Option<u64>> {
     let mut ctx = Ctx::open()?;
@@ -1923,6 +2086,16 @@ mod tests {
             "x".repeat(200)
         );
         assert_eq!(t(&[&long]).unwrap().chars().count(), 80);
+    }
+
+    #[test]
+    fn model_names() {
+        assert_eq!(model_name("claude-opus-5-5"), "Opus 5.5");
+        assert_eq!(model_name("claude-fable-5-2"), "Fable 5.2");
+        assert_eq!(model_name("claude-sonnet-4-5-20250929"), "Sonnet 4.5");
+        assert_eq!(model_name("claude-3-5-sonnet-20241022"), "Sonnet 3.5");
+        assert_eq!(model_name("claude-haiku-5-5"), "Haiku 5.5");
+        assert_eq!(model_name("gpt-5"), "gpt-5");
     }
 
     #[test]

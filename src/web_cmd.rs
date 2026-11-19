@@ -123,6 +123,32 @@ pub fn user_rm(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Renames an account; its password, authenticator and recovery codes stay.
+pub fn rename_account(old: &str, new: &str) -> Result<()> {
+    crate::state::validate_name("account", new)?;
+    let mut users = Users::load(users_path())?;
+    if users.users.contains_key(new) {
+        bail!("there is already an account named {new}");
+    }
+    let u = users
+        .users
+        .remove(old)
+        .with_context(|| format!("no account named {old}"))?;
+    users.users.insert(new.to_string(), u);
+    users.save(users_path())
+}
+
+pub fn user_rename(old: &str, new: &str) -> Result<()> {
+    sys::require_root()?;
+    rename_account(old, new)?;
+    let _ = sys::systemctl(&["try-restart", units::API]);
+    println!(
+        "account {old} is now {new}; log in again with the new name \
+         (the authenticator app may keep showing the old one, which is fine)"
+    );
+    Ok(())
+}
+
 pub fn user_passwd(name: &str) -> Result<()> {
     sys::require_root()?;
     let mut users = Users::load(users_path())?;

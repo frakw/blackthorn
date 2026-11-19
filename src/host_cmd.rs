@@ -77,6 +77,12 @@ fn confirm_fingerprints(name: &str, scan: &Scan, yes: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn rename(old: &str, new: &str) -> Result<()> {
+    ops::host_rename(old, new)?;
+    println!("machine {old} is now {new}; its spaces now reach it as `ssh {new}`");
+    Ok(())
+}
+
 pub fn rm(name: &str) -> Result<()> {
     ops::host_rm(name)?;
     println!("removed host {name} and its key");

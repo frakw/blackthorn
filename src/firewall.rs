@@ -26,6 +26,10 @@ use std::net::IpAddr;
 use std::process::{Command, Stdio};
 
 pub const TABLE: &str = "blackthorn";
+/// Addresses of managed (or denied) machines that tried to open a
+/// connection to the hub, collected for `thorn _tick` to report.
+pub const TRIED4: &str = "tried4";
+pub const TRIED6: &str = "tried6";
 
 #[derive(Debug, Clone)]
 pub struct SpaceRules {
@@ -71,6 +75,14 @@ pub fn render(plan: &Plan) -> String {
     let _ = writeln!(out, "table inet {TABLE}");
     let _ = writeln!(out, "delete table inet {TABLE}");
     let _ = writeln!(out, "table inet {TABLE} {{");
+    let _ = writeln!(
+        out,
+        "\tset {TRIED4} {{ type ipv4_addr; flags dynamic; size 256; }}"
+    );
+    let _ = writeln!(
+        out,
+        "\tset {TRIED6} {{ type ipv6_addr; flags dynamic; size 256; }}"
+    );
     out.push_str("\tchain output {\n");
     out.push_str("\t\ttype filter hook output priority filter; policy accept;\n");
     if !plan.spaces.is_empty() {
@@ -143,10 +155,18 @@ fn render_input(out: &mut String, p: &InboundPlan) {
         out.push_str("\t\t# Managed machines never open connections to the hub.\n");
     }
     if !d4.is_empty() {
-        let _ = writeln!(out, "\t\tip saddr {} counter drop", set(d4));
+        let _ = writeln!(
+            out,
+            "\t\tip saddr {} add @{TRIED4} {{ ip saddr }} counter drop",
+            set(d4)
+        );
     }
     if !d6.is_empty() {
-        let _ = writeln!(out, "\t\tip6 saddr {} counter drop", set(d6));
+        let _ = writeln!(
+            out,
+            "\t\tip6 saddr {} add @{TRIED6} {{ ip6 saddr }} counter drop",
+            set(d6)
+        );
     }
     if !p.admin_from.is_empty() && !p.admin_ports.is_empty() {
         let ports = set(&p.admin_ports);
@@ -256,8 +276,8 @@ mod tests {
         let r = render(&plan());
         let input = &r[r.find("chain input").unwrap()..];
         assert!(input.contains("ct state established,related accept"));
-        assert!(input.contains("ip saddr { 100.80.0.3 } counter drop"));
-        assert!(input.contains("ip6 saddr { fd7a::5 } counter drop"));
+        assert!(input.contains("ip saddr { 100.80.0.3 } add @tried4 { ip saddr } counter drop"));
+        assert!(input.contains("ip6 saddr { fd7a::5 } add @tried6 { ip6 saddr } counter drop"));
         assert!(input.contains("tcp dport { 22, 7180 } ip saddr { 100.64.0.2 } accept"));
         assert!(input.contains("tcp dport { 22, 7180 } counter drop"));
         // Drops of managed machines come before any accept of admin ports.

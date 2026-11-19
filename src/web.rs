@@ -10,6 +10,7 @@
 use crate::api::{self, Op, Request, Response};
 use crate::http;
 use crate::map::{self, esc};
+use crate::notify::NotifyView;
 use crate::ops::{
     self, Action, BridgeView, Chat, ConfigChange, HostView, NewSpace, Overview, Peer, Scan,
     Setting, SpaceView, SPECIAL_KEYS,
@@ -342,6 +343,41 @@ fn route(
             )
         }
 
+        ("POST", ["notify"]) => {
+            let token = form
+                .get("token")
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty());
+            let token = if f(form, "clear_token") == "on" {
+                Some(String::new())
+            } else {
+                token
+            };
+            back(
+                "/settings#notify",
+                get::<NotifyView>(
+                    &c,
+                    Op::NotifySet {
+                        url: f(form, "url").into(),
+                        token,
+                        code: f(form, "code").into(),
+                    },
+                )
+                .map(|v| {
+                    if v.url.is_empty() {
+                        "notifications off".into()
+                    } else {
+                        "saved; press Send a test to check".into()
+                    }
+                }),
+            )
+        }
+        ("POST", ["notify", "test"]) => back(
+            "/settings#notify",
+            get::<serde_json::Value>(&c, Op::NotifyTest)
+                .map(|_| "test sent; it should be on your phone".into()),
+        ),
+
         ("GET", ["account"]) => account_page(&c, &flash),
         ("POST", ["account", action]) => account_post(&c, action, form),
 
@@ -357,10 +393,10 @@ fn route(
                     code: f(form, "code").into(),
                 },
             );
+            let to = f(form, "back");
+            let local = to.starts_with('/') && !to.starts_with("//") && !to.contains('\\');
             back(
-                f(form, "back")
-                    .strip_prefix('/')
-                    .map_or("/bridges", |_| f(form, "back")),
+                if local { to } else { "/bridges" },
                 r.map(|_| format!("bridge up from {from}")),
             )
         }
@@ -495,6 +531,34 @@ fn button(c: &Ctx, action: &str, label: &str, class: &str, extra: &str) -> Strin
         esc(action),
         csrf(c),
         esc(label)
+    )
+}
+
+/// A Rename button that pops up a small form asking for the new name and
+/// a code. Plain HTML (an open <details> drawn as a dialog; clicking the
+/// dimmed backdrop closes it), so it works without the script too.
+/// `field` is the form field the new name goes in; `hidden` adds fields.
+fn rename_dialog(
+    c: &Ctx,
+    action: &str,
+    what: &str,
+    field: &str,
+    current: &str,
+    hidden: &str,
+) -> String {
+    format!(
+        "<details class=\"pop\"><summary class=\"btn\">Rename</summary>\
+         <form method=\"post\" action=\"{}\" class=\"stack pop-body\" role=\"dialog\" aria-label=\"Rename {}\">{}{hidden}\
+         <h2>Rename {}</h2><label>New name <input name=\"{field}\" value=\"{}\" required maxlength=\"100\" \
+         autocomplete=\"off\" spellcheck=\"false\"></label>{}\
+         <div class=\"buttons\"><button class=\"primary\">Save</button>\
+         <button type=\"button\" class=\"link\" data-close hidden>Cancel</button></div></form></details>",
+        esc(action),
+        esc(what),
+        csrf(c),
+        esc(what),
+        esc(current),
+        code_field()
     )
 }
 
@@ -692,8 +756,10 @@ fn map_page(c: &Ctx, flash: &Flash) -> Reply {
          <div class=\"graph-wrap\" id=\"map\" data-refresh=\"/map.svg\">{}</div>\
          <p class=\"legend\"><span class=\"dot ok\"></span>running <span class=\"dot warn\"></span>needs \
          login <span class=\"dot idle\"></span>stopped <span class=\"dot bad\"></span>failed \
-         <span class=\"swatch bridge\"></span>bridge <span class=\"swatch cut\"></span>blocked \
-         <span>Wires show who may connect to whom; machines never connect back to the hub.</span></p></section>",
+         <span class=\"swatch bridge\"></span>bridge <span class=\"swatch cut\"></span>blocked (a machine you cut off) \
+         <span>Arrows point from who opens the connection to whom: spaces dial out to the Claude app, \
+         and the machines never connect back to the hub. Dashed frames are one machine (this hub) or one \
+         company's cloud.</span></p></section>",
         map::svg(&o)
     ));
     Reply::Html(200, page(c, "Map", &b, flash))
@@ -754,15 +820,6 @@ fn spaces_page(c: &Ctx, flash: &Flash) -> Reply {
         "<h1>Spaces</h1><p class=\"hint\">A space is one machine worked on by one AI agent: its own user, keys, \
          firewall rules and chats.</p>",
     );
-    if o.spaces.is_empty() {
-        b.push_str("<p>No spaces yet.</p>");
-    } else {
-        b.push_str("<div class=\"items\">");
-        for s in &o.spaces {
-            b.push_str(&space_card(c, s));
-        }
-        b.push_str("</div>");
-    }
     if o.hosts.is_empty() {
         b.push_str("<p>Add a machine first, under <a href=\"/hosts\">Machines</a>.</p>");
     } else {
@@ -777,7 +834,7 @@ fn spaces_page(c: &Ctx, flash: &Flash) -> Reply {
             .map(|a| format!("<option>{}</option>", esc(a)))
             .collect();
         b.push_str(&format!(
-            "<section class=\"card\"><h2>New space</h2><form method=\"post\" action=\"/spaces\" class=\"stack\">{}\
+            "<details class=\"card add\"{}><summary>+ New space</summary><form method=\"post\" action=\"/spaces\" class=\"stack\">{}\
              <div class=\"fields\"><label>Machine <select name=\"host\">{hosts}</select></label>\
              <label>Agent <select name=\"agent\">{agents}</select></label></div>\
              <details class=\"more\"><summary>More options</summary><div class=\"stack\">\
@@ -785,9 +842,19 @@ fn spaces_page(c: &Ctx, flash: &Flash) -> Reply {
              <label>Extra arguments for the agent <input name=\"args\" placeholder=\"--permission-mode acceptEdits\"></label>\
              <label class=\"check\"><input type=\"checkbox\" name=\"single\"> Claude: one conversation, also typed into on the terminal</label>\
              <label class=\"check\"><input type=\"checkbox\" name=\"local\"> Claude: no Remote Control (only from this hub)</label>\
-             </div></details><div><button class=\"primary\">Create space</button></div></form></section>",
+             </div></details><div><button class=\"primary\">Create space</button></div></form></details>",
+            if o.spaces.is_empty() { " open" } else { "" },
             csrf(c)
         ));
+    }
+    if o.spaces.is_empty() {
+        b.push_str("<p>No spaces yet.</p>");
+    } else {
+        b.push_str("<div class=\"items\">");
+        for s in &o.spaces {
+            b.push_str(&space_card(c, s));
+        }
+        b.push_str("</div>");
     }
     Reply::Html(200, page(c, "Spaces", &b, flash))
 }
@@ -803,11 +870,12 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
     let n = url_encode(&s.name);
     let claude = s.agent == crate::config::CLAUDE;
     let mut b = format!(
-        "<div class=\"page-head\"><h1><span class=\"dot {}\"></span>{}</h1><div class=\"buttons\">{}</div></div>\
+        "<div class=\"page-head\"><h1><span class=\"dot {}\"></span>{}</h1><div class=\"buttons\">{}{}</div></div>\
          <p class=\"item-meta\">on <a href=\"/host/{}\">{}</a> · {} · {}{} {}</p>",
         map::state_class(&s.state),
         esc(&s.name),
         space_controls(c, s),
+        rename_dialog(c, &format!("/space/{n}/rename"), "space", "new", &s.name, ""),
         url_encode(&s.host),
         esc(&s.host),
         esc(&crate::space_cmd::agent_label(&s.agent, s.mode)),
@@ -953,13 +1021,10 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
         ));
     }
     b.push_str(&format!(
-        "<section class=\"card\"><h2>Rename</h2><form method=\"post\" action=\"/space/{n}/rename\" class=\"stack\">{}\
-         <label>New name <input name=\"new\" required></label><button>Rename</button></form></section>\
-         <section class=\"card danger\"><h2>Delete</h2><p>Stops the space and removes its user. Its files and \
+        "<section class=\"card danger\"><h2>Delete</h2><p>Stops the space and removes its user. Its files and \
          conversations are archived on the hub unless you purge them.</p><form method=\"post\" action=\"/space/{n}/rm\" \
          class=\"stack\" data-confirm=\"Delete space {}?\">{}<label class=\"check\"><input type=\"checkbox\" name=\"purge\"> \
          Also delete its files</label>{}<button class=\"danger\">Delete space</button></form></section></section>",
-        csrf(c),
         esc(&s.name),
         csrf(c),
         code_field()
@@ -983,16 +1048,31 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
             )
         }
     };
+    // One conversation at a time (single mode, or Remote Control off): a
+    // new chat, or an earlier one, replaces it. Otherwise chats are started
+    // in the Claude app.
+    let one = s.mode == crate::state::Mode::Single || !s.remote_control;
     let now = crate::state::now();
     let mut rows = String::new();
     for ch in &chats {
         let id = esc(&ch.id);
-        let delete = if ch.main {
-            "<span class=\"badge\">the space's conversation</span>".to_string()
+        let hidden = format!("<input type=\"hidden\" name=\"id\" value=\"{id}\">");
+        let side = if ch.main {
+            "<span class=\"badge\">running now</span>".to_string()
         } else {
+            let open = if one {
+                format!(
+                    "<form method=\"post\" action=\"/space/{n}/chat-open\" class=\"inline\" \
+                     data-confirm=\"Continue this chat? The space restarts into it.\">{}{hidden}\
+                     <button class=\"link\">Continue</button></form>",
+                    csrf(c)
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "<form method=\"post\" action=\"/space/{n}/chat-rm\" class=\"inline\" data-confirm=\"Delete the chat {}?\">{}\
-                 <input type=\"hidden\" name=\"id\" value=\"{id}\"><button class=\"link danger-text\">Delete</button></form>",
+                "{open}<form method=\"post\" action=\"/space/{n}/chat-rm\" class=\"inline\" data-confirm=\"Delete the chat {}?\">{}\
+                 {hidden}<button class=\"link danger-text\">Delete</button></form>",
                 esc(&ch.title),
                 csrf(c)
             )
@@ -1000,21 +1080,43 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
         rows.push_str(&format!(
             "<li class=\"chat\"><div class=\"chat-main\"><span class=\"chat-title\">{}</span>\
              <span class=\"item-meta\">{} · {} KB · <code>{}</code></span></div>\
-             <div class=\"chat-actions\"><details class=\"rename\"><summary>Rename</summary>\
-             <form method=\"post\" action=\"/space/{n}/chat-rename\" class=\"typing\">{}<input type=\"hidden\" name=\"id\" value=\"{id}\">\
-             <input name=\"title\" value=\"{}\" maxlength=\"100\" required><button>Save</button></form></details>{delete}</div></li>",
+             <div class=\"chat-actions\">{}{side}</div></li>",
             esc(&ch.title),
             ago(now.saturating_sub(ch.modified)),
             ch.kb,
             esc(&ch.id[..8.min(ch.id.len())]),
-            csrf(c),
-            esc(&ch.title),
+            rename_dialog(
+                c,
+                &format!("/space/{n}/chat-rename"),
+                "chat",
+                "title",
+                &ch.title,
+                &hidden
+            ),
         ));
     }
+    let new_chat = if one {
+        format!(
+            "<form method=\"post\" action=\"/space/{n}/chat-new\" class=\"inline\" \
+             data-confirm=\"Start a new chat? The space restarts into it; the current one stays in this list.\">{}\
+             <button class=\"primary\">+ New chat</button></form>",
+            csrf(c)
+        )
+    } else {
+        String::new()
+    };
+    let how = if one {
+        "This space runs one chat at a time: start a new one, or continue an earlier one, and the space restarts into it."
+            .to_string()
+    } else {
+        format!(
+            "Start new chats in the Claude app or on claude.ai/code, in the environment <b>{}</b>.",
+            esc(&s.rc_name)
+        )
+    };
     format!(
-        "<section class=\"card\" id=\"chats\"><h2>Chats</h2><p class=\"hint\">The conversations kept on this hub, \
-         newest first. A new name also shows in Claude Code (and in the Claude app once Claude Code picks it up); \
-         deleting removes the hub's copy.</p>{}</section>",
+        "<section class=\"card\" id=\"chats\"><div class=\"page-head\"><h2>Chats</h2>{new_chat}</div>\
+         <p class=\"hint\">{how} Newest first. A new name also shows in Claude Code; deleting removes the hub's copy.</p>{}</section>",
         if rows.is_empty() {
             "<p>No chats yet.</p>".to_string()
         } else {
@@ -1114,6 +1216,7 @@ fn space_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>)
                     old: name.into(),
                     new: new.clone(),
                     rc_name: None,
+                    code: f(form, "code").into(),
                 },
             ) {
                 Ok(restarted) => back(
@@ -1170,9 +1273,28 @@ fn space_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>)
                     name: name.into(),
                     id: f(form, "id").into(),
                     title: f(form, "title").into(),
+                    code: f(form, "code").into(),
                 },
             )
             .map(|_| "chat renamed".into()),
+        ),
+        "chat-new" | "chat-open" => back(
+            &format!("{here}#chats"),
+            get::<ops::ChatOpened>(
+                c,
+                Op::ChatOpen {
+                    name: name.into(),
+                    id: (action == "chat-open").then(|| f(form, "id").to_string()),
+                },
+            )
+            .map(|o| {
+                let what = if action == "chat-new" { "new chat started" } else { "back in that chat" };
+                if o.restarted {
+                    format!("{what}; the space restarted into it")
+                } else {
+                    format!("{what}; it runs when the space starts")
+                }
+            }),
         ),
         "chat-rm" => back(
             &format!("{here}#chats"),
@@ -1195,6 +1317,16 @@ fn hosts_page(c: &Ctx, flash: &Flash) -> Reply {
         Err(r) => return r,
     };
     let mut b = String::from("<h1>Machines</h1>");
+    b.push_str(&format!(
+        "<details class=\"card add\"{}><summary>+ Add a machine</summary><p class=\"hint\">Linux or macOS with an SSH server, by IP \
+         address (its tailnet address works well). Next you check that blackthorn reached the right machine.</p>\
+         <form method=\"post\" action=\"/hosts/scan\" class=\"stack\">{}<div class=\"fields\"><label>Name <input name=\"name\" required \
+         placeholder=\"fig\"></label><label>Login <input name=\"target\" required placeholder=\"user@100.80.0.3\"></label>\
+         <label class=\"narrow\">Port <input name=\"port\" value=\"22\" inputmode=\"numeric\"></label></div>\
+         <div><button class=\"primary\">Next: check it is the right machine</button></div></form></details>",
+        if o.hosts.is_empty() { " open" } else { "" },
+        csrf(c)
+    ));
     if o.hosts.is_empty() {
         b.push_str("<p>No machines yet.</p>");
     } else {
@@ -1204,15 +1336,6 @@ fn hosts_page(c: &Ctx, flash: &Flash) -> Reply {
         }
         b.push_str("</div>");
     }
-    b.push_str(&format!(
-        "<section class=\"card\"><h2>Add a machine</h2><p class=\"hint\">Linux or macOS with an SSH server, by IP \
-         address (its tailnet address works well). Next you check that blackthorn reached the right machine.</p>\
-         <form method=\"post\" action=\"/hosts/scan\" class=\"stack\">{}<div class=\"fields\"><label>Name <input name=\"name\" required \
-         placeholder=\"fig\"></label><label>Login <input name=\"target\" required placeholder=\"user@100.80.0.3\"></label>\
-         <label class=\"narrow\">Port <input name=\"port\" value=\"22\" inputmode=\"numeric\"></label></div>\
-         <div><button class=\"primary\">Next: check it is the right machine</button></div></form></section>",
-        csrf(c)
-    ));
     Reply::Html(200, page(c, "Machines", &b, flash))
 }
 
@@ -1328,10 +1451,11 @@ fn host_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
             .join(", ")
     };
     let mut b = format!(
-        "<div class=\"page-head\"><h1><span class=\"dot {}\"></span>{}</h1></div>\
+        "<div class=\"page-head\"><h1><span class=\"dot {}\"></span>{}</h1><div class=\"buttons\">{}</div></div>\
          <p class=\"item-meta\">{}@{} port {} · {} · spaces: {spaces}</p><p class=\"{}\">{}</p>",
         if h.blocked { "bad" } else { "ok" },
         esc(&h.name),
+        rename_dialog(c, &format!("/host/{n}/rename"), "machine", "new", &h.name, ""),
         esc(&h.user),
         h.address,
         h.port,
@@ -1506,6 +1630,23 @@ fn host_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>) 
                     .into()
             }),
         ),
+        "rename" => {
+            let new = f(form, "new").trim().to_string();
+            match get::<serde_json::Value>(
+                c,
+                Op::HostRename {
+                    old: name.into(),
+                    new: new.clone(),
+                    code: f(form, "code").into(),
+                },
+            ) {
+                Ok(_) => back(
+                    &format!("/host/{}", url_encode(&new)),
+                    Ok(format!("renamed; its spaces now reach it as ssh {new}")),
+                ),
+                Err(e) => back(&here, Err(e)),
+            }
+        }
         "rm" => match get::<serde_json::Value>(
             c,
             Op::HostRm {
@@ -1633,7 +1774,7 @@ fn settings_page(c: &Ctx, flash: &Flash) -> Reply {
         )
     };
     let b = format!(
-        "<h1>Settings</h1>{}<section class=\"card\"><h2>Network and access</h2><p class=\"hint\">Saved to \
+        "<h1>Settings</h1>{}{}<section class=\"card\"><h2>Network and access</h2><p class=\"hint\">Saved to \
          <code>/etc/blackthorn/config.toml</code> and applied at once.{you} A change that would shut you out is \
          refused.</p>{peers_note}<form method=\"post\" action=\"/settings\" class=\"stack settings\">{}{fields}{}\
          <div><button class=\"primary\">Save</button></div></form></section>\
@@ -1643,11 +1784,50 @@ fn settings_page(c: &Ctx, flash: &Flash) -> Reply {
          <div class=\"buttons\"><button value=\"add\" class=\"primary\">Add</button><button value=\"cancel\" formnovalidate>Cancel</button></div>\
          </form></dialog>",
         update_card(c),
+        notify_card(c),
         csrf(c),
         code_field(),
         esc(&picker.to_string()),
     );
     Reply::Html(200, page(c, "Settings", &b, flash))
+}
+
+fn notify_card(c: &Ctx) -> String {
+    let v = get::<NotifyView>(c, Op::NotifyShow).unwrap_or_default();
+    let on = !v.url.is_empty();
+    let status = if on {
+        format!(
+            "<p>On: messages go to <code>{}</code>{}. Subscribe to that topic in the ntfy app.</p>{}",
+            esc(&v.url),
+            if v.token { " with an access token" } else { "" },
+            button(c, "/notify/test", "Send a test", "", "")
+        )
+    } else {
+        "<p>Off.</p>".to_string()
+    };
+    let suggested = format!("https://ntfy.sh/{}", crate::notify::random_topic());
+    format!(
+        "<section class=\"card\" id=\"notify\"><h2>Notifications</h2><p class=\"hint\">Pushed to your phone with \
+         <a href=\"https://ntfy.sh\" target=\"_blank\" rel=\"noopener noreferrer\">ntfy</a> when a managed machine tries to \
+         connect to the hub, a space fails or needs to sign in again, a block or bridge ends, or a new release is out. \
+         Use ntfy.sh with a topic nobody can guess, or your own ntfy server. Messages carry names, never secrets.</p>\
+         {status}<form method=\"post\" action=\"/notify\" class=\"stack\">{}\
+         <label>Topic URL <input name=\"url\" value=\"{}\" placeholder=\"{}\" autocomplete=\"off\" spellcheck=\"false\"></label>\
+         <p class=\"hint\">Empty turns notifications off. A fresh random topic: <code>{}</code></p>\
+         <label>Access token, for a protected topic <input name=\"token\" type=\"password\" autocomplete=\"off\" \
+         placeholder=\"{}\"></label>{}{}<div><button class=\"primary\">Save</button></div></form></section>",
+        csrf(c),
+        esc(&v.url),
+        esc(&suggested),
+        esc(&suggested),
+        if v.token { "(kept unless you type a new one)" } else { "(optional)" },
+        if v.token {
+            "<label class=\"check\"><input type=\"checkbox\" name=\"clear_token\"> Remove the access token</label>"
+        } else {
+            ""
+        },
+        code_field()
+    )
 }
 
 fn updating_page(c: &Ctx, tag: &str) -> Reply {
@@ -1676,7 +1856,7 @@ fn account_page(c: &Ctx, flash: &Flash) -> Reply {
         .and_then(|v| v["recovery_left"].as_u64())
         .unwrap_or(0);
     let b = format!(
-        "<h1>Account {}</h1><section class=\"row\">\
+        "<div class=\"page-head\"><h1>Account {}</h1><div class=\"buttons\">{}</div></div><section class=\"row\">\
          <section class=\"card\"><h2>Password</h2><form method=\"post\" action=\"/account/password\" class=\"stack\">{}\
          <label>Current password <input name=\"current\" type=\"password\" autocomplete=\"current-password\" required></label>\
          <label>New password (12+ characters) <input name=\"new\" type=\"password\" autocomplete=\"new-password\" minlength=\"12\" required></label>\
@@ -1692,6 +1872,7 @@ fn account_page(c: &Ctx, flash: &Flash) -> Reply {
          <p class=\"hint\">Accounts are added and removed on the hub itself: <code>sudo thorn web user add &lt;name&gt;</code>, \
          <code>sudo thorn web user rm &lt;name&gt;</code>.</p>",
         esc(&c.user),
+        rename_dialog(c, "/account/rename", "account", "new", &c.user, ""),
         csrf(c),
         code_field(),
         csrf(c),
@@ -1701,6 +1882,17 @@ fn account_page(c: &Ctx, flash: &Flash) -> Reply {
 
 fn account_post(c: &Ctx, action: &str, form: &HashMap<String, String>) -> Reply {
     match action {
+        "rename" => back(
+            "/account",
+            get::<String>(
+                c,
+                Op::AccountRename {
+                    new: f(form, "new").trim().into(),
+                    code: f(form, "code").into(),
+                },
+            )
+            .map(|n| format!("you are now {n}; log in with that name from now on")),
+        ),
         "password" => {
             if f(form, "new") != f(form, "again") {
                 return back("/account", Err("the two new passwords differ".into()));

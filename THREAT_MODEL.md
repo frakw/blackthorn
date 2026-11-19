@@ -58,7 +58,7 @@ they are enforced by the kernel or by what the space has, not by the model.
 | A space reaches only its machine | nftables rules match the space's uid and allow only the IP and SSH port of its machine (and of machines it has an active bridge to) while not blocked, plus DNS and HTTPS. Everything else is rejected. |
 | Blocks and bridge ends are immediate | There is no "established connections are allowed" rule for spaces, so packets on open connections are rejected too. Keys are removed from agents at the same time. Timed blocks and bridges end within a minute of their time. |
 | Bridges are one-way | A bridge from A to B gives A's user B's machine; B's user gains nothing. |
-| Managed machines cannot reach the hub | The hub's input rules drop every connection from a managed machine (and from `never_manage`/`deny_from` addresses). Replies to the hub's own SSH connections still arrive. blackthorn refuses to manage an address listed in `inbound.admin_from` or the address you are connected from. |
+| Managed machines cannot reach the hub | The hub's input rules drop every connection from a managed machine (and from `never_manage`/`deny_from` addresses), and note who tried, for notifications. Replies to the hub's own SSH connections still arrive. blackthorn refuses to manage an address listed in `inbound.admin_from` or the address you are connected from. |
 | Admin ports only from your devices | If `inbound.admin_from` is set, only those addresses may reach SSH and the web UI. |
 | Spaces never see private keys | Keys are root-only files. Root loads them into the space's ssh-agent, which marks itself non-dumpable so the space user cannot read its memory. |
 | Stolen keys are useless elsewhere | The suggested `authorized_keys` line has `from="<hub address>"` and `restrict`: usable only from the hub, with no port, agent or X11 forwarding and no pty. |
@@ -66,7 +66,7 @@ they are enforced by the kernel or by what the space has, not by the model.
 | Spaces cannot change the system | systemd sandbox: `ProtectSystem=strict`, `ProtectHome`, `NoNewPrivileges`, `PrivateTmp`, `RestrictSUIDSGID`, and more. |
 | Without the firewall, nothing runs | Space units require the firewall unit, and stopping the firewall unit leaves its rules loaded. |
 | The web UI's network side has no power | The HTTP listener runs as the unprivileged `blackthorn-web` user in a tight systemd sandbox, with no access to blackthorn's files. It forwards requests to a root API on a Unix socket, which accepts only that user, checks the password (Argon2id) and TOTP code itself, keeps the sessions, and enforces the CSRF value. A compromised web process can act only through a session a user has logged in to. |
-| Logins resist guessing | Password and TOTP are both needed; each code works once; five failures lock the account and the address for 15 minutes. Deleting spaces, removing machines, moving them, opening bridges, accepting new host keys, changing settings, updating blackthorn and changing your password or authenticator need a fresh code. A new authenticator replaces the old one only after a code made from it is accepted; password and authenticator changes end your other logins. Accounts are created and removed only on the hub's command line. |
+| Logins resist guessing | Password and TOTP are both needed; each code works once; five failures lock the account and the address for 15 minutes. Deleting spaces, removing machines, moving them, renaming anything, opening bridges, accepting new host keys, changing settings or notifications, updating blackthorn and changing your password or authenticator need a fresh code. A new authenticator replaces the old one only after a code made from it is accepted; password and authenticator changes end your other logins. Accounts are created and removed only on the hub's command line. |
 | Account secrets do not linger | The terminal that showed a new account's QR code and recovery codes is cleared, scrollback included, once you have written them down. |
 | Root does not follow a space's links | Listing, naming and deleting chats reads and writes files in the space's home as root; it skips symbolic links, opens transcripts with `O_NOFOLLOW`, and acts only on files the space user owns. |
 | Web pages are hard to abuse | SameSite=Strict, HttpOnly session cookie; a CSRF value on every form; a CSP that allows no inline script or third-party resource; a small HTTP parser with size, time and connection limits. |
@@ -145,7 +145,15 @@ Know these before you rely on it.
     request to github.com from the hub, at most every six hours, while the
     Settings page is open.
 
-12. **Availability is not protected.** A space can exhaust memory or CPU,
+12. **Notifications leave the hub.** With notifications on, the hub
+    (as root, not a space) sends short messages to the ntfy server you
+    chose: names of spaces and machines, their states, addresses that tried
+    to connect. Never secrets. On ntfy.sh anyone who knows the topic can
+    read them, so blackthorn suggests a long random one and keeps it, and
+    any access token, in a root-only file spaces cannot read. A missing
+    notification proves nothing: the hub may be down, or its network.
+
+13. **Availability is not protected.** A space can exhaust memory or CPU,
     or kill its own agent. Spaces are separate units, so this affects
     others only through shared resources.
 

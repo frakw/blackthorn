@@ -12,6 +12,7 @@ mod http;
 mod init_cmd;
 mod keys;
 mod map;
+mod notify;
 mod ops;
 mod paths;
 mod render;
@@ -157,6 +158,10 @@ enum Cmd {
         #[arg(long)]
         check: bool,
     },
+    /// Push notifications (ntfy): a machine trying to connect back, a space
+    /// failing or needing login, blocks and bridges ending, new releases.
+    #[command(subcommand)]
+    Notify(NotifyCmd),
     /// Show or change the settings the web UI can change too.
     #[command(subcommand)]
     Config(ConfigCmd),
@@ -220,6 +225,29 @@ enum ChatCmd {
     },
     /// Delete a chat's transcript from the hub.
     Rm { space: String, id: String },
+    /// Start a new conversation in a space that runs one (single mode, or
+    /// Remote Control off). With Remote Control, start chats from the app.
+    New { space: String },
+    /// Go back to an earlier conversation in such a space.
+    Open { space: String, id: String },
+}
+
+#[derive(Subcommand)]
+enum NotifyCmd {
+    /// Where notifications go.
+    Show,
+    /// Send them to an ntfy topic: https://ntfy.sh/<topic> or your own
+    /// server. Without a URL: a new random topic on ntfy.sh.
+    Set {
+        url: Option<String>,
+        /// Ask for an access token (for a protected topic).
+        #[arg(long)]
+        token: bool,
+    },
+    /// Stop sending them.
+    Off,
+    /// Send a test message.
+    Test,
 }
 
 #[derive(Subcommand)]
@@ -246,6 +274,8 @@ enum HostCmd {
     },
     /// Forget a machine (delete its spaces first).
     Rm { name: String },
+    /// Rename a machine; its spaces stay (and reach it by the new name).
+    Rename { old: String, new: String },
     /// List machines.
     Ls,
     /// Cut every space off from a machine, now.
@@ -304,6 +334,8 @@ enum WebUserCmd {
     },
     /// Remove an account.
     Rm { name: String },
+    /// Rename an account.
+    Rename { old: String, new: String },
     /// List accounts.
     Ls,
     /// Change an account's password.
@@ -403,8 +435,16 @@ fn run(cli: Cli) -> Result<()> {
             ChatCmd::Ls { space } => s::chat_ls(&space),
             ChatCmd::Rename { space, id, title } => s::chat_rename(&space, &id, &title),
             ChatCmd::Rm { space, id } => s::chat_rm(&space, &id),
+            ChatCmd::New { space } => s::chat_open(&space, None),
+            ChatCmd::Open { space, id } => s::chat_open(&space, Some(&id)),
         },
         Cmd::Update { check } => config_cmd::update(check),
+        Cmd::Notify(n) => match n {
+            NotifyCmd::Show => notify::cmd_show(),
+            NotifyCmd::Set { url, token } => notify::cmd_set(url, token),
+            NotifyCmd::Off => notify::cmd_off(),
+            NotifyCmd::Test => notify::cmd_test(),
+        },
         Cmd::Config(c) => match c {
             ConfigCmd::Show => config_cmd::show(),
             ConfigCmd::Set { key, value } => config_cmd::set(&key, &value),
@@ -427,6 +467,7 @@ fn run(cli: Cli) -> Result<()> {
                 yes,
             } => host_cmd::add(&name, &target, port, yes),
             HostCmd::Rm { name } => host_cmd::rm(&name),
+            HostCmd::Rename { old, new } => host_cmd::rename(&old, &new),
             HostCmd::Ls => host_cmd::ls(),
             HostCmd::Block {
                 name,
@@ -450,6 +491,7 @@ fn run(cli: Cli) -> Result<()> {
             WebCmd::User(u) => match u {
                 WebUserCmd::Add { name, totp_secret } => web_cmd::user_add(&name, totp_secret),
                 WebUserCmd::Rm { name } => web_cmd::user_rm(&name),
+                WebUserCmd::Rename { old, new } => web_cmd::user_rename(&old, &new),
                 WebUserCmd::Ls => web_cmd::user_ls(),
                 WebUserCmd::Passwd { name } => web_cmd::user_passwd(&name),
                 WebUserCmd::TotpReset { name } => web_cmd::user_totp_reset(&name),
@@ -573,6 +615,12 @@ mod tests {
             ("account_password", &["web", "user", "passwd"]),
             ("account_totp_begin", &["web", "user", "totp-reset"]),
             ("account_totp_finish", &["web", "user", "totp-reset"]),
+            ("chat_open", &["chat", "new"]),
+            ("host_rename", &["host", "rename"]),
+            ("account_rename", &["web", "user", "rename"]),
+            ("notify_show", &["notify", "show"]),
+            ("notify_set", &["notify", "set"]),
+            ("notify_test", &["notify", "test"]),
         ];
         // Operations that exist only because of the web: sessions.
         let web_only = ["web_config", "login", "logout", "whoami"];
