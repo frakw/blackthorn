@@ -66,9 +66,9 @@ they are enforced by the kernel or by what the space has, not by the model.
 | Spaces cannot change the system | systemd sandbox: `ProtectSystem=strict`, `ProtectHome`, `NoNewPrivileges`, `PrivateTmp`, `RestrictSUIDSGID`, and more. |
 | Without the firewall, nothing runs | Space units require the firewall unit, and stopping the firewall unit leaves its rules loaded. |
 | The web UI's network side has no power | The HTTP listener runs as the unprivileged `blackthorn-web` user in a tight systemd sandbox, with no access to blackthorn's files. It forwards requests to a root API on a Unix socket, which accepts only that user, checks the password (Argon2id) and TOTP code itself, keeps the sessions, and enforces the CSRF value. A compromised web process can act only through a session a user has logged in to. |
-| Logins resist guessing | Password and TOTP are both needed; each code works once; five failures lock the account and the address for 15 minutes. Deleting spaces, removing machines, moving them, renaming anything, opening bridges, accepting new host keys, changing settings or notifications, updating blackthorn and changing your password or authenticator need a fresh code. A new authenticator replaces the old one only after a code made from it is accepted; password and authenticator changes end your other logins. Accounts are created and removed only on the hub's command line. |
+| Logins resist guessing | Password and TOTP are both needed; each code works once; five failures lock the account and the address for 15 minutes. Deleting spaces, removing machines, moving them, renaming anything, opening bridges, accepting new host keys, changing settings or notifications, updating blackthorn and changing your password or authenticator need a fresh code. A new authenticator replaces the old one only after a code made from it is accepted; password and authenticator changes end your other logins. Accounts are created and removed only on the hub's command line. Passkeys must verify the user (PIN or biometrics) and are checked for the hub's name and origin, a one-time challenge, the signature and a growing counter. |
 | Account secrets do not linger | The terminal that showed a new account's QR code and recovery codes is cleared, scrollback included, once you have written them down. |
-| Root does not follow a space's links | Listing, naming and deleting chats reads and writes files in the space's home as root; it skips symbolic links, opens transcripts with `O_NOFOLLOW`, and acts only on files the space user owns. |
+| Root does not follow a space's links | Listing, naming and deleting chats reads and writes files in the space's home as root; it skips symbolic links, opens transcripts with `O_NOFOLLOW`, and acts only on files the space user owns. Generated files (such as CLAUDE.md in the space's own work folder) are written through a temporary file created anew (`O_EXCL`), owned and set by its descriptor, so a link planted at that name is never followed (before v0.6 it was). |
 | Web pages are hard to abuse | SameSite=Strict, HttpOnly session cookie; a CSRF value on every form; a CSP that allows no inline script or third-party resource; a small HTTP parser with size, time and connection limits. |
 | SSH changes cannot lock you out | `thorn harden ssh` checks your authenticator first, validates sshd's configuration, and undoes itself unless you confirm from a new login. |
 
@@ -125,11 +125,16 @@ Know these before you rely on it.
    control server on a machine blackthorn does not manage, and list it in
    `never_manage`.
 
-9. **The web UI is plain HTTP.** It relies on the tailnet's encryption. A
-   fresh install without Tailscale listens on every address; anyone on that
-   network path can then read the session cookie. Set `web.listen` to the
-   tailnet address and `inbound.admin_from` to your devices, and do not
-   make it reachable outside the tailnet.
+9. **The web UI is plain HTTP unless you give it a certificate.** Then
+   it relies on the tailnet's encryption. A fresh install without Tailscale
+   listens on every address; anyone on that network path can then read the
+   session cookie. Set `web.listen` to the tailnet address and
+   `inbound.admin_from` to your devices, and do not make it reachable
+   outside the tailnet. With `thorn web https` it speaks only HTTPS, the
+   session cookie is `Secure`, and passkeys work. The unprivileged web
+   process holds the TLS key (it gets it from the root API, since it cannot
+   read the key file), so whoever takes over that process can impersonate
+   the web UI until the certificate is replaced.
 
 10. **Remote Control is as safe as your Claude account.** Spaces accept
     instructions from Remote Control. See "Who is trusted". A space with

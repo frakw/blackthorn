@@ -144,7 +144,7 @@ pub fn register(
     let id = rest.get(18..18 + len).context("credential id cut short")?;
     let key_bytes = &rest[18 + len..];
     let (key, used) = Cbor::parse_prefix(key_bytes)?;
-    verifier(&key)?; // a key type we can check
+    let _check = verifier(&key)?; // a key type we can check
     if b64(id) != answer.id.trim_end_matches('=') {
         bail!("credential id mismatch");
     }

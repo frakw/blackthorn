@@ -161,8 +161,10 @@ The web UI is the everyday way to run blackthorn, on a laptop or a phone:
   Anthropic's cloud), and the machines the spaces work on, as boxes and
   wires like a node editor. Arrows point from whoever opens the connection.
   Drag boxes around, pan and zoom; the layout is remembered in your browser.
-- **Spaces**: each one's chats (new, continue, rename, delete), a live view
-  of its terminal, Claude sign-in, bridges, and Remote Control on or off.
+- **Spaces**: each one's chats (new, continue, rename, delete; with Remote
+  Control a new chat runs next to the others and shows in the Claude app),
+  a live view of its terminal, Claude sign-in, bridges, Remote Control on
+  or off, and the name the Claude app lists it by.
 - **Machines**: the key line to install (with a Copy button), checking the
   machine's host keys, blocks, renaming.
 - **Settings**: who may connect, never_manage and the web address, edited
@@ -184,7 +186,31 @@ settings ask for a fresh code again. The HTTP-facing process runs as an unprivil
 cannot act on its own: a root process behind a Unix socket checks every
 login and code.
 
-It is plain HTTP. On install it listens on the hub's tailnet address when
+### HTTPS and passkeys
+
+Passkeys (Face ID, Touch ID, Windows Hello, Android) and hardware keys with a
+PIN log you in on their own, and stand in for the authenticator code where
+one is asked again ("or use a passkey"). Add them on the **Account** page.
+Browsers allow them only over HTTPS, under a name, so give the web UI one:
+
+```sh
+# Your own domain, e.g. a DNS record hub.example.com -> the hub's tailnet IP,
+# and a certificate from certbot with a DNS challenge (the hub need not be
+# reachable from the internet). Renew it as usual; blackthorn picks it up.
+sudo thorn web https --cert /etc/letsencrypt/live/hub.example.com/fullchain.pem \
+                     --key  /etc/letsencrypt/live/hub.example.com/privkey.pem --name hub.example.com
+
+# Or Tailscale's own coordination server (not Headscale), with MagicDNS and
+# HTTPS turned on in its admin console: a certificate for hub.<tailnet>.ts.net.
+sudo thorn web https --tailscale
+
+sudo thorn web https          # what is set
+sudo thorn web https --off    # back to plain HTTP
+```
+
+Then it speaks only HTTPS. Without it, the password and code are enough.
+
+It is plain HTTP until then. On install it listens on the hub's tailnet address when
 Tailscale is up, where WireGuard already encrypts the traffic and no domain
 or certificate is needed. Without Tailscale it listens on every address;
 then narrow it down, and limit who may connect at all, on the
@@ -234,7 +260,7 @@ restores the old settings at any time.
 | `thorn screen SPACE` / `thorn send SPACE TEXT` | Read or type into the terminal without attaching |
 | `thorn rename OLD NEW [--rc-name N]` | Rename; same chats |
 | `thorn chat ls SPACE` / `chat rename SPACE ID NAME` / `chat rm SPACE ID` | A space's Claude chats |
-| `thorn chat new SPACE` / `chat open SPACE ID` | A one-conversation space: start a new chat, or go back to one |
+| `thorn chat new SPACE` / `chat open SPACE ID` | Start a new chat, or go back to one |
 | `thorn remote SPACE on\|off` | Remote Control on, or off: one local conversation, only from the hub |
 | `thorn rm SPACE [--purge]` | Delete; files are archived unless `--purge` |
 | `thorn bridge add FROM TO [--for 1h]` / `bridge rm` / `bridge ls` | Let one space reach another space's machine for a while |
@@ -243,6 +269,8 @@ restores the old settings at any time.
 | `thorn host set-address NAME USER@IP [--port P]` | Move a machine to a new address (e.g. LAN to tailnet); its spaces stay |
 | `thorn host block NAME [--for 30m] [--reason R]` / `host unblock` | Cut a machine off from every space |
 | `thorn web enable\|disable` / `web user add\|rm\|ls\|rename\|passwd\|totp-reset` | The web UI and its accounts |
+| `thorn web https [--cert C --key K --name N \| --tailscale \| --off]` | HTTPS for the web UI (needed for passkeys) |
+| `thorn web user passkey-rm NAME PASSKEY` | Remove a lost passkey |
 | `thorn notify set [URL] [--token]` / `notify show\|test\|off` | Notifications to an ntfy topic (no URL: a new random topic on ntfy.sh) |
 | `thorn config show` / `config set KEY VALUE` | The settings the web UI can change: admin devices, never_manage, web address, ... |
 | `thorn harden ssh --totp\|--fido` / `harden confirm\|undo` | Two-factor SSH to the hub |
