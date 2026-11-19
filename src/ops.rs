@@ -721,7 +721,7 @@ pub fn chat_list(name: &str) -> Result<Vec<Chat>> {
             })
         })
         .collect();
-    chats.sort_by(|a, b| b.modified.cmp(&a.modified));
+    chats.sort_by_key(|c| std::cmp::Reverse(c.modified));
     chats.truncate(200);
     Ok(chats)
 }
