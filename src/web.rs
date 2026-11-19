@@ -11,8 +11,8 @@ use crate::api::{self, Op, Request, Response};
 use crate::http;
 use crate::map::{self, esc};
 use crate::ops::{
-    Action, BridgeView, ConfigChange, HostView, NewSpace, Overview, Scan, Setting, SpaceView,
-    SPECIAL_KEYS,
+    self, Action, BridgeView, Chat, ConfigChange, HostView, NewSpace, Overview, Peer, Scan,
+    Setting, SpaceView, SPECIAL_KEYS,
 };
 use crate::webauth::url_encode;
 use anyhow::{Context, Result};
@@ -59,6 +59,8 @@ struct Ctx {
     client: Option<IpAddr>,
     csrf: String,
     user: String,
+    /// The page's path, to mark where you are in the menu.
+    path: String,
 }
 
 enum Reply {
@@ -226,6 +228,7 @@ fn route(
         client,
         csrf: String::new(),
         user: String::new(),
+        path: path.to_string(),
     };
     if c.token.is_none() {
         return Reply::Redirect("/login".into(), None);
@@ -265,6 +268,7 @@ fn route(
                 agent: opt(form, "agent"),
                 name: opt(form, "name"),
                 single: f(form, "single") == "on",
+                local: f(form, "local") == "on",
                 rc_name: opt(form, "rc_name"),
                 args: f(form, "args")
                     .split_whitespace()
@@ -317,6 +321,29 @@ fn route(
 
         ("GET", ["settings"]) => settings_page(&c, &flash),
         ("POST", ["settings"]) => settings_post(&c, form),
+        ("POST", ["update"]) => match get::<String>(
+            &c,
+            Op::Update {
+                code: f(form, "code").into(),
+            },
+        ) {
+            Ok(tag) => updating_page(&c, &tag),
+            Err(e) => back("/settings#update", Err(e)),
+        },
+        ("POST", ["update", "check"]) => {
+            let r = get::<ops::UpdateInfo>(&c, Op::UpdateCheck { refresh: true });
+            back(
+                "/settings#update",
+                r.map(|u| match (u.error, u.newer, u.latest) {
+                    (Some(e), _, _) => format!("could not check: {e}"),
+                    (None, true, Some(t)) => format!("{t} is available"),
+                    _ => "this is the latest release".into(),
+                }),
+            )
+        }
+
+        ("GET", ["account"]) => account_page(&c, &flash),
+        ("POST", ["account", action]) => account_post(&c, action, form),
 
         ("GET", ["bridges"]) => bridges_page(&c, &flash),
         ("POST", ["bridges"]) => {
@@ -366,7 +393,32 @@ struct Flash {
 
 // ---------------------------------------------------------------- pages
 
+const MENU: &[(&str, &str)] = &[
+    ("/", "Map"),
+    ("/spaces", "Spaces"),
+    ("/hosts", "Machines"),
+    ("/bridges", "Bridges"),
+    ("/settings", "Settings"),
+];
+
+/// Which menu entry a page belongs to.
+fn section(path: &str) -> &'static str {
+    match path.trim_start_matches('/').split('/').next().unwrap_or("") {
+        "spaces" | "space" => "/spaces",
+        "hosts" | "host" => "/hosts",
+        "bridges" => "/bridges",
+        "settings" | "update" => "/settings",
+        "account" => "/account",
+        _ => "/",
+    }
+}
+
 fn page(c: &Ctx, title: &str, body: &str, flash: &Flash) -> String {
+    page_with(c, title, body, flash, "")
+}
+
+/// `head`: extra tags for <head>, e.g. a refresh while an update runs.
+fn page_with(c: &Ctx, title: &str, body: &str, flash: &Flash, head: &str) -> String {
     let mut fl = String::new();
     if let Some(m) = &flash.ok {
         fl.push_str(&format!("<p class=\"flash ok\">{}</p>", esc(m)));
@@ -377,22 +429,36 @@ fn page(c: &Ctx, title: &str, body: &str, flash: &Flash) -> String {
     let nav = if c.user.is_empty() {
         String::new()
     } else {
+        let here = section(&c.path);
+        let links: String = MENU
+            .iter()
+            .map(|(href, label)| {
+                format!(
+                    "<a href=\"{href}\"{}>{label}</a>",
+                    if *href == here {
+                        " class=\"on\" aria-current=\"page\""
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .collect();
         format!(
-            "<nav><a href=\"/\">Map</a><a href=\"/spaces\">Spaces</a><a href=\"/hosts\">Machines</a>\
-             <a href=\"/bridges\">Bridges</a><a href=\"/settings\">Settings</a></nav><form method=\"post\" action=\"/logout\" class=\"logout\">\
-             {}<button class=\"link\">Log out {}</button></form>",
-            csrf(c),
-            esc(&c.user)
+            "<nav class=\"menu\">{links}</nav><div class=\"me\"><a href=\"/account\"{}>{}</a>\
+             <form method=\"post\" action=\"/logout\" class=\"inline\">{}<button class=\"link\">Log out</button></form></div>",
+            if here == "/account" { " class=\"on\"" } else { "" },
+            esc(&c.user),
+            csrf(c)
         )
     };
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <title>{} · blackthorn</title><link rel=\"stylesheet\" href=\"/static/app.css\">\
-         <link rel=\"icon\" href=\"/static/logo.svg\" type=\"image/svg+xml\">\
+         <link rel=\"icon\" href=\"/static/logo.svg\" type=\"image/svg+xml\">{head}\
          <script src=\"/static/app.js\" defer></script></head><body>\
-         <header class=\"top\"><a class=\"brand\" href=\"/\">{LOGO}blackthorn</a>\
-         <span class=\"version\" title=\"blackthorn version\">v{VERSION}</span>{nav}</header>\
+         <header class=\"top\"><div class=\"bar\"><a class=\"brand\" href=\"/\">{LOGO}blackthorn</a>\
+         <span class=\"version\" title=\"blackthorn version\">v{VERSION}</span></div>{nav}</header>\
          <main>{fl}{body}</main></body></html>",
         esc(title)
     )
@@ -432,12 +498,31 @@ fn button(c: &Ctx, action: &str, label: &str, class: &str, extra: &str) -> Strin
     )
 }
 
+/// Text with a Copy button (the button appears only with the script).
+fn copyable(id: &str, text: &str) -> String {
+    format!(
+        "<div class=\"copyable\"><pre class=\"wrap\" id=\"{id}\">{}</pre>\
+         <button type=\"button\" class=\"copy\" data-copy=\"{id}\" hidden>Copy</button></div>",
+        esc(text)
+    )
+}
+
+fn ago(secs: u64) -> String {
+    match secs {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{} min ago", secs / 60),
+        3600..=86_399 => format!("{} h ago", secs / 3600),
+        _ => format!("{} days ago", secs / 86_400),
+    }
+}
+
 fn login_page(err: Option<&str>) -> Reply {
     let c = Ctx {
         token: None,
         client: None,
         csrf: String::new(),
         user: String::new(),
+        path: "/login".into(),
     };
     let body = "<section class=\"card narrow\"><h1>Log in</h1>\
         <form method=\"post\" action=\"/login\" class=\"stack\">\
@@ -504,51 +589,71 @@ fn overview_or_error(c: &Ctx, title: &str, flash: &Flash) -> std::result::Result
     })
 }
 
+/// The hub's health: the checks that failed, or one line saying all passed.
+fn health(o: &Overview) -> String {
+    let hub = &o.hub;
+    let mut bad: Vec<String> = Vec::new();
+    if !hub.firewall_loaded {
+        bad.push("the firewall is NOT loaded: run <code>sudo thorn apply</code>".into());
+    }
+    if hub.timer != "active" {
+        bad.push(format!(
+            "the block timer is {}: blocks and bridges will not expire",
+            esc(&hub.timer)
+        ));
+    }
+    if hub.claude_version.is_none() {
+        bad.push(
+            "Claude Code is not installed: <code>sudo thorn init --claude-from …</code>".into(),
+        );
+    }
+    if hub.admin_from.is_empty() {
+        bad.push(
+            "admin from anywhere: anything that reaches the hub may try to log in. \
+             <a href=\"/settings#inbound.admin_from\">List your devices</a>"
+                .into(),
+        );
+    }
+    if hub.memory_available_mb.is_some_and(|m| m <= 300) {
+        bad.push(format!(
+            "low memory: {} MB free",
+            hub.memory_available_mb.unwrap_or(0)
+        ));
+    }
+    let facts = format!(
+        "<dl class=\"facts\"><dt>Firewall</dt><dd>{}</dd><dt>Block timer</dt><dd>{}</dd><dt>Claude Code</dt><dd>{}</dd>\
+         <dt>Admin from</dt><dd>{}</dd><dt>Refused inbound</dt><dd>{} address(es)</dd><dt>Memory free</dt><dd>{}</dd></dl>",
+        if hub.firewall_loaded { "on" } else { "NOT LOADED" },
+        esc(&hub.timer),
+        esc(hub.claude_version.as_deref().unwrap_or("missing")),
+        if hub.admin_from.is_empty() {
+            "anywhere".to_string()
+        } else {
+            esc(&hub.admin_from.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "))
+        },
+        hub.denied_inbound.len(),
+        hub.memory_available_mb.map(|m| format!("{m} MB")).unwrap_or_else(|| "-".into()),
+    );
+    if bad.is_empty() {
+        format!(
+            "<details class=\"health ok\"><summary><span class=\"dot ok\"></span>All hub checks pass</summary>{facts}</details>"
+        )
+    } else {
+        format!(
+            "<details class=\"health bad\" open><summary><span class=\"dot bad\"></span>{} hub check(s) need you</summary>\
+             <ul>{}</ul>{facts}</details>",
+            bad.len(),
+            bad.iter().map(|b| format!("<li>{b}</li>")).collect::<String>()
+        )
+    }
+}
+
 fn map_page(c: &Ctx, flash: &Flash) -> Reply {
     let o = match overview_or_error(c, "Map", flash) {
         Ok(o) => o,
         Err(r) => return r,
     };
-    let hub = &o.hub;
-    let mut b = String::new();
-    b.push_str("<section class=\"strip\">");
-    b.push_str(&chip(
-        hub.firewall_loaded,
-        "firewall",
-        if hub.firewall_loaded {
-            "on"
-        } else {
-            "NOT LOADED"
-        },
-    ));
-    b.push_str(&chip(hub.timer == "active", "block timer", &hub.timer));
-    b.push_str(&chip(
-        hub.claude_version.is_some(),
-        "claude",
-        hub.claude_version.as_deref().unwrap_or("missing"),
-    ));
-    b.push_str(&chip(
-        !hub.admin_from.is_empty(),
-        "admin from",
-        &if hub.admin_from.is_empty() {
-            "anywhere".to_string()
-        } else {
-            hub.admin_from
-                .iter()
-                .map(|a| a.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        },
-    ));
-    b.push_str(&chip(
-        true,
-        "refused inbound",
-        &format!("{} address(es)", hub.denied_inbound.len()),
-    ));
-    if let Some(m) = hub.memory_available_mb {
-        b.push_str(&chip(m > 300, "memory free", &format!("{m} MB")));
-    }
-    b.push_str("</section>");
+    let mut b = health(&o);
 
     let attention: Vec<String> = o
         .spaces
@@ -578,54 +683,65 @@ fn map_page(c: &Ctx, flash: &Flash) -> Reply {
         ));
     }
     b.push_str(&format!(
-        "<section class=\"card\"><div class=\"map-wrap\" id=\"map\" data-refresh=\"/map.svg\">{}</div>\
+        "<section class=\"card graph-card\"><div class=\"graph-tools\" hidden>\
+         <button type=\"button\" data-map=\"in\" title=\"Zoom in\">+</button>\
+         <button type=\"button\" data-map=\"out\" title=\"Zoom out\">−</button>\
+         <button type=\"button\" data-map=\"fit\">Fit</button>\
+         <button type=\"button\" data-map=\"reset\" title=\"Put every box back where it started\">Reset layout</button>\
+         <span class=\"hint\">Drag boxes to arrange them; drag the background to pan.</span></div>\
+         <div class=\"graph-wrap\" id=\"map\" data-refresh=\"/map.svg\">{}</div>\
          <p class=\"legend\"><span class=\"dot ok\"></span>running <span class=\"dot warn\"></span>needs \
          login <span class=\"dot idle\"></span>stopped <span class=\"dot bad\"></span>failed \
-         <span class=\"swatch bridge\"></span>bridge <span class=\"swatch cut\"></span>blocked</p></section>",
+         <span class=\"swatch bridge\"></span>bridge <span class=\"swatch cut\"></span>blocked \
+         <span>Wires show who may connect to whom; machines never connect back to the hub.</span></p></section>",
         map::svg(&o)
     ));
     Reply::Html(200, page(c, "Map", &b, flash))
 }
 
-fn chip(good: bool, label: &str, value: &str) -> String {
-    format!(
-        "<span class=\"chip {}\"><span class=\"k\">{}</span> {}</span>",
-        if good { "good" } else { "bad" },
-        esc(label),
-        esc(value)
-    )
+fn reach_badge(s: &SpaceView) -> &'static str {
+    if s.agent != crate::config::CLAUDE {
+        "<span class=\"badge\">terminal</span>"
+    } else if s.remote_control {
+        "<span class=\"badge\">Remote Control</span>"
+    } else {
+        "<span class=\"badge local\">local only</span>"
+    }
 }
 
-fn space_row(c: &Ctx, s: &SpaceView) -> String {
+fn space_controls(c: &Ctx, s: &SpaceView) -> String {
     let n = url_encode(&s.name);
-    let actions = if s.state == "needs login" {
-        format!("<a class=\"btn\" href=\"/space/{n}#login\">Sign in</a>")
+    if s.state == "needs login" {
+        return format!("<a class=\"btn primary\" href=\"/space/{n}#login\">Sign in</a>");
+    }
+    if s.state == "running" {
+        format!(
+            "{}{}",
+            button(c, &format!("/space/{n}/restart"), "Restart", "", ""),
+            button(c, &format!("/space/{n}/stop"), "Stop", "", "")
+        )
     } else {
-        let mut a = String::new();
-        if s.state != "running" {
-            a.push_str(&button(c, &format!("/space/{n}/start"), "Start", "", ""));
-        } else {
-            a.push_str(&button(
-                c,
-                &format!("/space/{n}/restart"),
-                "Restart",
-                "",
-                "",
-            ));
-            a.push_str(&button(c, &format!("/space/{n}/stop"), "Stop", "", ""));
-        }
-        a
-    };
+        button(c, &format!("/space/{n}/start"), "Start", "primary", "")
+    }
+}
+
+fn space_card(c: &Ctx, s: &SpaceView) -> String {
+    let chats = s
+        .chats_24h
+        .map(|n| format!(" · {n} chat(s) today"))
+        .unwrap_or_default();
     format!(
-        "<tr><td><span class=\"dot {}\"></span><a href=\"/space/{n}\">{}</a></td><td>{}</td><td>{}</td>\
-         <td>{}</td><td>{}</td><td>{}</td><td class=\"actions\">{actions}</td></tr>",
+        "<article class=\"item\"><div class=\"item-head\"><span class=\"dot {}\"></span>\
+         <a class=\"item-name\" href=\"/space/{}\">{}</a>{}</div>\
+         <p class=\"item-meta\">on {} · {} · {}{chats}</p><div class=\"buttons\">{}</div></article>",
         map::state_class(&s.state),
+        url_encode(&s.name),
         esc(&s.name),
+        reach_badge(s),
         esc(&s.host),
         esc(&crate::space_cmd::agent_label(&s.agent, s.mode)),
         esc(&s.state),
-        esc(&s.rc_name),
-        s.chats_24h.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+        space_controls(c, s)
     )
 }
 
@@ -634,15 +750,18 @@ fn spaces_page(c: &Ctx, flash: &Flash) -> Reply {
         Ok(o) => o,
         Err(r) => return r,
     };
-    let mut b = String::from("<h1>Spaces</h1><p class=\"hint\">A space is one machine worked on by one AI agent: its own user, keys, firewall rules and chats.</p>");
+    let mut b = String::from(
+        "<h1>Spaces</h1><p class=\"hint\">A space is one machine worked on by one AI agent: its own user, keys, \
+         firewall rules and chats.</p>",
+    );
     if o.spaces.is_empty() {
         b.push_str("<p>No spaces yet.</p>");
     } else {
-        b.push_str("<div class=\"table-wrap\"><table><thead><tr><th>Space</th><th>Machine</th><th>Agent</th><th>State</th><th>Remote Control</th><th>Chats today</th><th></th></tr></thead><tbody>");
+        b.push_str("<div class=\"items\">");
         for s in &o.spaces {
-            b.push_str(&space_row(c, s));
+            b.push_str(&space_card(c, s));
         }
-        b.push_str("</tbody></table></div>");
+        b.push_str("</div>");
     }
     if o.hosts.is_empty() {
         b.push_str("<p>Add a machine first, under <a href=\"/hosts\">Machines</a>.</p>");
@@ -658,14 +777,15 @@ fn spaces_page(c: &Ctx, flash: &Flash) -> Reply {
             .map(|a| format!("<option>{}</option>", esc(a)))
             .collect();
         b.push_str(&format!(
-            "<section class=\"card\"><h2>New space</h2><form method=\"post\" action=\"/spaces\" class=\"grid\">{}\
-             <label>Machine <select name=\"host\">{hosts}</select></label>\
-             <label>Agent <select name=\"agent\">{agents}</select></label>\
+            "<section class=\"card\"><h2>New space</h2><form method=\"post\" action=\"/spaces\" class=\"stack\">{}\
+             <div class=\"fields\"><label>Machine <select name=\"host\">{hosts}</select></label>\
+             <label>Agent <select name=\"agent\">{agents}</select></label></div>\
+             <details class=\"more\"><summary>More options</summary><div class=\"stack\">\
              <label>Name <input name=\"name\" placeholder=\"machine-agent\"></label>\
-             <label>Remote Control name <input name=\"rc_name\" placeholder=\"same as name\"></label>\
-             <label>Extra arguments <input name=\"args\" placeholder=\"--permission-mode acceptEdits\"></label>\
-             <label class=\"check\"><input type=\"checkbox\" name=\"single\"> One conversation (also typed into on the terminal)</label>\
-             <button class=\"primary\">Create</button></form></section>",
+             <label>Extra arguments for the agent <input name=\"args\" placeholder=\"--permission-mode acceptEdits\"></label>\
+             <label class=\"check\"><input type=\"checkbox\" name=\"single\"> Claude: one conversation, also typed into on the terminal</label>\
+             <label class=\"check\"><input type=\"checkbox\" name=\"local\"> Claude: no Remote Control (only from this hub)</label>\
+             </div></details><div><button class=\"primary\">Create space</button></div></form></section>",
             csrf(c)
         ));
     }
@@ -681,55 +801,40 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
         return Reply::Html(404, page(c, name, "<h1>No such space</h1>", flash));
     };
     let n = url_encode(&s.name);
+    let claude = s.agent == crate::config::CLAUDE;
     let mut b = format!(
-        "<h1><span class=\"dot {}\"></span>{}</h1><dl class=\"facts\"><dt>Machine</dt><dd><a href=\"/host/{}\">{}</a></dd>\
-         <dt>Agent</dt><dd>{}</dd><dt>State</dt><dd>{}</dd><dt>Remote Control name</dt><dd>{}</dd>\
-         <dt>Can reach now</dt><dd>{}</dd><dt>Memory</dt><dd>{}</dd></dl>",
+        "<div class=\"page-head\"><h1><span class=\"dot {}\"></span>{}</h1><div class=\"buttons\">{}</div></div>\
+         <p class=\"item-meta\">on <a href=\"/host/{}\">{}</a> · {} · {}{} {}</p>",
         map::state_class(&s.state),
         esc(&s.name),
+        space_controls(c, s),
         url_encode(&s.host),
         esc(&s.host),
         esc(&crate::space_cmd::agent_label(&s.agent, s.mode)),
         esc(&s.state),
-        esc(&s.rc_name),
-        if s.reachable.is_empty() {
-            "nothing (machine blocked?)".into()
-        } else {
-            esc(&s.reachable.join(", "))
-        },
-        s.memory_mb.map(|m| format!("{m} MB")).unwrap_or_else(|| "-".into()),
+        s.memory_mb.map(|m| format!(" · {m} MB")).unwrap_or_default(),
+        reach_badge(s),
     );
+    if s.reachable.is_empty() {
+        b.push_str("<p class=\"t-bad\">It can reach no machine right now (blocked?).</p>");
+    } else if s.reachable.len() > 1 {
+        b.push_str(&format!(
+            "<p class=\"hint\">Can reach now: {}</p>",
+            esc(&s.reachable.join(", "))
+        ));
+    }
 
-    b.push_str("<section class=\"row\">");
     if s.state == "needs login" {
         b.push_str(&format!(
-            "<section class=\"card\" id=\"login\"><h2>Sign in to Claude</h2><p>Each space signs in once. \
+            "<section class=\"card attention\" id=\"login\"><h2>Sign in to Claude</h2><p>Each space signs in once. \
              Start, open the link on any device, then paste the code it shows.</p>{}</section>",
             button(c, &format!("/space/{n}/login"), "Start sign-in", "primary", "")
         ));
-    } else {
-        b.push_str("<section class=\"card\"><h2>Control</h2><div class=\"buttons\">");
-        b.push_str(&button(c, &format!("/space/{n}/start"), "Start", "", ""));
-        b.push_str(&button(
-            c,
-            &format!("/space/{n}/restart"),
-            "Restart",
-            "",
-            "",
-        ));
-        b.push_str(&button(c, &format!("/space/{n}/stop"), "Stop", "", ""));
-        if s.agent == "claude" {
-            b.push_str(&button(
-                c,
-                &format!("/space/{n}/login"),
-                "Sign in again",
-                "",
-                "",
-            ));
-        }
-        b.push_str("</div></section>");
     }
-    b.push_str("</section>");
+
+    if claude {
+        b.push_str(&chats_card(c, s));
+    }
 
     // Terminal.
     let keys: String = SPECIAL_KEYS
@@ -741,14 +846,23 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
             )
         })
         .collect();
+    let where_chats = if !claude {
+        "The agent runs here.".to_string()
+    } else if s.remote_control {
+        format!(
+            "Chats themselves are in the Claude app or claude.ai/code under <b>{}</b>.",
+            esc(&s.rc_name)
+        )
+    } else {
+        "Remote Control is off: this is the only way in, besides <code>sudo thorn attach</code> on the hub.".to_string()
+    };
     b.push_str(&format!(
         "<section class=\"card\"><h2>Terminal</h2><p class=\"hint\">What the space's terminal shows, refreshed every \
-         few seconds. Chats themselves are in the Claude app or claude.ai/code under <b>{}</b>.</p>\
+         few seconds. {where_chats}</p>\
          <pre class=\"screen\" id=\"screen\" data-src=\"/space/{n}/screen\">…</pre>\
          <form method=\"post\" action=\"/space/{n}/send\" class=\"send typing\">{}<input name=\"text\" \
          placeholder=\"type a line, Enter sends it\" autocomplete=\"off\"><button>Send</button></form>\
          <div class=\"buttons keys\">{keys}</div></section>",
-        esc(&s.rc_name),
         csrf(c)
     ));
 
@@ -806,11 +920,41 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
     }
     b.push_str("</section>");
 
-    // Rename, delete.
+    // Settings of the space.
+    b.push_str("<section class=\"row\">");
+    if claude {
+        let (text, label, on, class) = if s.remote_control {
+            (
+                format!(
+                    "On: its chats are in the Claude app and on claude.ai/code under <b>{}</b>. Turned off, \
+                     it becomes one conversation reached only from this hub.",
+                    esc(&s.rc_name)
+                ),
+                "Turn Remote Control off",
+                "off",
+                "",
+            )
+        } else {
+            (
+                "Off: one conversation, reached only from this hub (the terminal above, or \
+                 <code>sudo thorn attach</code>). It does not show in the Claude app."
+                    .to_string(),
+                "Turn Remote Control on",
+                "on",
+                "primary",
+            )
+        };
+        b.push_str(&format!(
+            "<section class=\"card\"><h2>Remote Control</h2><p>{text}</p>\
+             <form method=\"post\" action=\"/space/{n}/remote\" class=\"inline\" data-confirm=\"{}? The space restarts.\">{}\
+             <input type=\"hidden\" name=\"on\" value=\"{on}\"><button class=\"{class}\">{label}</button></form></section>",
+            esc(label),
+            csrf(c)
+        ));
+    }
     b.push_str(&format!(
-        "<section class=\"row\"><section class=\"card\"><h2>Rename</h2><form method=\"post\" action=\"/space/{n}/rename\" class=\"stack\">{}\
-         <label>New name <input name=\"new\" required></label><label>Remote Control name \
-         <input name=\"rc_name\" placeholder=\"follows the name\"></label><button>Rename</button></form></section>\
+        "<section class=\"card\"><h2>Rename</h2><form method=\"post\" action=\"/space/{n}/rename\" class=\"stack\">{}\
+         <label>New name <input name=\"new\" required></label><button>Rename</button></form></section>\
          <section class=\"card danger\"><h2>Delete</h2><p>Stops the space and removes its user. Its files and \
          conversations are archived on the hub unless you purge them.</p><form method=\"post\" action=\"/space/{n}/rm\" \
          class=\"stack\" data-confirm=\"Delete space {}?\">{}<label class=\"check\"><input type=\"checkbox\" name=\"purge\"> \
@@ -821,6 +965,62 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
         code_field()
     ));
     Reply::Html(200, page(c, &s.name, &b, flash))
+}
+
+fn chats_card(c: &Ctx, s: &SpaceView) -> String {
+    let n = url_encode(&s.name);
+    let chats = match get::<Vec<Chat>>(
+        c,
+        Op::ChatList {
+            name: s.name.clone(),
+        },
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return format!(
+                "<section class=\"card\"><h2>Chats</h2><p class=\"t-bad\">{}</p></section>",
+                esc(&e)
+            )
+        }
+    };
+    let now = crate::state::now();
+    let mut rows = String::new();
+    for ch in &chats {
+        let id = esc(&ch.id);
+        let delete = if ch.main {
+            "<span class=\"badge\">the space's conversation</span>".to_string()
+        } else {
+            format!(
+                "<form method=\"post\" action=\"/space/{n}/chat-rm\" class=\"inline\" data-confirm=\"Delete the chat {}?\">{}\
+                 <input type=\"hidden\" name=\"id\" value=\"{id}\"><button class=\"link danger-text\">Delete</button></form>",
+                esc(&ch.title),
+                csrf(c)
+            )
+        };
+        rows.push_str(&format!(
+            "<li class=\"chat\"><div class=\"chat-main\"><span class=\"chat-title\">{}</span>\
+             <span class=\"item-meta\">{} · {} KB · <code>{}</code></span></div>\
+             <div class=\"chat-actions\"><details class=\"rename\"><summary>Rename</summary>\
+             <form method=\"post\" action=\"/space/{n}/chat-rename\" class=\"typing\">{}<input type=\"hidden\" name=\"id\" value=\"{id}\">\
+             <input name=\"title\" value=\"{}\" maxlength=\"100\" required><button>Save</button></form></details>{delete}</div></li>",
+            esc(&ch.title),
+            ago(now.saturating_sub(ch.modified)),
+            ch.kb,
+            esc(&ch.id[..8.min(ch.id.len())]),
+            csrf(c),
+            esc(&ch.title),
+        ));
+    }
+    format!(
+        "<section class=\"card\" id=\"chats\"><h2>Chats</h2><p class=\"hint\">The conversations kept on this hub, \
+         newest first. A new name also shows in Claude Code (and in the Claude app once Claude Code picks it up); \
+         deleting removes the hub's copy.</p>{}</section>",
+        if rows.is_empty() {
+            "<p>No chats yet.</p>".to_string()
+        } else {
+            format!("<ul class=\"chats\">{rows}</ul>")
+        }
+    )
 }
 
 fn duration_select(options: &[&str], default: &str, forever: bool) -> String {
@@ -913,7 +1113,7 @@ fn space_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>)
                 Op::SpaceRename {
                     old: name.into(),
                     new: new.clone(),
-                    rc_name: opt(form, "rc_name"),
+                    rc_name: None,
                 },
             ) {
                 Ok(restarted) => back(
@@ -942,6 +1142,49 @@ fn space_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>)
                 Err(e) => back(&here, Err(e)),
             }
         }
+        "remote" => {
+            let on = f(form, "on") == "on";
+            back(
+                &here,
+                get::<bool>(
+                    c,
+                    Op::SpaceRemote {
+                        name: name.into(),
+                        on,
+                    },
+                )
+                .map(|restarted| {
+                    format!(
+                        "Remote Control {}{}",
+                        if on { "on" } else { "off" },
+                        if restarted { "; the space restarted" } else { "" }
+                    )
+                }),
+            )
+        }
+        "chat-rename" => back(
+            &format!("{here}#chats"),
+            get::<String>(
+                c,
+                Op::ChatRename {
+                    name: name.into(),
+                    id: f(form, "id").into(),
+                    title: f(form, "title").into(),
+                },
+            )
+            .map(|_| "chat renamed".into()),
+        ),
+        "chat-rm" => back(
+            &format!("{here}#chats"),
+            get::<String>(
+                c,
+                Op::ChatRm {
+                    name: name.into(),
+                    id: f(form, "id").into(),
+                },
+            )
+            .map(|_| "chat deleted".into()),
+        ),
         _ => back(&here, Err("unknown action".into())),
     }
 }
@@ -955,35 +1198,80 @@ fn hosts_page(c: &Ctx, flash: &Flash) -> Reply {
     if o.hosts.is_empty() {
         b.push_str("<p>No machines yet.</p>");
     } else {
-        b.push_str("<div class=\"table-wrap\"><table><thead><tr><th>Machine</th><th>Address</th><th>User</th><th>OS</th><th>Spaces</th><th>Status</th></tr></thead><tbody>");
+        b.push_str("<div class=\"items\">");
         for h in &o.hosts {
-            b.push_str(&host_row(h));
+            b.push_str(&host_card(h));
         }
-        b.push_str("</tbody></table></div>");
+        b.push_str("</div>");
     }
     b.push_str(&format!(
-        "<section class=\"card\"><h2>Add a machine</h2><p class=\"hint\">By IP address (its tailnet address works \
-         well), Linux or macOS with an SSH server. You confirm its host key fingerprints next.</p>\
-         <form method=\"post\" action=\"/hosts/scan\" class=\"grid\">{}<label>Name <input name=\"name\" required \
+        "<section class=\"card\"><h2>Add a machine</h2><p class=\"hint\">Linux or macOS with an SSH server, by IP \
+         address (its tailnet address works well). Next you check that blackthorn reached the right machine.</p>\
+         <form method=\"post\" action=\"/hosts/scan\" class=\"stack\">{}<div class=\"fields\"><label>Name <input name=\"name\" required \
          placeholder=\"fig\"></label><label>Login <input name=\"target\" required placeholder=\"user@100.80.0.3\"></label>\
-         <label>Port <input name=\"port\" value=\"22\" inputmode=\"numeric\"></label><button class=\"primary\">Read host keys</button></form></section>",
+         <label class=\"narrow\">Port <input name=\"port\" value=\"22\" inputmode=\"numeric\"></label></div>\
+         <div><button class=\"primary\">Next: check it is the right machine</button></div></form></section>",
         csrf(c)
     ));
     Reply::Html(200, page(c, "Machines", &b, flash))
 }
 
-fn host_row(h: &HostView) -> String {
+fn host_card(h: &HostView) -> String {
     format!(
-        "<tr><td><a href=\"/host/{}\">{}</a></td><td>{}{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"{}\">{}</td></tr>",
+        "<article class=\"item\"><div class=\"item-head\"><span class=\"dot {}\"></span>\
+         <a class=\"item-name\" href=\"/host/{}\">{}</a></div>\
+         <p class=\"item-meta\">{}@{}{} · {}</p><p class=\"item-meta\">spaces: {}</p><p class=\"{}\">{}</p></article>",
+        if h.blocked { "bad" } else { "ok" },
         url_encode(&h.name),
         esc(&h.name),
+        esc(&h.user),
         h.address,
         if h.port == 22 { String::new() } else { format!(":{}", h.port) },
-        esc(&h.user),
         h.os,
-        if h.spaces.is_empty() { "-".into() } else { esc(&h.spaces.join(", ")) },
-        if h.blocked { "t-bad" } else { "" },
+        if h.spaces.is_empty() { "none".into() } else { esc(&h.spaces.join(", ")) },
+        if h.blocked { "t-bad" } else { "item-meta" },
         esc(&h.status)
+    )
+}
+
+const FINGERPRINT_CMD: &str =
+    "for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf \"$f\"; done";
+
+/// "Is this really <name>?": the host key fingerprints, how to compare them,
+/// and the form that accepts them.
+fn keys_confirm(
+    c: &Ctx,
+    name: &str,
+    scan: &Scan,
+    action: &str,
+    hidden: &str,
+    accept: &str,
+    cancel: &str,
+) -> String {
+    let fps: String = scan
+        .fingerprints
+        .iter()
+        .map(|f| format!("<li><code>{}</code></li>", esc(f)))
+        .collect();
+    format!(
+        "<section class=\"card narrow\"><h1>Is this really {name}?</h1>\
+         <p>blackthorn reached <code>{addr}</code>. Every SSH server has its own <b>host keys</b>, like an ID card, \
+         and these are the fingerprints of the ones it showed:</p><ul class=\"fingerprints\">{fps}</ul>\
+         <p>If something else answered at that address (a typo, another machine, someone in between), they would \
+         differ. Once you accept them, blackthorn refuses to talk to {name} if they ever change.</p>\
+         <ol class=\"steps\"><li>On {name} itself, run this and compare its lines with the ones above:{cmd}</li>\
+         <li><form method=\"post\" action=\"{action}\" class=\"stack\">{csrf}{hidden}\
+         <input type=\"hidden\" name=\"keys\" value=\"{keys}\">{code}<button class=\"primary\">They match: {accept}</button></form></li></ol>\
+         <p><a href=\"{cancel}\">They do not match: stop here</a></p></section>",
+        name = esc(name),
+        addr = esc(&format!("{}:{}", scan.address, scan.port)),
+        cmd = copyable("fpcmd", FINGERPRINT_CMD),
+        action = esc(action),
+        csrf = csrf(c),
+        keys = esc(&serde_json::to_string(&scan.host_keys).unwrap_or_default()),
+        code = code_field(),
+        accept = esc(accept),
+        cancel = esc(cancel),
     )
 }
 
@@ -999,29 +1287,22 @@ fn host_scan(c: &Ctx, form: &HashMap<String, String>) -> Reply {
         },
     ) {
         Ok(scan) => {
-            let fps: String = scan
-                .fingerprints
-                .iter()
-                .map(|f| format!("<li><code>{}</code></li>", esc(f)))
-                .collect();
-            let b = format!(
-                "<section class=\"card narrow\"><h1>Confirm {}</h1><p>{} presents these host keys:</p><ul>{fps}</ul>\
-                 <p>Compare them with the output of this, run on the machine itself:</p>\
-                 <pre>for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf \"$f\"; done</pre>\
-                 <form method=\"post\" action=\"/hosts\" class=\"stack\">{}\
-                 <input type=\"hidden\" name=\"name\" value=\"{}\"><input type=\"hidden\" name=\"target\" value=\"{}\">\
-                 <input type=\"hidden\" name=\"port\" value=\"{port}\"><input type=\"hidden\" name=\"keys\" value=\"{}\">\
-                 {}<button class=\"primary\">They match: add {}</button></form><p><a href=\"/hosts\">They do not match</a></p></section>",
+            let hidden = format!(
+                "<input type=\"hidden\" name=\"name\" value=\"{}\"><input type=\"hidden\" name=\"target\" value=\"{}\">\
+                 <input type=\"hidden\" name=\"port\" value=\"{port}\">",
                 esc(&name),
-                esc(&format!("{}:{}", scan.address, scan.port)),
-                csrf(c),
-                esc(&name),
-                esc(&target),
-                esc(&serde_json::to_string(&scan.host_keys).unwrap_or_default()),
-                code_field(),
-                esc(&name)
+                esc(&target)
             );
-            Reply::Html(200, page(c, "Confirm host keys", &b, &Flash::default()))
+            let b = keys_confirm(
+                c,
+                &name,
+                &scan,
+                "/hosts",
+                &hidden,
+                &format!("add {name}"),
+                "/hosts",
+            );
+            Reply::Html(200, page(c, "Check the machine", &b, &Flash::default()))
         }
         Err(e) => back("/hosts", Err(e)),
     }
@@ -1047,31 +1328,41 @@ fn host_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
             .join(", ")
     };
     let mut b = format!(
-        "<h1>{}</h1><dl class=\"facts\"><dt>Login</dt><dd>{}@{} port {}</dd><dt>OS</dt><dd>{}</dd>\
-         <dt>Spaces</dt><dd>{spaces}</dd><dt>Status</dt><dd class=\"{}\">{}</dd></dl>",
+        "<div class=\"page-head\"><h1><span class=\"dot {}\"></span>{}</h1></div>\
+         <p class=\"item-meta\">{}@{} port {} · {} · spaces: {spaces}</p><p class=\"{}\">{}</p>",
+        if h.blocked { "bad" } else { "ok" },
         esc(&h.name),
         esc(&h.user),
         h.address,
         h.port,
         h.os,
-        if h.blocked { "t-bad" } else { "" },
+        if h.blocked { "t-bad" } else { "hint" },
         esc(&h.status)
     );
+    let install = format!(
+        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '{}' >> ~/.ssh/authorized_keys",
+        line.replace('\'', "")
+    );
     b.push_str(&format!(
-        "<section class=\"card\"><h2>Key</h2><p>Put this line in <code>~{}/.ssh/authorized_keys</code> on {}:</p>\
-         <pre class=\"wrap\">{}</pre><div class=\"buttons\">{}{}</div></section>",
-        esc(&h.user),
+        "<section class=\"card\"><h2>Key</h2><p>blackthorn logs in to {} with its own key. Put this line in \
+         <code>~{}/.ssh/authorized_keys</code> there:</p>{}\
+         <p class=\"hint\">Or run this on {} as {}:</p>{}<div class=\"buttons\">{}{}</div></section>",
         esc(&h.name),
-        esc(&line),
+        esc(&h.user),
+        copyable("keyline", &line),
+        esc(&h.name),
+        esc(&h.user),
+        copyable("keycmd", &install),
         button(c, &format!("/host/{n}/check"), "Check login", "primary", ""),
-        button(c, &format!("/host/{n}/rescan"), "Re-read host keys", "", "")
+        button(c, &format!("/host/{n}/rescan"), "Check its host keys again", "", "")
     ));
+    b.push_str("<section class=\"row\">");
     b.push_str(&format!(
         "<section class=\"card\"><h2>Address</h2><p>Moved {} to another network, such as its tailnet \
-         address? Its spaces stay.</p><form method=\"post\" action=\"/host/{n}/move-scan\" class=\"grid\">{}\
-         <label>Login <input name=\"target\" value=\"{}\" required></label>\
-         <label>Port <input name=\"port\" value=\"{}\" inputmode=\"numeric\"></label>\
-         <button>Read its host keys</button></form></section>",
+         address? Its spaces stay.</p><form method=\"post\" action=\"/host/{n}/move-scan\" class=\"stack\">{}\
+         <div class=\"fields\"><label>Login <input name=\"target\" value=\"{}\" required></label>\
+         <label class=\"narrow\">Port <input name=\"port\" value=\"{}\" inputmode=\"numeric\"></label></div>\
+         <div><button>Next: check it is the right machine</button></div></form></section>",
         esc(&h.name),
         csrf(c),
         esc(&format!("{}@{}", h.user, h.address)),
@@ -1079,7 +1370,7 @@ fn host_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
     ));
     if h.blocked {
         b.push_str(&format!(
-            "<section class=\"card\"><h2>Blocked</h2><p>No space can reach {} until you unblock it{}.</p>{}</section>",
+            "<section class=\"card attention\"><h2>Blocked</h2><p>No space can reach {} until you unblock it{}.</p>{}</section>",
             esc(&h.name),
             if h.status.contains(" for ") { " or the time runs out" } else { "" },
             button(c, &format!("/host/{n}/unblock"), "Unblock now", "primary", "")
@@ -1087,8 +1378,8 @@ fn host_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
     } else {
         b.push_str(&format!(
             "<section class=\"card\"><h2>Block</h2><p>Cut every space off from {} now, including open \
-             connections.</p><form method=\"post\" action=\"/host/{n}/block\" class=\"grid\">{}{}<label>Reason \
-             <input name=\"reason\" placeholder=\"optional\"></label><button class=\"danger\">Block</button></form></section>",
+             connections.</p><form method=\"post\" action=\"/host/{n}/block\" class=\"stack\">{}<div class=\"fields\">{}<label>Reason \
+             <input name=\"reason\" placeholder=\"optional\"></label></div><div><button class=\"danger\">Block</button></div></form></section>",
             esc(&h.name),
             csrf(c),
             duration_select(&["15m", "1h", "4h", "1d"], "1h", true).replace("value=\"forever\"", "value=\"\"")
@@ -1097,7 +1388,7 @@ fn host_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
     b.push_str(&format!(
         "<section class=\"card danger\"><h2>Remove</h2><p>Forget {} and delete its key. Delete its spaces first.</p>\
          <form method=\"post\" action=\"/host/{n}/rm\" class=\"stack\" data-confirm=\"Remove machine {}?\">{}{}\
-         <button class=\"danger\">Remove machine</button></form></section>",
+         <button class=\"danger\">Remove machine</button></form></section></section>",
         esc(&h.name),
         esc(&h.name),
         csrf(c),
@@ -1137,20 +1428,19 @@ fn host_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>) 
         "rescan" => match get::<(Scan, bool)>(c, Op::HostRescan { name: name.into() }) {
             Ok((_, false)) => back(&here, Ok("host keys unchanged".into())),
             Ok((scan, true)) => {
-                let fps: String = scan
-                    .fingerprints
-                    .iter()
-                    .map(|f| format!("<li><code>{}</code></li>", esc(f)))
-                    .collect();
                 let b = format!(
-                    "<section class=\"card narrow danger\"><h1>{}'s host keys changed</h1><p>If you did not reinstall it \
-                     or regenerate its keys, stop here.</p><ul>{fps}</ul><form method=\"post\" action=\"{here}/rescan-confirm\" \
-                     class=\"stack\">{}<input type=\"hidden\" name=\"keys\" value=\"{}\">{}<button class=\"danger\">Save new keys</button>\
-                     </form><p><a href=\"{here}\">Cancel</a></p></section>",
+                    "<p class=\"flash err\">{}'s host keys changed. If you did not reinstall it or regenerate \
+                     its keys, stop here.</p>{}",
                     esc(name),
-                    csrf(c),
-                    esc(&serde_json::to_string(&scan.host_keys).unwrap_or_default()),
-                    code_field()
+                    keys_confirm(
+                        c,
+                        name,
+                        &scan,
+                        &format!("{here}/rescan-confirm"),
+                        "",
+                        "save the new keys",
+                        &here
+                    )
                 );
                 Reply::Html(200, page(c, "Host keys changed", &b, &Flash::default()))
             }
@@ -1180,28 +1470,21 @@ fn host_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>) 
                 },
             ) {
                 Ok(scan) => {
-                    let fps: String = scan
-                        .fingerprints
-                        .iter()
-                        .map(|f| format!("<li><code>{}</code></li>", esc(f)))
-                        .collect();
-                    let b = format!(
-                        "<section class=\"card narrow\"><h1>Move {}</h1><p>{} presents these host keys:</p><ul>{fps}</ul>\
-                         <p>Compare them with the output of this, run on the machine itself:</p>\
-                         <pre>for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf \"$f\"; done</pre>\
-                         <form method=\"post\" action=\"{here}/move\" class=\"stack\">{}\
-                         <input type=\"hidden\" name=\"target\" value=\"{}\">\
-                         <input type=\"hidden\" name=\"port\" value=\"{port}\"><input type=\"hidden\" name=\"keys\" value=\"{}\">\
-                         {}<button class=\"primary\">They match: move {}</button></form><p><a href=\"{here}\">Cancel</a></p></section>",
-                        esc(name),
-                        esc(&format!("{}:{}", scan.address, scan.port)),
-                        csrf(c),
-                        esc(&target),
-                        esc(&serde_json::to_string(&scan.host_keys).unwrap_or_default()),
-                        code_field(),
-                        esc(name)
+                    let hidden = format!(
+                        "<input type=\"hidden\" name=\"target\" value=\"{}\">\
+                         <input type=\"hidden\" name=\"port\" value=\"{port}\">",
+                        esc(&target)
                     );
-                    Reply::Html(200, page(c, "Confirm host keys", &b, &Flash::default()))
+                    let b = keys_confirm(
+                        c,
+                        name,
+                        &scan,
+                        &format!("{here}/move"),
+                        &hidden,
+                        &format!("move {name}"),
+                        &here,
+                    );
+                    Reply::Html(200, page(c, "Check the machine", &b, &Flash::default()))
                 }
                 Err(e) => back(&here, Err(e)),
             }
@@ -1242,6 +1525,56 @@ fn host_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>) 
     }
 }
 
+/// Which settings are lists of addresses, and of what kind.
+fn list_kind(key: &str) -> Option<&'static str> {
+    match key {
+        "inbound.admin_from" | "never_manage" | "inbound.deny_from" | "ssh_from" => Some("ip"),
+        "web.listen" => Some("socket"),
+        _ => None,
+    }
+}
+
+fn update_card(c: &Ctx) -> String {
+    let u = match get::<ops::UpdateInfo>(c, Op::UpdateCheck { refresh: false }) {
+        Ok(u) => u,
+        Err(e) => ops::UpdateInfo {
+            current: VERSION.into(),
+            error: Some(e),
+            ..Default::default()
+        },
+    };
+    let check_again = button(c, "/update/check", "Check again", "link", "");
+    let body = if u.running {
+        "<p>An update is running right now; this page comes back in a minute.</p>".to_string()
+    } else if let Some(e) = &u.error {
+        format!(
+            "<p>This hub runs <b>v{}</b>. Could not check for a newer release: {} {check_again}</p>",
+            esc(&u.current),
+            esc(e)
+        )
+    } else if u.newer {
+        format!(
+            "<p>This hub runs <b>v{}</b>; <b>{}</b> is out. <a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">What is new</a></p>\
+             <p class=\"hint\">Updating downloads the release's installer from GitHub, checks the new <code>thorn</code> \
+             against the release's checksums, and restarts the web UI. Settings, accounts and spaces stay; running \
+             chats are not interrupted.</p>\
+             <form method=\"post\" action=\"/update\" class=\"stack\">{}{}<div><button class=\"primary\">Update to {}</button></div></form>",
+            esc(&u.current),
+            esc(u.latest.as_deref().unwrap_or("")),
+            esc(u.url.as_deref().unwrap_or(ops::RELEASES)),
+            csrf(c),
+            code_field(),
+            esc(u.latest.as_deref().unwrap_or("")),
+        )
+    } else {
+        format!(
+            "<p>This hub runs <b>v{}</b>, the latest release. {check_again}</p>",
+            esc(&u.current)
+        )
+    };
+    format!("<section class=\"card\" id=\"update\"><h2>blackthorn version</h2>{body}</section>")
+}
+
 fn settings_page(c: &Ctx, flash: &Flash) -> Reply {
     let settings = match get::<Vec<Setting>>(c, Op::ConfigShow) {
         Ok(s) => s,
@@ -1252,26 +1585,31 @@ fn settings_page(c: &Ctx, flash: &Flash) -> Reply {
             )
         }
     };
+    let peers = get::<Vec<Peer>>(c, Op::TailnetPeers).unwrap_or_default();
     let mut fields = String::new();
     for s in &settings {
-        let input = if s.key == "egress.https_anywhere" {
-            let on = s.value == "true";
-            format!(
-                "<select name=\"{k}\"><option value=\"true\"{}>true</option><option value=\"false\"{}>false</option></select>",
-                if on { " selected" } else { "" },
-                if on { "" } else { " selected" },
-                k = esc(&s.key)
-            )
-        } else {
-            format!(
-                "<input name=\"{}\" value=\"{}\" placeholder=\"(empty)\">",
-                esc(&s.key),
+        let key = esc(&s.key);
+        let input = match list_kind(&s.key) {
+            _ if s.key == "egress.https_anywhere" => {
+                let on = s.value == "true";
+                format!(
+                    "<select name=\"{key}\" id=\"{key}\"><option value=\"true\"{}>true</option><option value=\"false\"{}>false</option></select>",
+                    if on { " selected" } else { "" },
+                    if on { "" } else { " selected" },
+                )
+            }
+            Some(kind) => format!(
+                "<div class=\"list-edit\" data-kind=\"{kind}\"><input name=\"{key}\" id=\"{key}\" value=\"{}\" \
+                 placeholder=\"(empty)\" class=\"list-raw\" autocomplete=\"off\"></div>",
                 esc(&s.value)
-            )
+            ),
+            None => format!(
+                "<input name=\"{key}\" id=\"{key}\" value=\"{}\" placeholder=\"(empty)\">",
+                esc(&s.value)
+            ),
         };
         fields.push_str(&format!(
-            "<label><code>{}</code> {input}</label><p class=\"hint\">{}</p>",
-            esc(&s.key),
+            "<div class=\"setting\"><label for=\"{key}\"><code>{key}</code></label><p class=\"hint\">{}</p>{input}</div>",
             esc(&s.help)
         ));
     }
@@ -1279,15 +1617,168 @@ fn settings_page(c: &Ctx, flash: &Flash) -> Reply {
         .client
         .map(|a| format!(" You are connected from <code>{a}</code>."))
         .unwrap_or_default();
+    // What the address picker offers: this device, then the tailnet's.
+    let picker = serde_json::json!({
+        "you": c.client.map(|a| a.to_string()),
+        "peers": peers,
+    });
+    let peers_note = if peers.is_empty() {
+        "<p class=\"hint\">This hub is not on a tailnet (or <code>tailscale</code> is not installed), so the \
+         address picker offers only the device you are on.</p>"
+            .to_string()
+    } else {
+        format!(
+            "<p class=\"hint\">The address picker lists the {} devices on this hub's tailnet, and whether they are online.</p>",
+            peers.len()
+        )
+    };
     let b = format!(
-        "<h1>Settings</h1><section class=\"card\"><p class=\"hint\">Saved to <code>/etc/blackthorn/config.toml</code> \
-         and applied at once. Lists are addresses separated by commas.{you} A change that would shut you out is \
-         refused.</p><form method=\"post\" action=\"/settings\" class=\"stack\">{}{fields}{}\
-         <button class=\"primary\">Save</button></form></section>",
+        "<h1>Settings</h1>{}<section class=\"card\"><h2>Network and access</h2><p class=\"hint\">Saved to \
+         <code>/etc/blackthorn/config.toml</code> and applied at once.{you} A change that would shut you out is \
+         refused.</p>{peers_note}<form method=\"post\" action=\"/settings\" class=\"stack settings\">{}{fields}{}\
+         <div><button class=\"primary\">Save</button></div></form></section>\
+         <dialog id=\"add-address\" data-picker=\"{}\"><form method=\"dialog\" class=\"stack\">\
+         <h2>Add an address</h2><label>Address <input name=\"address\" autocomplete=\"off\" spellcheck=\"false\"></label>\
+         <p class=\"dialog-error t-bad\" hidden></p><div class=\"suggest\"></div>\
+         <div class=\"buttons\"><button value=\"add\" class=\"primary\">Add</button><button value=\"cancel\" formnovalidate>Cancel</button></div>\
+         </form></dialog>",
+        update_card(c),
         csrf(c),
-        code_field()
+        code_field(),
+        esc(&picker.to_string()),
     );
     Reply::Html(200, page(c, "Settings", &b, flash))
+}
+
+fn updating_page(c: &Ctx, tag: &str) -> Reply {
+    let b = format!(
+        "<section class=\"card narrow\"><h1>Updating to {}</h1><p>The installer is running on the hub. The web UI \
+         restarts on the way, so this page reloads by itself in about a minute.</p>\
+         <p class=\"hint\">On the hub you can follow it with <code>journalctl -u {} -f</code>.</p></section>",
+        esc(tag),
+        ops::UPDATE_UNIT
+    );
+    Reply::Html(
+        200,
+        page_with(
+            c,
+            "Updating",
+            &b,
+            &Flash::default(),
+            "<meta http-equiv=\"refresh\" content=\"45;url=/settings#update\">",
+        ),
+    )
+}
+
+fn account_page(c: &Ctx, flash: &Flash) -> Reply {
+    let left = get::<serde_json::Value>(c, Op::Account)
+        .ok()
+        .and_then(|v| v["recovery_left"].as_u64())
+        .unwrap_or(0);
+    let b = format!(
+        "<h1>Account {}</h1><section class=\"row\">\
+         <section class=\"card\"><h2>Password</h2><form method=\"post\" action=\"/account/password\" class=\"stack\">{}\
+         <label>Current password <input name=\"current\" type=\"password\" autocomplete=\"current-password\" required></label>\
+         <label>New password (12+ characters) <input name=\"new\" type=\"password\" autocomplete=\"new-password\" minlength=\"12\" required></label>\
+         <label>New password again <input name=\"again\" type=\"password\" autocomplete=\"new-password\" minlength=\"12\" required></label>\
+         {}<div><button class=\"primary\">Change password</button></div></form></section>\
+         <section class=\"card\"><h2>Authenticator app</h2><p>Moving to a new phone, or worried the old one leaked? \
+         Set up a new authenticator: the old one stops working once the new one is confirmed, and you get new \
+         recovery codes.</p><p class=\"hint\">{left} recovery code(s) left.</p>\
+         <form method=\"post\" action=\"/account/totp-begin\" class=\"stack\">{}\
+         <label>Code from your current authenticator <input name=\"code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" \
+         pattern=\"[0-9]{{6}}\" maxlength=\"6\" required class=\"code\"></label>\
+         <div><button>Set up a new authenticator</button></div></form></section></section>\
+         <p class=\"hint\">Accounts are added and removed on the hub itself: <code>sudo thorn web user add &lt;name&gt;</code>, \
+         <code>sudo thorn web user rm &lt;name&gt;</code>.</p>",
+        esc(&c.user),
+        csrf(c),
+        code_field(),
+        csrf(c),
+    );
+    Reply::Html(200, page(c, "Account", &b, flash))
+}
+
+fn account_post(c: &Ctx, action: &str, form: &HashMap<String, String>) -> Reply {
+    match action {
+        "password" => {
+            if f(form, "new") != f(form, "again") {
+                return back("/account", Err("the two new passwords differ".into()));
+            }
+            back(
+                "/account",
+                get::<String>(
+                    c,
+                    Op::AccountPassword {
+                        current: f(form, "current").into(),
+                        new: f(form, "new").into(),
+                        code: f(form, "code").into(),
+                    },
+                ),
+            )
+        }
+        "totp-begin" => match get::<serde_json::Value>(
+            c,
+            Op::AccountTotpBegin {
+                code: f(form, "code").into(),
+            },
+        ) {
+            Ok(v) => {
+                let secret = v["secret"].as_str().unwrap_or("");
+                // The QR code is our own SVG (qrcode crate output), not user input.
+                let qr = v["qr"].as_str().unwrap_or("");
+                let b = format!(
+                    "<section class=\"card narrow\"><h1>New authenticator</h1><ol class=\"steps\">\
+                     <li>Scan this with your authenticator app:<div class=\"qr\">{qr}</div>\
+                     <p class=\"hint\">or enter this key by hand:</p>{}</li>\
+                     <li><form method=\"post\" action=\"/account/totp-finish\" class=\"stack\">{}\
+                     <label>The code the app now shows for blackthorn <input name=\"code\" inputmode=\"numeric\" \
+                     autocomplete=\"one-time-code\" pattern=\"[0-9]{{6}}\" maxlength=\"6\" required class=\"code\"></label>\
+                     <button class=\"primary\">Confirm</button></form></li></ol>\
+                     <p class=\"hint\">Until you confirm, your current authenticator keeps working. This expires in 10 minutes.</p>\
+                     <p><a href=\"/account\">Cancel</a></p></section>",
+                    copyable("totpkey", secret),
+                    csrf(c),
+                );
+                Reply::Html(200, page(c, "New authenticator", &b, &Flash::default()))
+            }
+            Err(e) => back("/account", Err(e)),
+        },
+        "totp-finish" => match get::<Vec<String>>(
+            c,
+            Op::AccountTotpFinish {
+                code: f(form, "code").into(),
+            },
+        ) {
+            Ok(codes) => {
+                let b = format!(
+                    "<section class=\"card narrow\"><h1>New authenticator confirmed</h1><p>From now on log in with \
+                     the new one. Your other logins ended.</p><p>Your new recovery codes: each works once instead \
+                     of a code, if you lose the phone. Write them down now; they are not shown again.</p>{}\
+                     <p><a class=\"btn primary\" href=\"/account\">Done</a></p></section>",
+                    copyable("codes", &codes.join("\n"))
+                );
+                Reply::Html(200, page(c, "Recovery codes", &b, &Flash::default()))
+            }
+            Err(e) if e.starts_with("start again") => back("/account", Err(e)),
+            Err(e) => {
+                let b = format!(
+                    "<section class=\"card narrow\"><h1>New authenticator</h1>\
+                     <form method=\"post\" action=\"/account/totp-finish\" class=\"stack\">{}\
+                     <label>The code the app now shows for blackthorn <input name=\"code\" inputmode=\"numeric\" \
+                     autocomplete=\"one-time-code\" pattern=\"[0-9]{{6}}\" maxlength=\"6\" required class=\"code\" autofocus></label>\
+                     <button class=\"primary\">Confirm</button></form><p><a href=\"/account\">Cancel</a></p></section>",
+                    csrf(c)
+                );
+                let flash = Flash {
+                    ok: None,
+                    err: Some(e),
+                };
+                Reply::Html(200, page(c, "New authenticator", &b, &flash))
+            }
+        },
+        _ => back("/account", Err("unknown action".into())),
+    }
 }
 
 fn settings_post(c: &Ctx, form: &HashMap<String, String>) -> Reply {
@@ -1345,10 +1836,12 @@ fn bridges_page(c: &Ctx, flash: &Flash) -> Reply {
     if o.bridges.is_empty() {
         b.push_str("<p>No bridges.</p>");
     } else {
-        b.push_str("<div class=\"table-wrap\"><table><thead><tr><th>From</th><th>Reaches</th><th>Via</th><th>Lasts</th><th></th></tr></thead><tbody>");
+        b.push_str("<div class=\"items\">");
         for x in &o.bridges {
             b.push_str(&format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<article class=\"item\"><div class=\"item-head\"><span class=\"swatch bridge\"></span>\
+                 <span class=\"item-name\">{} → {}</span></div><p class=\"item-meta\">via space {} · {}</p>\
+                 <div class=\"buttons\">{}</div></article>",
                 esc(&x.from),
                 esc(&x.host),
                 esc(&x.to),
@@ -1366,7 +1859,7 @@ fn bridges_page(c: &Ctx, flash: &Flash) -> Reply {
                 )
             ));
         }
-        b.push_str("</tbody></table></div>");
+        b.push_str("</div>");
     }
     if o.spaces.len() >= 2 {
         let opts: String = o
@@ -1382,7 +1875,7 @@ fn bridges_page(c: &Ctx, flash: &Flash) -> Reply {
             })
             .collect();
         b.push_str(&format!(
-            "<section class=\"card\"><h2>Open a bridge</h2><form method=\"post\" action=\"/bridges\" class=\"grid\">{}\
+            "<section class=\"card\"><h2>Open a bridge</h2><form method=\"post\" action=\"/bridges\" class=\"stack\">{}\
              <label>Space <select name=\"from\">{opts}</select></label><label>May also reach the machine of \
              <select name=\"to\">{opts}</select></label>{}{}<button class=\"primary\">Open bridge</button></form></section>",
             csrf(c),

@@ -240,6 +240,58 @@ thorn firewall show | grep -q "192.0.2.50" && ok "and applied to the firewall at
 thorn config set inbound.deny_from "" >/dev/null && ! hub grep -q "192.0.2.50" /etc/blackthorn/config.toml && ok "thorn config set empties a list" || fail "config set"
 hub env SSH_CONNECTION="192.0.2.9 50000 $HUB 22" /usr/local/bin/thorn config set inbound.admin_from 192.0.2.77 2>&1 | grep -q "lock you out" && ok "the command line refuses to lock out its SSH user too" || fail "CLI lock-out guard"
 
+say "chats of a space: list, name, delete"
+dir="/var/lib/blackthorn/spaces/$k1/.claude/projects/-var-lib-blackthorn-spaces-$k1-work"
+cid=4a1f0c2e-1111-4222-8333-444455556666
+hub runuser -u "bt-$k1" -- sh -c "mkdir -p '$dir' && echo '{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"check the disks\"}}' > '$dir/$cid.jsonl'"
+hub runuser -u "bt-$k1" -- ln -s /etc/shadow "$dir/5b2e1d3f-1111-4222-8333-444455556666.jsonl"
+thorn chat ls t1-claude | grep -q "check the disks" && ok "thorn chat ls names a chat by its first message" || fail "chat ls"
+thorn chat ls t1-claude | grep -q "5b2e1d3f" && fail "chat ls followed a planted link" || ok "chat ls skips links the space user planted"
+thorn chat rename t1-claude 5b2e1d3f "x" 2>&1 | grep -q "no chat" && ok "and will not write through one" || fail "rename through a link"
+r=$(web_post /space/t1-claude/chat-rename --data-urlencode "csrf=$C" --data-urlencode "id=$cid" --data-urlencode "title=disk check")
+case "$r" in *"ok=chat%20renamed"*) ok "chat renamed from the web";; *) fail "chat rename: $r";; esac
+hub tail -1 "$dir/$cid.jsonl" | grep -q '"customTitle":"disk check"' && ok "named the way Claude Code's /rename does" || fail "custom-title line"
+web_get /space/t1-claude | grep -q "disk check" && ok "the space page lists the chat by its new name" || fail "chats on the space page"
+thorn chat rm t1-claude 4a1f 2>&1 | grep -q "in use" && ok "a chat in use is not deleted" || fail "chat rm while in use"
+hub touch -h -d '2 hours ago' "$dir/$cid.jsonl"
+r=$(web_post /space/t1-claude/chat-rm --data-urlencode "csrf=$C" --data-urlencode "id=$cid")
+case "$r" in *"ok=chat%20deleted"*) ok "an old chat deleted from the web";; *) fail "chat rm: $r";; esac
+hub test -e "$dir/$cid.jsonl" && fail "the transcript is still there" || ok "its transcript is gone"
+hub test -e /etc/shadow && ok "and nothing else was touched" || fail "/etc/shadow is gone"
+hub rm -f "$dir/5b2e1d3f-1111-4222-8333-444455556666.jsonl"
+
+say "Remote Control off and on again"
+thorn remote t1-claude off | grep -q "Remote Control off" && ok "thorn remote off" || fail "thorn remote off"
+sleep 3
+a=$(hub tail -1 "/var/lib/blackthorn/spaces/$k1/fake-claude.args")
+case "$a" in --session-id*|--resume*) case "$a" in *remote-control*) fail "still Remote Control: $a";; *) ok "off: one local conversation, no Remote Control";; esac;; *) fail "remote off: $a";; esac
+web_get /space/t1-claude | grep -q "local only" && ok "the space page says local only" || fail "local only badge"
+r=$(web_post /space/t1-claude/remote --data-urlencode "csrf=$C" --data-urlencode "on=on")
+case "$r" in *"ok=Remote%20Control%20on"*) ok "turned on again from the web";; *) fail "remote on: $r";; esac
+sleep 3
+hub tail -1 "/var/lib/blackthorn/spaces/$k1/fake-claude.args" | grep -q -- '^remote-control --name t1-claude' && ok "back in server mode" || fail "server mode again"
+expect_reach 20 t1-claude t1 ok
+
+say "account: password and authenticator from the web"
+web_get /account | grep -q "Change password" && ok "the account page" || fail "account page"
+NEWPW='a different horse battery'
+code=$(fresh_code $WEB_SECRET)
+r=$(web_post /account/password --data-urlencode "csrf=$C" --data-urlencode "current=$PASSWORD" --data-urlencode "new=$NEWPW" --data-urlencode "again=$NEWPW" --data-urlencode "code=$code")
+case "$r" in *"ok=password%20changed"*) ok "password changed from the web"; PASSWORD=$NEWPW;; *) fail "password change: $r";; esac
+code=$(fresh_code $WEB_SECRET)
+page=$(admin curl -s -b /tmp/jar -c /tmp/jar --data-urlencode "csrf=$C" --data-urlencode "code=$code" "http://$HUB:7180/account/totp-begin")
+NEW=$(echo "$page" | grep -o 'id="totpkey">[A-Z2-7]*' | cut -d'>' -f2)
+echo "$page" | grep -q 'class="qr"><svg' && [ -n "$NEW" ] && ok "a new authenticator, as a QR code and a key" || fail "totp begin: $(echo "$page" | head -c 300)"
+page=$(admin curl -s -b /tmp/jar -c /tmp/jar --data-urlencode "csrf=$C" --data-urlencode "code=000000" "http://$HUB:7180/account/totp-finish")
+echo "$page" | grep -q "does not match" && ok "a wrong code does not switch it" || fail "totp finish with a wrong code"
+page=$(admin curl -s -b /tmp/jar -c /tmp/jar --data-urlencode "csrf=$C" --data-urlencode "code=$(admin oathtool --totp -b "$NEW")" "http://$HUB:7180/account/totp-finish")
+echo "$page" | grep -q "New authenticator confirmed" && ok "switched once a code from the new one matched" || fail "totp finish"
+WEB_SECRET=$NEW
+admin rm -f /tmp/jar2
+r=$(admin curl -s -o /dev/null -w "%{redirect_url}" -c /tmp/jar2 --data-urlencode "user=frakw" --data-urlencode "password=$PASSWORD" --data-urlencode "code=$(fresh_code $WEB_SECRET)" "http://$HUB:7180/login")
+[ "$r" = "http://$HUB:7180/" ] && ok "log in with the new password and authenticator" || fail "login after changes: $r"
+web_get /settings | grep -q 'id="update"' && ok "the settings page has the update card" || fail "update card"
+
 say "block cuts a machine off now, and lifts itself"
 thorn host block t1 --for 70s --reason test >/dev/null
 expect_reach 10 t1-claude t1 FAIL

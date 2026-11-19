@@ -143,6 +143,9 @@ pub struct Launch {
     pub kind: LaunchKind,
     pub bin: String,
     pub rc_name: String,
+    /// Off: Claude runs as one local conversation, without Remote Control.
+    #[serde(default = "crate::render::yes")]
+    pub remote_control: bool,
     pub conversation: String,
     pub capacity: u32,
     pub args: Vec<String>,
@@ -188,10 +191,15 @@ pub fn launch(name: &str, space: &Space, cfg: &Config) -> Launch {
         kind,
         bin,
         rc_name: space.rc_name.clone(),
+        remote_control: space.remote_control,
         conversation: space.conversation.clone(),
         capacity: cfg.capacity,
         args,
     }
+}
+
+pub fn yes() -> bool {
+    true
 }
 
 /// Initial ~/.claude.json for a new space user, so Claude Code starts
@@ -276,6 +284,7 @@ mod tests {
                     host: h.into(),
                     agent: "claude".into(),
                     mode: Mode::Server,
+                    remote_control: true,
                     rc_name: n.into(),
                     conversation: "c0ffee00-0000-4000-8000-000000000000".into(),
                     args: vec!["--permission-mode".into(), "acceptEdits".into()],

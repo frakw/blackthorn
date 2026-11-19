@@ -102,6 +102,11 @@ pub struct Space {
     /// a single conversation that can also be typed into on the terminal.
     #[serde(default)]
     pub mode: Mode,
+    /// Claude only: reachable through Remote Control (the Claude app,
+    /// claude.ai/code). Off: only from the hub itself, through its terminal
+    /// (the web UI or `thorn attach`).
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub remote_control: bool,
     /// Name shown in Remote Control on your phone or laptop.
     pub rc_name: String,
     /// The conversation a single-mode space resumes.
@@ -110,6 +115,14 @@ pub struct Space {
     #[serde(default)]
     pub args: Vec<String>,
     pub created: u64,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -358,6 +371,7 @@ mod tests {
             host: host.into(),
             agent: "claude".into(),
             mode: Mode::Server,
+            remote_control: true,
             rc_name: format!("{host}-claude"),
             conversation: "7bb9dc88-2ec5-4933-90b6-b872466876b2".into(),
             args: vec![],

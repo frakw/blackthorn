@@ -237,3 +237,57 @@ pub fn print_table(rows: &[Vec<String>]) {
         println!("{}", line.join("  ").trim_end());
     }
 }
+
+pub fn chat_ls(space: &str) -> Result<()> {
+    let chats = ops::chat_list(space)?;
+    if chats.is_empty() {
+        println!("no chats in {space} yet");
+    }
+    let now = crate::state::now();
+    for c in chats {
+        println!(
+            "{}  {:>8} ago  {}{}",
+            &c.id[..8],
+            ago(now.saturating_sub(c.modified)),
+            c.title,
+            if c.main {
+                "  (the space's conversation)"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
+fn ago(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+pub fn chat_rename(space: &str, id: &str, title: &str) -> Result<()> {
+    let id = ops::chat_rename(space, id, title)?;
+    println!("chat {} is now called {title:?}", &id[..8]);
+    Ok(())
+}
+
+pub fn chat_rm(space: &str, id: &str) -> Result<()> {
+    let id = ops::chat_rm(space, id)?;
+    println!("deleted chat {} from the hub", &id[..8]);
+    Ok(())
+}
+
+pub fn remote(name: &str, on: bool) -> Result<()> {
+    let restarted = ops::space_set_remote(name, on)?;
+    let again = if restarted { " (restarted)" } else { "" };
+    if on {
+        println!("{name}: Remote Control on{again}");
+    } else {
+        println!("{name}: Remote Control off{again}; use it with: sudo thorn attach {name}");
+    }
+    Ok(())
+}

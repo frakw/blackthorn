@@ -227,6 +227,24 @@ pub fn qr_terminal(data: &str) -> Result<String> {
         .build())
 }
 
+/// The same as an SVG image, black on white so any camera reads it.
+pub fn qr_svg(data: &str) -> Result<String> {
+    use qrcode::render::svg;
+    let code = qrcode::QrCode::new(data.as_bytes()).context("making a QR code")?;
+    let s = code
+        .render::<svg::Color>()
+        .min_dimensions(220, 220)
+        .dark_color(svg::Color("#000000"))
+        .light_color(svg::Color("#ffffff"))
+        .quiet_zone(true)
+        .build();
+    // Inline in a page: without the XML declaration.
+    Ok(match s.find("<svg") {
+        Some(i) => s[i..].to_string(),
+        None => s,
+    })
+}
+
 /// Constant-time comparison of two strings (tokens, CSRF values).
 pub fn same(a: &str, b: &str) -> bool {
     use subtle::ConstantTimeEq;
@@ -295,6 +313,7 @@ mod tests {
         assert_eq!(codes.len(), 10);
         assert!(codes.iter().all(|c| c.len() == 14));
         assert!(qr_terminal(&u).unwrap().contains('█'));
+        assert!(qr_svg(&u).unwrap().starts_with("<svg"));
         assert!(same("abc", "abc"));
         assert!(!same("abc", "abd"));
         assert!(!same("abc", "abcd"));

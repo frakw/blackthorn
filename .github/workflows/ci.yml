@@ -18,6 +18,9 @@ jobs:
       - name: fmt
         run: |
           cargo fmt --check || { echo "::error::cargo fmt --check failed; run cargo fmt"; exit 1; }
+      - name: the web UI's script parses
+        run: |
+          node --check src/assets/app.js || { echo "::error::src/assets/app.js does not parse"; exit 1; }
       - name: clippy
         run: |
           cargo clippy --all-targets --message-format=short -- -D warnings 2>&1 | tee clippy.log

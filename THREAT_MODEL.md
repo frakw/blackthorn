@@ -66,7 +66,9 @@ they are enforced by the kernel or by what the space has, not by the model.
 | Spaces cannot change the system | systemd sandbox: `ProtectSystem=strict`, `ProtectHome`, `NoNewPrivileges`, `PrivateTmp`, `RestrictSUIDSGID`, and more. |
 | Without the firewall, nothing runs | Space units require the firewall unit, and stopping the firewall unit leaves its rules loaded. |
 | The web UI's network side has no power | The HTTP listener runs as the unprivileged `blackthorn-web` user in a tight systemd sandbox, with no access to blackthorn's files. It forwards requests to a root API on a Unix socket, which accepts only that user, checks the password (Argon2id) and TOTP code itself, keeps the sessions, and enforces the CSRF value. A compromised web process can act only through a session a user has logged in to. |
-| Logins resist guessing | Password and TOTP are both needed; each code works once; five failures lock the account and the address for 15 minutes. Deleting spaces, removing machines, moving them, opening bridges, accepting new host keys and changing settings need a fresh code. |
+| Logins resist guessing | Password and TOTP are both needed; each code works once; five failures lock the account and the address for 15 minutes. Deleting spaces, removing machines, moving them, opening bridges, accepting new host keys, changing settings, updating blackthorn and changing your password or authenticator need a fresh code. A new authenticator replaces the old one only after a code made from it is accepted; password and authenticator changes end your other logins. Accounts are created and removed only on the hub's command line. |
+| Account secrets do not linger | The terminal that showed a new account's QR code and recovery codes is cleared, scrollback included, once you have written them down. |
+| Root does not follow a space's links | Listing, naming and deleting chats reads and writes files in the space's home as root; it skips symbolic links, opens transcripts with `O_NOFOLLOW`, and acts only on files the space user owns. |
 | Web pages are hard to abuse | SameSite=Strict, HttpOnly session cookie; a CSRF value on every form; a CSP that allows no inline script or third-party resource; a small HTTP parser with size, time and connection limits. |
 | SSH changes cannot lock you out | `thorn harden ssh` checks your authenticator first, validates sshd's configuration, and undoes itself unless you confirm from a new login. |
 
@@ -130,9 +132,20 @@ Know these before you rely on it.
    make it reachable outside the tailnet.
 
 10. **Remote Control is as safe as your Claude account.** Spaces accept
-    instructions from Remote Control. See "Who is trusted".
+    instructions from Remote Control. See "Who is trusted". A space with
+    Remote Control off is reached only from the hub, but it still signs in
+    to the same account (point 1).
 
-11. **Availability is not protected.** A space can exhaust memory or CPU,
+11. **Updates trust GitHub.** The web UI's Update button (and
+    `thorn update`) runs the release's `install.sh`, downloaded over HTTPS
+    from GitHub, as root; it checks the new `thorn` against the release's
+    `SHA256SUMS`, which come from the same place. Whoever can publish a
+    release in the repository can therefore run code on your hub, exactly
+    as with the first install. Checking for a release sends one HTTPS
+    request to github.com from the hub, at most every six hours, while the
+    Settings page is open.
+
+12. **Availability is not protected.** A space can exhaust memory or CPU,
     or kill its own agent. Spaces are separate units, so this affects
     others only through shared resources.
 

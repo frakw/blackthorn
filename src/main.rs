@@ -78,6 +78,10 @@ enum Cmd {
         /// instead of a Remote Control server with many chats.
         #[arg(long)]
         single: bool,
+        /// Claude: without Remote Control; use it only from the hub's
+        /// terminal (thorn attach, or the web UI).
+        #[arg(long)]
+        local: bool,
         /// Name shown in Remote Control (default: the space name).
         #[arg(long)]
         rc_name: Option<String>,
@@ -133,9 +137,26 @@ enum Cmd {
         #[arg(long)]
         no_enter: bool,
     },
+    /// Turn a Claude space's Remote Control on or off. Off, it is one local
+    /// conversation, reached only from the hub (thorn attach, the web UI).
+    Remote {
+        name: String,
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+    /// A space's Claude chats: list, name, delete.
+    #[command(subcommand)]
+    Chat(ChatCmd),
     /// Let one space reach another space's machine for a while.
     #[command(subcommand)]
     Bridge(BridgeCmd),
+    /// Install the latest blackthorn release (settings, accounts and spaces
+    /// stay).
+    Update {
+        /// Only say whether there is a newer release.
+        #[arg(long)]
+        check: bool,
+    },
     /// Show or change the settings the web UI can change too.
     #[command(subcommand)]
     Config(ConfigCmd),
@@ -185,6 +206,20 @@ enum BridgeCmd {
     Rm { from: String, to: String },
     /// List bridges.
     Ls,
+}
+
+#[derive(Subcommand)]
+enum ChatCmd {
+    /// List a space's chats, newest first.
+    Ls { space: String },
+    /// Name a chat (the first characters of its id are enough).
+    Rename {
+        space: String,
+        id: String,
+        title: String,
+    },
+    /// Delete a chat's transcript from the hub.
+    Rm { space: String, id: String },
 }
 
 #[derive(Subcommand)]
@@ -337,6 +372,7 @@ fn run(cli: Cli) -> Result<()> {
             agent,
             name,
             single,
+            local,
             rc_name,
             args,
         } => s::new(ops::NewSpace {
@@ -344,6 +380,7 @@ fn run(cli: Cli) -> Result<()> {
             agent,
             name,
             single,
+            local,
             rc_name,
             args,
         }),
@@ -361,6 +398,13 @@ fn run(cli: Cli) -> Result<()> {
             key,
             no_enter,
         } => s::send(&name, text.as_deref(), key.as_deref(), no_enter),
+        Cmd::Remote { name, state } => s::remote(&name, state == "on"),
+        Cmd::Chat(c) => match c {
+            ChatCmd::Ls { space } => s::chat_ls(&space),
+            ChatCmd::Rename { space, id, title } => s::chat_rename(&space, &id, &title),
+            ChatCmd::Rm { space, id } => s::chat_rm(&space, &id),
+        },
+        Cmd::Update { check } => config_cmd::update(check),
         Cmd::Config(c) => match c {
             ConfigCmd::Show => config_cmd::show(),
             ConfigCmd::Set { key, value } => config_cmd::set(&key, &value),
@@ -518,6 +562,17 @@ mod tests {
             ("host_move", &["host", "set-address"]),
             ("config_show", &["config", "show"]),
             ("config_set", &["config", "set"]),
+            ("tailnet_peers", &["config", "show"]),
+            ("chat_list", &["chat", "ls"]),
+            ("chat_rename", &["chat", "rename"]),
+            ("chat_rm", &["chat", "rm"]),
+            ("space_remote", &["remote"]),
+            ("update_check", &["update"]),
+            ("update", &["update"]),
+            ("account", &["web", "user", "ls"]),
+            ("account_password", &["web", "user", "passwd"]),
+            ("account_totp_begin", &["web", "user", "totp-reset"]),
+            ("account_totp_finish", &["web", "user", "totp-reset"]),
         ];
         // Operations that exist only because of the web: sessions.
         let web_only = ["web_config", "login", "logout", "whoami"];

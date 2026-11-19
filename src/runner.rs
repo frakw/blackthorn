@@ -8,6 +8,8 @@
 //! - Claude, single mode: one conversation. Exit 0 (you typed /exit) ends
 //!   the space until `thorn start` or the next boot; an error resumes the
 //!   same conversation.
+//! - Claude without Remote Control: one local conversation, like single
+//!   mode, reached only through the hub's terminal.
 //! - Other agents: restarted whenever they exit.
 //!
 //! Restarts back off from 5 seconds up to five minutes.
@@ -40,7 +42,7 @@ pub fn run(key: &str) -> Result<()> {
             .status();
 
         match status {
-            Ok(s) if s.success() && launch.kind == LaunchKind::ClaudeSingle => {
+            Ok(s) if s.success() && one_conversation(&launch) => {
                 println!(
                     "blackthorn: claude exited normally; space {} ends.",
                     launch.name
@@ -64,9 +66,19 @@ pub fn run(key: &str) -> Result<()> {
     }
 }
 
+/// Claude with one conversation: single mode, or without Remote Control.
+fn one_conversation(launch: &Launch) -> bool {
+    launch.kind == LaunchKind::ClaudeSingle
+        || (launch.kind == LaunchKind::ClaudeServer && !launch.remote_control)
+}
+
 pub fn agent_args(launch: &Launch, resume: bool) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     match launch.kind {
+        LaunchKind::ClaudeServer | LaunchKind::ClaudeSingle if !launch.remote_control => {
+            args.push(if resume { "--resume" } else { "--session-id" }.into());
+            args.push(launch.conversation.clone());
+        }
         LaunchKind::ClaudeServer => {
             args.extend([
                 "remote-control".into(),
@@ -119,6 +131,7 @@ mod tests {
             kind,
             bin: "/usr/local/bin/claude".into(),
             rc_name: "fig-claude".into(),
+            remote_control: true,
             conversation: "c0ffee00-0000-4000-8000-000000000000".into(),
             capacity: 8,
             args: vec!["--permission-mode".into(), "acceptEdits".into()],
@@ -158,6 +171,25 @@ mod tests {
             ]
         );
         assert_eq!(agent_args(&l, true)[0], "--resume");
+    }
+
+    #[test]
+    fn without_remote_control_one_local_conversation() {
+        for kind in [LaunchKind::ClaudeServer, LaunchKind::ClaudeSingle] {
+            let mut l = launch(kind);
+            l.remote_control = false;
+            assert_eq!(
+                agent_args(&l, true),
+                vec![
+                    "--resume",
+                    "c0ffee00-0000-4000-8000-000000000000",
+                    "--permission-mode",
+                    "acceptEdits"
+                ]
+            );
+            assert!(one_conversation(&l));
+        }
+        assert!(!one_conversation(&launch(LaunchKind::ClaudeServer)));
     }
 
     #[test]

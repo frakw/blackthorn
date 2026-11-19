@@ -7,7 +7,7 @@ coding agents live. They keep running there, you reach them from your phone
 or laptop, and each one can work on exactly one of your machines, over SSH,
 one way only.
 
-Status: **early (v0.3)**. It works and is tested end to end, but expect
+Status: **early (v0.4)**. It works and is tested end to end, but expect
 changes. Read [THREAT_MODEL.md](THREAT_MODEL.md) before trusting it with
 anything important.
 
@@ -112,8 +112,9 @@ That one line:
 It ends by printing the web UI's address. Open it, log in, and do the rest
 there: add a machine, create a space on it, sign it in to Claude.
 
-Run the same line again to upgrade; your configuration stays as it is. To
-update Claude Code: `... | sh -s -- --update-claude`. Other options:
+Run the same line again to upgrade, or press **Update** on the web UI's
+Settings page when it says a new release is out (`sudo thorn update` does the
+same); your configuration stays as it is. To update Claude Code: `... | sh -s -- --update-claude`. Other options:
 `--version v0.3.0`, `--no-claude`, `--no-web`, and `--binary ./thorn` to
 install a binary you built yourself (`cargo build --release`; the hub needs
 no compiler).
@@ -147,9 +148,22 @@ sudo thorn bridge add fig-claude nas-claude --for 30m
 
 ## Web UI
 
-The web UI is the everyday way to run blackthorn: the map, spaces (with a
-live view of each space's terminal, and Claude sign-in), machines, blocks
-and bridges. The command line can do everything it can, for when it is down.
+The web UI is the everyday way to run blackthorn, on a laptop or a phone:
+
+- **Map**: your devices, the hub, its spaces and their machines as boxes and
+  wires, like a node editor. Drag boxes around, pan and zoom; the layout is
+  remembered in your browser.
+- **Spaces**: each one's chats (rename, delete), a live view of its
+  terminal, Claude sign-in, bridges, and Remote Control on or off.
+- **Machines**: the key line to install (with a Copy button), checking the
+  machine's host keys, blocks.
+- **Settings**: who may connect, never_manage and the web address, edited
+  as lists of addresses with a picker that knows your tailnet's devices and
+  whether they are online; and the blackthorn version, with one-click
+  updates.
+- **Account**: change your password, or move to a new authenticator app.
+
+The command line can do everything it can, for when it is down.
 
 Logins need the password and a TOTP code; deleting a space, removing a
 machine, opening a bridge and accepting new host keys ask for a fresh code
@@ -174,7 +188,10 @@ stay) and applied at once. On the web they need a fresh code, and a change
 that would shut out the device you are using is refused. Everything else in
 the file is edited by hand, followed by `sudo thorn apply`.
 
-More accounts: `sudo thorn web user add NAME`. Turn the web UI off with
+Accounts are added and removed only on the hub itself, with
+`sudo thorn web user add NAME` and `sudo thorn web user rm NAME`; once you
+have written down the recovery codes, the terminal is cleared, so neither
+they nor the QR code stay in its scrollback. Turn the web UI off with
 `sudo thorn web disable`; the command line keeps working.
 
 ## SSH two-factor
@@ -197,12 +214,14 @@ restores the old settings at any time.
 | `thorn init [--claude-from PATH] [--no-web]` | Set up the hub (the installer runs it), or update Claude Code |
 | `thorn status [--json]` | The map: machines, spaces, bridges, hub health |
 | `thorn ls` | Spaces: machine, agent, state, what they can reach |
-| `thorn new HOST [--agent A] [--name N] [--single] [--rc-name N] [--arg A]...` | Create a space on a machine |
+| `thorn new HOST [--agent A] [--name N] [--single] [--local] [--arg A]...` | Create a space on a machine |
 | `thorn login SPACE` | Sign a Claude space in, then start it |
 | `thorn start\|stop\|restart SPACE... \| --all` | Control spaces |
 | `thorn attach SPACE` | Open the space's terminal |
 | `thorn screen SPACE` / `thorn send SPACE TEXT` | Read or type into the terminal without attaching |
 | `thorn rename OLD NEW [--rc-name N]` | Rename; same chats |
+| `thorn chat ls SPACE` / `chat rename SPACE ID NAME` / `chat rm SPACE ID` | A space's Claude chats |
+| `thorn remote SPACE on\|off` | Remote Control on, or off: one local conversation, only from the hub |
 | `thorn rm SPACE [--purge]` | Delete; files are archived unless `--purge` |
 | `thorn bridge add FROM TO [--for 1h]` / `bridge rm` / `bridge ls` | Let one space reach another space's machine for a while |
 | `thorn host add NAME USER@IP [--port P]` | Register a machine and create its key |
@@ -214,6 +233,7 @@ restores the old settings at any time.
 | `thorn harden ssh --totp\|--fido` / `harden confirm\|undo` | Two-factor SSH to the hub |
 | `thorn firewall show [--planned]` / `firewall apply` | Inspect or reload the rules |
 | `thorn apply` | Rewrite all generated files and reload everything |
+| `thorn update [--check]` | Install the latest release (settings, accounts and spaces stay) |
 
 Commands that change anything must run as root.
 
@@ -221,7 +241,10 @@ Commands that change anything must run as root.
 
 A space runs **Claude Code** by default, as a Remote Control server with
 many chats. `--single` gives one conversation that you can also type into
-on the terminal. Options for Claude Code go after `--arg`:
+on the terminal. `--local` (or Remote Control off on its page) leaves
+Remote Control out altogether: one conversation, reached only from the hub,
+through the web UI's terminal or `thorn attach`, and not shown in your
+Claude account's session list. Options for Claude Code go after `--arg`:
 
 ```sh
 sudo thorn new fig --arg=--permission-mode --arg=acceptEdits

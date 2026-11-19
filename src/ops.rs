@@ -46,6 +46,9 @@ pub struct SpaceView {
     pub host: String,
     pub agent: String,
     pub mode: Mode,
+    /// Claude: reachable through Remote Control.
+    #[serde(default = "crate::render::yes")]
+    pub remote_control: bool,
     pub rc_name: String,
     /// "running", "stopped", "failed", "needs login", ...
     pub state: String,
@@ -117,6 +120,7 @@ pub fn overview(with_version: bool) -> Result<Overview> {
                 host: s.host.clone(),
                 agent: s.agent.clone(),
                 mode: s.mode,
+                remote_control: s.remote_control,
                 rc_name: s.rc_name.clone(),
                 state: state_str,
                 memory_mb: sys::unit_memory(&unit).map(|b| b / 1_048_576),
@@ -251,6 +255,9 @@ pub struct NewSpace {
     pub name: Option<String>,
     #[serde(default)]
     pub single: bool,
+    /// Claude: no Remote Control; use it from the hub's terminal only.
+    #[serde(default)]
+    pub local: bool,
     pub rc_name: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
@@ -318,6 +325,7 @@ pub fn space_new(o: NewSpace) -> Result<String> {
         host: o.host,
         agent,
         mode: if o.single { Mode::Single } else { Mode::Server },
+        remote_control: !o.local,
         rc_name,
         conversation: uuid::Uuid::new_v4().to_string(),
         args: o.args,
@@ -539,6 +547,474 @@ fn send_keys(sock: &Path, text: Option<&str>, key: Option<&str>, enter: bool) ->
         sys::run("tmux", &["-S", sock, "send-keys", "-t", "main", "Enter"])?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------- chats
+
+/// One Claude conversation of a space, from its transcript on the hub.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Chat {
+    pub id: String,
+    pub title: String,
+    /// Unix seconds of the last write.
+    pub modified: u64,
+    pub kb: u64,
+    /// The one conversation a single-mode or local-only space resumes.
+    pub main: bool,
+}
+
+/// Transcripts: ~/.claude/projects/<dir>/<uuid>.jsonl, real files and
+/// directories only (the space user owns these; root never follows a link
+/// it may have planted).
+fn chat_files(key: &str) -> Vec<(String, PathBuf)> {
+    let projects = paths::space_home(key).join(".claude/projects");
+    let Ok(dirs) = std::fs::read_dir(projects) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for d in dirs.flatten() {
+        if !d.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(d.path()) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let p = f.path();
+            if !f.file_type().is_ok_and(|t| t.is_file())
+                || !p.extension().is_some_and(|e| e == "jsonl")
+            {
+                continue;
+            }
+            if let Some(id) = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|s| uuid::Uuid::parse_str(s).is_ok())
+            {
+                out.push((id.to_string(), p));
+            }
+        }
+    }
+    out
+}
+
+/// A chat's name, as Claude Code shows it: the name you gave it, else the
+/// title Claude made up, else its first message.
+pub fn chat_title(transcript: &str) -> Option<String> {
+    let mut custom: Option<String> = None;
+    let mut ai: Option<String> = None;
+    let mut summary: Option<String> = None;
+    let mut first: Option<String> = None;
+    for line in transcript.lines() {
+        let interesting = line.contains("\"custom-title\"")
+            || line.contains("\"ai-title\"")
+            || line.contains("\"summary\"")
+            || (first.is_none() && line.contains("\"user\""));
+        if !interesting {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let text = |k: &str| {
+            v[k].as_str()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        match v["type"].as_str() {
+            // The last one wins; an empty one clears the name.
+            Some("custom-title") => custom = text("customTitle"),
+            Some("ai-title") => ai = text("aiTitle"),
+            Some("summary") => summary = text("summary"),
+            Some("user") if first.is_none() && v["isMeta"].as_bool() != Some(true) => {
+                first = user_text(&v["message"]["content"]);
+            }
+            _ => {}
+        }
+    }
+    let t = custom.or(ai).or(summary).or(first)?;
+    let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(if t.chars().count() > 80 {
+        let mut s: String = t.chars().take(79).collect();
+        s.push('…');
+        s
+    } else {
+        t
+    })
+}
+
+/// A transcript's text; of a big one only the start (its first message)
+/// and the end (its latest name), which is where titles are.
+fn head_and_tail(path: &Path, len: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    const PART: u64 = 1 << 20;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let mut buf = Vec::new();
+    if len <= 4 * PART {
+        let _ = f.read_to_end(&mut buf);
+    } else {
+        let _ = (&mut f).take(PART).read_to_end(&mut buf);
+        buf.push(b'\n');
+        if f.seek(SeekFrom::Start(len - PART)).is_ok() {
+            let _ = f.take(PART).read_to_end(&mut buf);
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn user_text(c: &serde_json::Value) -> Option<String> {
+    let t = match c {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(a) => a
+            .iter()
+            .find(|x| x["type"] == "text")
+            .and_then(|x| x["text"].as_str())?
+            .to_string(),
+        _ => return None,
+    };
+    let t = t.trim();
+    // Commands and other tool-made messages start with a tag.
+    (!t.is_empty() && !t.starts_with('<')).then(|| t.to_string())
+}
+
+fn space_uid(key: &str) -> Result<u32> {
+    Ok(sys::lookup_user(&paths::unix_user(key))
+        .context("the space user is missing")?
+        .uid)
+}
+
+fn main_conversation(s: &Space) -> Option<&str> {
+    (s.agent == CLAUDE && (s.mode == Mode::Single || !s.remote_control))
+        .then_some(s.conversation.as_str())
+}
+
+pub fn chat_list(name: &str) -> Result<Vec<Chat>> {
+    sys::require_root()?;
+    let (_, state) = ctx::read_only()?;
+    let s = state.space(name)?;
+    if s.agent != CLAUDE {
+        bail!(
+            "space {name} runs {}; only Claude chats are listed",
+            s.agent
+        );
+    }
+    let main = main_conversation(s);
+    let mut chats: Vec<Chat> = chat_files(&s.key)
+        .into_iter()
+        .filter_map(|(id, p)| {
+            let meta = std::fs::symlink_metadata(&p).ok()?;
+            let modified = meta
+                .modified()
+                .ok()?
+                .duration_since(UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            let text = head_and_tail(&p, meta.len());
+            Some(Chat {
+                title: chat_title(&text).unwrap_or_else(|| "(no messages yet)".into()),
+                main: main == Some(id.as_str()),
+                id,
+                modified,
+                kb: meta.len().div_ceil(1024),
+            })
+        })
+        .collect();
+    chats.sort_by(|a, b| b.modified.cmp(&a.modified));
+    chats.truncate(200);
+    Ok(chats)
+}
+
+/// A chat by its id, or a unique start of it (at least 4 characters).
+fn find_chat(key: &str, id: &str) -> Result<(String, PathBuf)> {
+    let id = id.trim().to_ascii_lowercase();
+    if id.len() < 4 {
+        bail!("give at least the first 4 characters of the chat id");
+    }
+    let mut found: Vec<(String, PathBuf)> = chat_files(key)
+        .into_iter()
+        .filter(|(i, _)| i.starts_with(&id))
+        .collect();
+    match found.len() {
+        0 => bail!("no chat {id} in this space (thorn chat ls lists them)"),
+        1 => Ok(found.remove(0)),
+        _ => bail!("{id} matches several chats; give more of its id"),
+    }
+}
+
+/// Opens a transcript to append to, refusing links and files the space
+/// user does not own.
+fn open_transcript(path: &Path, uid: u32) -> Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let f = std::fs::OpenOptions::new()
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let m = f.metadata()?;
+    if !m.is_file() || m.uid() != uid {
+        bail!("{} is not the space's own transcript", path.display());
+    }
+    Ok(f)
+}
+
+/// Names a chat the way Claude Code's /rename does: a custom-title line at
+/// the end of its transcript, which Claude Code picks up.
+pub fn chat_rename(name: &str, id: &str, title: &str) -> Result<String> {
+    use std::io::Write as _;
+    sys::require_root()?;
+    let title = title.trim();
+    if title.is_empty() || title.chars().count() > 100 || title.chars().any(char::is_control) {
+        bail!("a chat name is 1 to 100 characters on one line");
+    }
+    let (_, state) = ctx::read_only()?;
+    let s = state.space(name)?;
+    let (id, path) = find_chat(&s.key, id)?;
+    let mut f = open_transcript(&path, space_uid(&s.key)?)?;
+    let line = serde_json::json!({ "type": "custom-title", "customTitle": title, "sessionId": id });
+    f.write_all(format!("{line}\n").as_bytes())?;
+    Ok(id)
+}
+
+/// Deletes a chat's transcript (and its subagent files) from the hub.
+pub fn chat_rm(name: &str, id: &str) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    sys::require_root()?;
+    let (_, state) = ctx::read_only()?;
+    let s = state.space(name)?;
+    let (id, path) = find_chat(&s.key, id)?;
+    if main_conversation(s) == Some(id.as_str()) {
+        bail!("this is the conversation space {name} runs; delete the space instead");
+    }
+    let meta = std::fs::symlink_metadata(&path)?;
+    if !meta.is_file() || meta.uid() != space_uid(&s.key)? {
+        bail!("{} is not the space's own transcript", path.display());
+    }
+    let recent = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .is_some_and(|e| e < Duration::from_secs(600));
+    if recent && sys::unit_state(&paths::space_unit(&s.key)) == "active" {
+        bail!("this chat was in use in the last 10 minutes; stop the space first, or wait");
+    }
+    std::fs::remove_file(&path)?;
+    let extra = path.with_extension("");
+    if std::fs::symlink_metadata(&extra).is_ok_and(|m| m.is_dir()) {
+        std::fs::remove_dir_all(&extra)?;
+    }
+    Ok(id)
+}
+
+/// Turns Remote Control on or off for a Claude space. Returns whether the
+/// space was restarted for it.
+pub fn space_set_remote(name: &str, on: bool) -> Result<bool> {
+    let mut ctx = Ctx::open()?;
+    let s = ctx
+        .state
+        .spaces
+        .get_mut(name)
+        .with_context(|| format!("no space named {name:?} (thorn ls lists them)"))?;
+    if s.agent != CLAUDE {
+        bail!("only Claude spaces have Remote Control");
+    }
+    if s.remote_control == on {
+        return Ok(false);
+    }
+    s.remote_control = on;
+    let unit = paths::space_unit(&s.key);
+    ctx.commit()?;
+    drop(ctx);
+    if sys::unit_state(&unit) == "active" {
+        sys::systemctl(&["restart", &unit])?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+// ---------------------------------------------------------------- updates
+
+pub const RELEASES: &str = "https://github.com/frakw/blackthorn/releases";
+pub const UPDATE_UNIT: &str = "blackthorn-update.service";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateInfo {
+    pub current: String,
+    pub latest: Option<String>,
+    pub newer: bool,
+    /// The release page of `latest`.
+    pub url: Option<String>,
+    pub error: Option<String>,
+    /// An update is running right now.
+    pub running: bool,
+}
+
+/// "v0.4.1" -> (0, 4, 1). Pre-releases and anything else: None.
+pub fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
+    let mut it = v.trim().strip_prefix('v').unwrap_or(v.trim()).split('.');
+    let mut n = || -> Option<u64> {
+        let p = it.next()?;
+        (!p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+            .then(|| p.parse().ok())
+            .flatten()
+    };
+    let v = (n()?, n()?, n()?);
+    it.next().is_none().then_some(v)
+}
+
+/// The tag GitHub redirects releases/latest to.
+fn parse_release_tag(redirect: &str) -> Option<String> {
+    let tag = redirect.trim().rsplit_once("/releases/tag/")?.1;
+    (tag.starts_with('v') && parse_version(tag).is_some()).then(|| tag.to_string())
+}
+
+pub fn latest_release() -> Result<String> {
+    let out = Command::new("curl")
+        .args([
+            "-sS",
+            "--max-time",
+            "15",
+            "--proto",
+            "=https",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{redirect_url}",
+            &format!("{RELEASES}/latest"),
+        ])
+        .output()
+        .context("running curl")?;
+    if !out.status.success() {
+        bail!(
+            "could not reach GitHub: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    parse_release_tag(&String::from_utf8_lossy(&out.stdout))
+        .context("GitHub did not name a latest release")
+}
+
+pub fn update_check() -> UpdateInfo {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    let running = matches!(
+        sys::unit_state(UPDATE_UNIT).as_str(),
+        "active" | "activating"
+    );
+    match latest_release() {
+        Ok(tag) => UpdateInfo {
+            newer: parse_version(&tag) > parse_version(&current),
+            url: Some(format!("{RELEASES}/tag/{tag}")),
+            latest: Some(tag),
+            current,
+            error: None,
+            running,
+        },
+        Err(e) => UpdateInfo {
+            current,
+            error: Some(format!("{e:#}")),
+            running,
+            ..Default::default()
+        },
+    }
+}
+
+/// Starts the installer of the latest release in its own systemd unit (it
+/// restarts the API and the web UI as it goes). Returns the tag.
+pub fn update_start() -> Result<String> {
+    sys::require_root()?;
+    let info = update_check();
+    if info.running {
+        bail!("an update is already running (journalctl -u {UPDATE_UNIT})");
+    }
+    if let Some(e) = info.error {
+        bail!(e);
+    }
+    let tag = info.latest.context("no release found")?;
+    if !info.newer {
+        bail!("already at the latest release ({tag})");
+    }
+    // `tag` passed parse_version: v and digits and dots only.
+    let script = format!(
+        "set -e; f=$(mktemp); trap 'rm -f \"$f\"' EXIT; \
+         curl -fsSL --proto '=https' -o \"$f\" {RELEASES}/download/{tag}/install.sh; \
+         sh \"$f\" --version {tag} --no-claude </dev/null"
+    );
+    sys::run(
+        "systemd-run",
+        &[
+            "--unit",
+            UPDATE_UNIT,
+            "--collect",
+            "--quiet",
+            "--description",
+            "blackthorn: update",
+            "/bin/sh",
+            "-c",
+            &script,
+        ],
+    )?;
+    Ok(tag)
+}
+
+// ---------------------------------------------------------------- tailnet
+
+/// A device on the hub's tailnet, from `tailscale status`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Peer {
+    pub name: String,
+    pub ips: Vec<IpAddr>,
+    pub online: bool,
+    pub os: String,
+    /// The hub itself.
+    pub hub: bool,
+}
+
+pub fn tailnet_peers() -> Vec<Peer> {
+    let Ok(out) = Command::new("tailscale")
+        .args(["status", "--json"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    parse_tailscale_status(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_tailscale_status(s: &str) -> Vec<Peer> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
+        return Vec::new();
+    };
+    let peer = |p: &serde_json::Value, hub: bool| -> Option<Peer> {
+        let name = p["HostName"]
+            .as_str()
+            .filter(|n| !n.is_empty())
+            .or_else(|| p["DNSName"].as_str()?.split('.').next())?
+            .to_string();
+        let ips: Vec<IpAddr> = p["TailscaleIPs"]
+            .as_array()?
+            .iter()
+            .filter_map(|x| x.as_str()?.parse().ok())
+            .collect();
+        Some(Peer {
+            name,
+            ips,
+            online: hub || p["Online"].as_bool().unwrap_or(false),
+            os: p["OS"].as_str().unwrap_or("").to_string(),
+            hub,
+        })
+    };
+    let mut out: Vec<Peer> = v["Peer"]
+        .as_object()
+        .map(|m| m.values().filter_map(|p| peer(p, false)).collect())
+        .unwrap_or_default();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    if let Some(me) = peer(&v["Self"], true) {
+        out.insert(0, me);
+    }
+    out
 }
 
 // ---------------------------------------------------------------- sign-in
@@ -1418,5 +1894,73 @@ mod tests {
             "https://claude.com/cai/oauth/authorize?code=true&state=x"
         );
         assert!(find_login_url("nothing").is_none());
+    }
+
+    #[test]
+    fn chat_titles() {
+        let t = |lines: &[&str]| chat_title(&lines.join("\n"));
+        let user =
+            r#"{"type":"user","message":{"role":"user","content":"fix the   nginx config"}}"#;
+        let meta = r#"{"type":"user","isMeta":true,"message":{"content":"<command-name>/clear</command-name>"}}"#;
+        let blocks =
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"check disk usage"}]}}"#;
+        assert_eq!(t(&[meta, user]).as_deref(), Some("fix the nginx config"));
+        assert_eq!(t(&[blocks]).as_deref(), Some("check disk usage"));
+        let ai = r#"{"type":"ai-title","aiTitle":"Nginx config fix","sessionId":"x"}"#;
+        assert_eq!(t(&[user, ai]).as_deref(), Some("Nginx config fix"));
+        let named = r#"{"type":"custom-title","customTitle":"web server","sessionId":"x"}"#;
+        let renamed = r#"{"type":"custom-title","customTitle":"proxy","sessionId":"x"}"#;
+        assert_eq!(t(&[user, named, ai, renamed]).as_deref(), Some("proxy"));
+        let cleared = r#"{"type":"custom-title","customTitle":"","sessionId":"x"}"#;
+        assert_eq!(
+            t(&[user, named, cleared]).as_deref(),
+            Some("fix the nginx config")
+        );
+        assert_eq!(t(&[meta]), None);
+        assert_eq!(t(&["not json", ""]), None);
+        let long = format!(
+            r#"{{"type":"user","message":{{"content":"{}"}}}}"#,
+            "x".repeat(200)
+        );
+        assert_eq!(t(&[&long]).unwrap().chars().count(), 80);
+    }
+
+    #[test]
+    fn versions_and_release_tags() {
+        assert_eq!(parse_version("v0.4.1"), Some((0, 4, 1)));
+        assert_eq!(parse_version("0.10.0"), Some((0, 10, 0)));
+        assert!(parse_version("v0.10.0") > parse_version("v0.9.9"));
+        assert_eq!(parse_version("v0.4.1-rc1"), None);
+        assert_eq!(parse_version("v0.4"), None);
+        assert_eq!(parse_version("v0.4.1.2"), None);
+        assert_eq!(parse_version("v0.4.1; rm -rf /"), None);
+        assert_eq!(
+            parse_release_tag("https://github.com/frakw/blackthorn/releases/tag/v0.4.0").as_deref(),
+            Some("v0.4.0")
+        );
+        assert_eq!(
+            parse_release_tag("https://github.com/frakw/blackthorn/releases/tag/v1;x"),
+            None
+        );
+        assert_eq!(parse_release_tag(""), None);
+    }
+
+    #[test]
+    fn tailnet_devices() {
+        let status = r#"{
+          "Self": {"HostName": "frakw-blackthorn", "TailscaleIPs": ["100.80.0.6", "fd7a:115c:a1e0::6"], "OS": "linux", "Online": true},
+          "Peer": {
+            "k1": {"HostName": "rosemary", "TailscaleIPs": ["100.80.0.2"], "OS": "macOS", "Online": true},
+            "k2": {"HostName": "", "DNSName": "basil.tail.example.", "TailscaleIPs": ["100.80.0.4"], "OS": "android", "Online": false}
+          }
+        }"#;
+        let p = parse_tailscale_status(status);
+        assert_eq!(p.len(), 3);
+        assert!(p[0].hub && p[0].name == "frakw-blackthorn" && p[0].ips.len() == 2);
+        assert_eq!(p[1].name, "basil");
+        assert!(!p[1].online);
+        assert_eq!(p[2].name, "rosemary");
+        assert_eq!(p[2].ips, vec!["100.80.0.2".parse::<IpAddr>().unwrap()]);
+        assert!(parse_tailscale_status("not json").is_empty());
     }
 }

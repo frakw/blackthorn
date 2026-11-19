@@ -1,19 +1,9 @@
-//! The architecture map as SVG: your devices on top, the hub with its
-//! spaces in the middle, the machines below, with a line from each space to
-//! the machine it works on and dashed lines for bridges.
+//! The architecture map as SVG, drawn like a node editor: your devices, the
+//! hub, its spaces and the machines they work on, left to right, with a
+//! wire from each space to its machine and dashed wires for bridges.
 
-use crate::ops::{HostView, Overview, SpaceView};
+use crate::ops::{Overview, SpaceView};
 use std::fmt::Write as _;
-
-const SW: i32 = 190; // space box
-const SH: i32 = 60;
-const GAP: i32 = 14;
-const PAD: i32 = 12;
-const COL_GAP: i32 = 28;
-const MARGIN: i32 = 24;
-const SPACE_Y: i32 = 112;
-const HOST_Y: i32 = 252;
-const HOST_H: i32 = 60;
 
 pub fn esc(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
@@ -50,13 +40,6 @@ pub fn state_class(state: &str) -> &'static str {
     }
 }
 
-struct Col<'a> {
-    host: &'a HostView,
-    spaces: Vec<&'a SpaceView>,
-    x: i32,
-    w: i32,
-}
-
 /// How you reach this page, from where the web UI listens.
 fn web_path(listen: &[String]) -> &'static str {
     let ips: Vec<std::net::IpAddr> = listen
@@ -75,224 +58,361 @@ fn web_path(listen: &[String]) -> &'static str {
     }
 }
 
+// A node editor: boxes with a title bar, an input port on the left, an
+// output port on the right, and curved wires between them. The layout here
+// is the starting point; the page's script lets you drag nodes, pan and
+// zoom, and remembers where you put them.
+
+const NW: i32 = 230; // node width
+const TITLE: i32 = 28;
+const SLOT_Y: i32 = TITLE + 14; // the ports' row
+const ROW: i32 = 18;
+const GAP_Y: i32 = 26;
+const COLS: [i32; 4] = [40, 330, 620, 910];
+const TOP: i32 = 40;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tone {
+    Dim,
+    Ok,
+    Bad,
+}
+
+struct Node {
+    id: String,
+    kind: &'static str,
+    title: String,
+    dot: Option<&'static str>,
+    href: Option<String>,
+    slot_in: Option<&'static str>,
+    slot_out: Option<&'static str>,
+    rows: Vec<(Tone, String)>,
+    x: i32,
+    y: i32,
+}
+
+impl Node {
+    fn h(&self) -> i32 {
+        SLOT_Y + 10 + self.rows.len() as i32 * ROW + 6
+    }
+}
+
+struct Wire {
+    from: String,
+    to: String,
+    class: &'static str,
+    label: Option<String>,
+}
+
+/// The cubic curve from an output port to an input port.
+pub fn wire_path(x1: i32, y1: i32, x2: i32, y2: i32) -> String {
+    let dx = ((x2 - x1).abs() / 2).max(50);
+    format!("M{x1},{y1} C{},{y1} {},{y2} {x2},{y2}", x1 + dx, x2 - dx)
+}
+
 pub fn svg(o: &Overview) -> String {
-    let mut cols: Vec<Col> = Vec::new();
-    let mut x = MARGIN;
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut wires: Vec<Wire> = Vec::new();
+    let hub = &o.hub;
+
+    let admin = if hub.admin_from.is_empty() {
+        (Tone::Bad, "admin from: anywhere".to_string())
+    } else {
+        (
+            Tone::Dim,
+            clip(
+                &format!(
+                    "admin from: {}",
+                    hub.admin_from
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                34,
+            ),
+        )
+    };
+    nodes.push(Node {
+        id: "devices".into(),
+        kind: "devices",
+        title: "Your devices".into(),
+        dot: None,
+        href: None,
+        slot_in: None,
+        slot_out: Some("connect"),
+        rows: vec![
+            admin,
+            (Tone::Dim, "chats: Remote Control, claude.ai".into()),
+            (
+                Tone::Dim,
+                format!("this page {}", web_path(&hub.web_listen)),
+            ),
+        ],
+        x: COLS[0],
+        y: 0,
+    });
+    nodes.push(Node {
+        id: "hub".into(),
+        kind: "hub",
+        title: format!("{} · hub", clip(&hub.hostname, 22)),
+        dot: None,
+        href: None,
+        slot_in: Some("admin"),
+        slot_out: Some("spaces"),
+        rows: vec![
+            if hub.firewall_loaded {
+                (Tone::Ok, "firewall on".into())
+            } else {
+                (Tone::Bad, "FIREWALL NOT LOADED".into())
+            },
+            match &hub.claude_version {
+                Some(v) => (Tone::Dim, clip(&format!("claude {v}"), 34)),
+                None => (Tone::Dim, "claude: not installed".into()),
+            },
+            match hub.memory_available_mb {
+                Some(m) => (
+                    if m > 300 { Tone::Dim } else { Tone::Bad },
+                    format!("{m} MB memory free"),
+                ),
+                None => (Tone::Dim, String::new()),
+            },
+        ],
+        x: COLS[1],
+        y: 0,
+    });
+    wires.push(Wire {
+        from: "devices".into(),
+        to: "hub".into(),
+        class: "wire",
+        label: None,
+    });
+
+    // Spaces in the third column, grouped by machine; each machine in the
+    // fourth, level with its spaces.
+    let mut sy = TOP;
+    let mut hy = TOP;
     for h in &o.hosts {
         let spaces: Vec<&SpaceView> = o.spaces.iter().filter(|s| s.host == h.name).collect();
-        let n = spaces.len().max(1) as i32;
-        let w = (n * SW + (n - 1) * GAP + 2 * PAD).max(SW + 2 * PAD);
-        cols.push(Col {
-            host: h,
-            spaces,
-            x,
-            w,
-        });
-        x += w + COL_GAP;
-    }
-    let width = (x - COL_GAP + MARGIN).max(560);
-    let height = HOST_Y + HOST_H + 52;
-
-    let mut out = String::new();
-    let _ = write!(
-        out,
-        "<svg class=\"map\" viewBox=\"0 0 {width} {height}\" width=\"{width}\" height=\"{height}\" \
-         role=\"img\" aria-label=\"blackthorn map\" xmlns=\"http://www.w3.org/2000/svg\">"
-    );
-    out.push_str(
-        "<defs><marker id=\"arrow\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" \
-         markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0,0 L10,5 L0,10 z\" \
-         class=\"arrowhead\"/></marker><marker id=\"arrow-b\" viewBox=\"0 0 10 10\" refX=\"9\" \
-         refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto\"><path d=\"M0,0 L10,5 L0,10 z\" \
-         class=\"arrowhead-bridge\"/></marker></defs>",
-    );
-
-    // Your devices.
-    let _ = write!(
-        out,
-        "<rect class=\"devices\" x=\"{MARGIN}\" y=\"12\" width=\"{}\" height=\"34\" rx=\"8\"/>\
-         <text class=\"t-dim\" x=\"{}\" y=\"34\">your phone / laptop · Remote Control via claude.ai · \
-         this page {}</text>",
-        width - 2 * MARGIN,
-        MARGIN + 14,
-        web_path(&o.hub.web_listen)
-    );
-    let _ = write!(
-        out,
-        "<line class=\"link\" x1=\"{c}\" y1=\"46\" x2=\"{c}\" y2=\"70\" marker-end=\"url(#arrow)\"/>",
-        c = width / 2
-    );
-
-    // The hub.
-    let hub_h = SPACE_Y + SH + 22 - 74;
-    let _ = write!(
-        out,
-        "<rect class=\"hub\" x=\"{MARGIN}\" y=\"74\" width=\"{}\" height=\"{hub_h}\" rx=\"10\"/>",
-        width - 2 * MARGIN
-    );
-    let fw = if o.hub.firewall_loaded {
-        "<tspan class=\"t-ok\">firewall on</tspan>"
-    } else {
-        "<tspan class=\"t-bad\">FIREWALL NOT LOADED</tspan>"
-    };
-    let _ = write!(
-        out,
-        "<text class=\"t-strong\" x=\"{}\" y=\"98\">{} <tspan class=\"t-dim\">hub ·</tspan> {fw}</text>",
-        MARGIN + 14,
-        esc(&o.hub.hostname)
-    );
-
-    if cols.is_empty() {
-        let _ = write!(
-            out,
-            "<text class=\"t-dim\" x=\"{}\" y=\"{}\">No machines yet. Add one under Machines, \
-             then create a space on it.</text>",
-            MARGIN + 14,
-            SPACE_Y + 30
-        );
-    }
-
-    // Space positions, for the bridge lines.
-    let mut space_x: Vec<(&str, i32)> = Vec::new();
-    for c in &cols {
-        for (i, s) in c.spaces.iter().enumerate() {
-            space_x.push((s.name.as_str(), c.x + PAD + i as i32 * (SW + GAP) + SW / 2));
-        }
-    }
-    let host_x = |name: &str| -> Option<i32> {
-        cols.iter()
-            .find(|c| c.host.name == name)
-            .map(|c| c.x + c.w / 2)
-    };
-
-    // Lines first, so boxes sit on top of them.
-    for c in &cols {
-        let hx = c.x + c.w / 2;
-        for s in &c.spaces {
-            let sx = space_x
-                .iter()
-                .find(|(n, _)| *n == s.name)
-                .map(|(_, x)| *x)
-                .unwrap_or(hx);
-            let cls = if c.host.blocked { "link cut" } else { "link" };
-            let _ = write!(
-                out,
-                "<path class=\"{cls}\" d=\"M{sx},{} C{sx},{} {hx},{} {hx},{}\" marker-end=\"url(#arrow)\"/>",
-                SPACE_Y + SH,
-                SPACE_Y + SH + 40,
-                HOST_Y - 40,
-                HOST_Y - 2
-            );
-        }
-    }
-    for b in &o.bridges {
-        let (Some(sx), Some(hx)) = (
-            space_x.iter().find(|(n, _)| *n == b.from).map(|(_, x)| *x),
-            host_x(&b.host),
-        ) else {
-            continue;
-        };
-        let _ = write!(
-            out,
-            "<path class=\"bridge\" d=\"M{sx},{} C{sx},{} {hx},{} {hx},{}\" marker-end=\"url(#arrow-b)\"/>",
-            SPACE_Y + SH,
-            SPACE_Y + SH + 60,
-            HOST_Y - 60,
-            HOST_Y - 2
-        );
-        let _ = write!(
-            out,
-            "<text class=\"t-bridge\" x=\"{}\" y=\"{}\" text-anchor=\"middle\">bridge {}</text>",
-            (sx + hx) / 2,
-            (SPACE_Y + SH + HOST_Y) / 2 + 4,
-            esc(&b.remaining)
-        );
-    }
-
-    // Spaces.
-    for c in &cols {
-        if c.spaces.is_empty() {
-            let _ = write!(
-                out,
-                "<text class=\"t-dim\" x=\"{}\" y=\"{}\" text-anchor=\"middle\">no space</text>",
-                c.x + c.w / 2,
-                SPACE_Y + SH / 2 + 4
-            );
-        }
-        for (i, s) in c.spaces.iter().enumerate() {
-            let x = c.x + PAD + i as i32 * (SW + GAP);
+        let first = sy;
+        for s in &spaces {
             let detail = match (s.chats_24h, s.memory_mb) {
                 (Some(n), Some(m)) => format!("{n} chat(s) today · {m} MB"),
                 (Some(n), None) => format!("{n} chat(s) today"),
                 (None, Some(m)) => format!("{m} MB"),
                 (None, None) => String::new(),
             };
+            let reach = if s.agent != crate::config::CLAUDE {
+                "terminal only"
+            } else if s.remote_control {
+                "Remote Control"
+            } else {
+                "local only (no Remote Control)"
+            };
+            let n = Node {
+                id: format!("space:{}", s.name),
+                kind: "space",
+                title: clip(&s.name, 24),
+                dot: Some(state_class(&s.state)),
+                href: Some(format!("/space/{}", crate::webauth::url_encode(&s.name))),
+                slot_in: Some("hub"),
+                slot_out: Some("ssh"),
+                rows: vec![
+                    (Tone::Dim, format!("{} · {}", s.agent, s.state)),
+                    (Tone::Dim, detail),
+                    (Tone::Dim, reach.into()),
+                ],
+                x: COLS[2],
+                y: sy,
+            };
+            sy += n.h() + GAP_Y;
+            nodes.push(n);
+            wires.push(Wire {
+                from: "hub".into(),
+                to: format!("space:{}", s.name),
+                class: "wire",
+                label: None,
+            });
+            wires.push(Wire {
+                from: format!("space:{}", s.name),
+                to: format!("host:{}", h.name),
+                class: if h.blocked { "wire cut" } else { "wire" },
+                label: None,
+            });
+        }
+        let node = Node {
+            id: format!("host:{}", h.name),
+            kind: "host",
+            title: clip(&h.name, 24),
+            dot: None,
+            href: Some(format!("/host/{}", crate::webauth::url_encode(&h.name))),
+            slot_in: Some("ssh"),
+            slot_out: None,
+            rows: vec![
+                (Tone::Dim, clip(&format!("{}@{}", h.user, h.address), 34)),
+                (Tone::Dim, h.os.to_string()),
+                if h.blocked {
+                    (Tone::Bad, clip(&h.status, 34))
+                } else if spaces.is_empty() {
+                    (Tone::Dim, "no space yet".into())
+                } else {
+                    (Tone::Ok, clip(&h.status, 34))
+                },
+            ],
+            x: COLS[3],
+            y: 0,
+        };
+        let height = node.h();
+        let centre = if spaces.is_empty() {
+            hy
+        } else {
+            (first + sy - GAP_Y) / 2 - height / 2
+        };
+        let y = centre.max(hy);
+        hy = y + height + GAP_Y;
+        // The next machine's spaces start below this machine.
+        sy = sy.max(hy);
+        nodes.push(Node { y, ..node });
+    }
+    for b in &o.bridges {
+        wires.push(Wire {
+            from: format!("space:{}", b.from),
+            to: format!("host:{}", b.host),
+            class: "wire bridge",
+            label: Some(format!("bridge {}", b.remaining)),
+        });
+    }
+
+    let bottom = nodes
+        .iter()
+        .map(|n| n.y + n.h())
+        .max()
+        .unwrap_or(0)
+        .max(220);
+    // The devices and the hub halfway down.
+    for n in nodes.iter_mut().take(2) {
+        n.y = ((bottom + TOP) / 2 - n.h() / 2).max(TOP);
+    }
+    let width = COLS[3] + NW + 40;
+    let height = bottom + 40;
+
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "<svg class=\"map graph\" viewBox=\"0 0 {width} {height}\" width=\"{width}\" height=\"{height}\" \
+         role=\"img\" aria-label=\"blackthorn map\" xmlns=\"http://www.w3.org/2000/svg\">\
+         <defs><pattern id=\"grid\" width=\"24\" height=\"24\" patternUnits=\"userSpaceOnUse\">\
+         <circle class=\"grid-dot\" cx=\"1\" cy=\"1\" r=\"1.1\"/></pattern></defs>\
+         <rect class=\"grid-bg\" x=\"-20000\" y=\"-20000\" width=\"40000\" height=\"40000\" fill=\"url(#grid)\"/>"
+    );
+
+    // Wires under the nodes.
+    let find = |id: &str| nodes.iter().find(|n| n.id == id);
+    out.push_str("<g class=\"wires\">");
+    for w in &wires {
+        let (Some(a), Some(b)) = (find(&w.from), find(&w.to)) else {
+            continue;
+        };
+        let (x1, y1, x2, y2) = (a.x + NW, a.y + SLOT_Y, b.x, b.y + SLOT_Y);
+        let _ = write!(
+            out,
+            "<path class=\"{}\" data-from=\"{}\" data-to=\"{}\" d=\"{}\"/>",
+            w.class,
+            esc(&w.from),
+            esc(&w.to),
+            wire_path(x1, y1, x2, y2)
+        );
+        if let Some(l) = &w.label {
             let _ = write!(
                 out,
-                "<a href=\"/space/{n}\"><g class=\"space\"><rect x=\"{x}\" y=\"{SPACE_Y}\" width=\"{SW}\" \
-                 height=\"{SH}\" rx=\"8\"/><circle class=\"dot {cls}\" cx=\"{}\" cy=\"{}\" r=\"5\"/>\
-                 <text class=\"t-strong\" x=\"{}\" y=\"{}\">{name}</text>\
-                 <text class=\"t-dim\" x=\"{}\" y=\"{}\">{agent} · {state}</text>\
-                 <text class=\"t-dim\" x=\"{}\" y=\"{}\">{detail}</text></g></a>",
-                x + 14,
-                SPACE_Y + 19,
-                x + 26,
-                SPACE_Y + 23,
-                x + 12,
-                SPACE_Y + 40,
-                x + 12,
-                SPACE_Y + 54,
-                n = crate::webauth::url_encode(&s.name),
-                cls = state_class(&s.state),
-                name = esc(&clip(&s.name, 22)),
-                agent = esc(&s.agent),
-                state = esc(&s.state),
-                detail = esc(&detail),
+                "<text class=\"wire-label\" data-from=\"{}\" data-to=\"{}\" x=\"{}\" y=\"{}\" \
+                 text-anchor=\"middle\">{}</text>",
+                esc(&w.from),
+                esc(&w.to),
+                (x1 + x2) / 2,
+                (y1 + y2) / 2 - 6,
+                esc(l)
             );
         }
     }
+    out.push_str("</g>");
 
-    let _ = write!(
-        out,
-        "<text class=\"t-dim\" x=\"{}\" y=\"{}\">outbound SSH only ↓</text>",
-        MARGIN + 4,
-        HOST_Y - 16
-    );
-
-    // Machines.
-    for c in &cols {
-        let h = c.host;
-        let cls = if h.blocked { "host blocked" } else { "host" };
-        let x = c.x + PAD / 2;
-        let w = c.w - PAD;
+    for n in &nodes {
+        let h = n.h();
         let _ = write!(
             out,
-            "<a href=\"/host/{n}\"><g class=\"{cls}\"><rect x=\"{x}\" y=\"{HOST_Y}\" width=\"{w}\" \
-             height=\"{HOST_H}\" rx=\"8\"/>\
-             <text class=\"t-strong\" x=\"{}\" y=\"{}\">{name}</text>\
-             <text class=\"t-dim\" x=\"{}\" y=\"{}\">{user}@{addr} · {os}</text>\
-             <text class=\"{scls}\" x=\"{}\" y=\"{}\">{status}</text></g></a>",
-            x + 12,
-            HOST_Y + 21,
-            x + 12,
-            HOST_Y + 38,
-            x + 12,
-            HOST_Y + 53,
-            n = crate::webauth::url_encode(&h.name),
-            name = esc(&h.name),
-            user = esc(&h.user),
-            addr = h.address,
-            os = h.os,
-            scls = if h.blocked { "t-bad" } else { "t-dim" },
-            status = esc(&clip(&h.status, (w / 7).max(10) as usize)),
+            "<g class=\"node kind-{}\" data-node=\"{}\" data-w=\"{NW}\" transform=\"translate({},{})\">\
+             <rect class=\"node-body\" width=\"{NW}\" height=\"{h}\" rx=\"8\"/>\
+             <path class=\"node-title\" d=\"M0,8 a8,8 0 0 1 8,-8 h{} a8,8 0 0 1 8,8 v{} h-{NW} z\"/>",
+            n.kind,
+            esc(&n.id),
+            n.x,
+            n.y,
+            NW - 16,
+            TITLE - 8,
+        );
+        let mut tx = 12;
+        if let Some(cls) = n.dot {
+            let _ = write!(
+                out,
+                "<circle class=\"dot {cls}\" cx=\"17\" cy=\"{}\" r=\"5\"/>",
+                TITLE / 2
+            );
+            tx = 28;
+        }
+        let name = format!(
+            "<text class=\"node-name\" x=\"{tx}\" y=\"{}\">{}</text>",
+            TITLE / 2 + 5,
+            esc(&n.title)
+        );
+        match &n.href {
+            Some(href) => {
+                let _ = write!(out, "<a href=\"{}\">{name}</a>", esc(href));
+            }
+            None => out.push_str(&name),
+        }
+        if let Some(l) = n.slot_in {
+            let _ = write!(
+                out,
+                "<circle class=\"port\" cx=\"0\" cy=\"{SLOT_Y}\" r=\"5\"/>\
+                 <text class=\"slot\" x=\"12\" y=\"{}\">{l}</text>",
+                SLOT_Y + 4
+            );
+        }
+        if let Some(l) = n.slot_out {
+            let _ = write!(
+                out,
+                "<circle class=\"port\" cx=\"{NW}\" cy=\"{SLOT_Y}\" r=\"5\"/>\
+                 <text class=\"slot\" x=\"{}\" y=\"{}\" text-anchor=\"end\">{l}</text>",
+                NW - 12,
+                SLOT_Y + 4
+            );
+        }
+        for (i, (tone, text)) in n.rows.iter().enumerate() {
+            let cls = match tone {
+                Tone::Dim => "t-dim",
+                Tone::Ok => "t-ok",
+                Tone::Bad => "t-bad",
+            };
+            let _ = write!(
+                out,
+                "<text class=\"{cls}\" x=\"12\" y=\"{}\">{}</text>",
+                SLOT_Y + 14 + (i as i32 + 1) * ROW - 4,
+                esc(text)
+            );
+        }
+        out.push_str("</g>");
+    }
+
+    if o.hosts.is_empty() {
+        let _ = write!(
+            out,
+            "<text class=\"t-dim\" x=\"{}\" y=\"{}\">No machines yet: add one under Machines, \
+             then create a space on it.</text>",
+            COLS[2],
+            TOP + 20
         );
     }
-    let _ = write!(
-        out,
-        "<text class=\"t-dim\" x=\"{}\" y=\"{}\">machines cannot connect to the hub</text>",
-        MARGIN + 4,
-        HOST_Y + HOST_H + 26
-    );
     out.push_str("</svg>");
     out
 }
@@ -313,7 +433,7 @@ mod tests {
         assert_eq!(web_path(&l(&["192.168.10.106:7180"])), "over your network");
         assert_eq!(web_path(&l(&["100.128.0.1:7180"])), "over your network");
     }
-    use crate::ops::{BridgeView, HubView};
+    use crate::ops::{BridgeView, HostView, HubView};
     use crate::state::{Mode, Os};
 
     fn overview() -> Overview {
@@ -336,6 +456,7 @@ mod tests {
             host: h.into(),
             agent: "claude".into(),
             mode: Mode::Server,
+            remote_control: n != "fig-aider",
             rc_name: n.into(),
             state: st.into(),
             memory_mb: Some(300),
@@ -372,18 +493,60 @@ mod tests {
     }
 
     #[test]
-    fn draws_every_space_host_and_bridge() {
+    fn draws_every_node_and_wire() {
         let s = svg(&overview());
-        assert!(s.starts_with("<svg"));
+        assert!(s.starts_with("<svg class=\"map graph\""));
         assert!(s.ends_with("</svg>"));
-        assert_eq!(s.matches("class=\"space\"").count(), 3);
-        assert_eq!(s.matches("<g class=\"host").count(), 3);
-        assert!(s.contains("class=\"host blocked\""));
-        assert!(s.contains("class=\"link cut\""));
-        assert!(s.contains("class=\"bridge\""));
+        assert_eq!(s.matches("class=\"node kind-space\"").count(), 3);
+        assert_eq!(s.matches("class=\"node kind-host\"").count(), 3);
+        assert_eq!(s.matches("class=\"node kind-hub\"").count(), 1);
+        assert_eq!(s.matches("class=\"node kind-devices\"").count(), 1);
+        // devices->hub, hub->3 spaces, 3 spaces->their machines, 1 bridge.
+        assert_eq!(s.matches("<path class=\"wire").count(), 8);
+        assert!(
+            s.contains("class=\"wire cut\" data-from=\"space:nas-&lt;x&gt;\" data-to=\"host:nas\"")
+        );
+        assert!(
+            s.contains("class=\"wire bridge\" data-from=\"space:fig-claude\" data-to=\"host:nas\"")
+        );
         assert!(s.contains("bridge for 52m"));
-        assert!(s.contains("no space"), "pine has none");
+        assert!(s.contains("no space yet"), "pine has none");
         assert!(s.contains("href=\"/space/fig-claude\""));
+        assert!(s.contains("local only"), "fig-aider has Remote Control off");
+        assert!(s.contains("admin from: anywhere"));
+    }
+
+    #[test]
+    fn nodes_do_not_overlap_in_a_column() {
+        let s = svg(&overview());
+        let mut boxes: Vec<(i32, i32, i32)> = Vec::new(); // x, y, height
+        for part in s.split("<g class=\"node ").skip(1) {
+            let t = &part[part.find("translate(").unwrap() + 10..];
+            let (x, rest) = t.split_once(',').unwrap();
+            let y = rest.split(')').next().unwrap();
+            let h = part
+                .split("height=\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap();
+            boxes.push((x.parse().unwrap(), y.parse().unwrap(), h.parse().unwrap()));
+        }
+        assert_eq!(boxes.len(), 8);
+        for (i, a) in boxes.iter().enumerate() {
+            for b in &boxes[i + 1..] {
+                if a.0 == b.0 {
+                    assert!(a.1 + a.2 <= b.1 || b.1 + b.2 <= a.1, "{a:?} overlaps {b:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wires_curve_from_port_to_port() {
+        assert_eq!(wire_path(0, 10, 300, 50), "M0,10 C150,10 150,50 300,50");
+        assert_eq!(wire_path(0, 0, 40, 0), "M0,0 C50,0 -10,0 40,0");
     }
 
     #[test]

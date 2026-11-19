@@ -102,7 +102,7 @@ fn add_account(name: &str, totp_secret: Option<String>, input: &mut Input) -> Re
         },
     );
     users.save(users_path())?;
-    print_recovery(&recovery);
+    print_recovery(&recovery, input)?;
     if sys::unit_state(units::WEB) == "active" {
         println!("account {name} added; log in to the web UI with it");
     } else {
@@ -151,7 +151,7 @@ pub fn user_totp_reset(name: &str) -> Result<()> {
     u.last_step = step;
     users.save(users_path())?;
     let _ = sys::systemctl(&["try-restart", units::API]);
-    print_recovery(&recovery);
+    print_recovery(&recovery, &mut input)?;
     println!("new authenticator set for {name}; existing logins ended");
     Ok(())
 }
@@ -192,12 +192,21 @@ fn hash_codes(codes: &[String]) -> Result<Vec<String>> {
     codes.iter().map(|c| webauth::hash_password(c)).collect()
 }
 
-fn print_recovery(codes: &[String]) {
+/// Prints the recovery codes. At a terminal, waits until they are written
+/// down, then clears the screen and its scrollback, so neither they nor the
+/// QR code above stay in the terminal's history.
+fn print_recovery(codes: &[String], input: &mut Input) -> Result<()> {
     println!("\nRecovery codes (each works once instead of a TOTP code; keep them offline):");
     for c in codes {
         println!("  {c}");
     }
     println!();
+    if input.interactive {
+        input.line("Press Enter once you have written them down (the screen is then cleared): ")?;
+        print!("\x1b[H\x1b[2J\x1b[3J");
+        println!("Cleared the QR code and the recovery codes from this terminal.");
+    }
+    Ok(())
 }
 
 /// Reads answers from the terminal (without echo for passwords), or line by

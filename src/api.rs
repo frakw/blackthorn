@@ -154,6 +154,44 @@ pub enum Op {
         changes: Vec<(String, String)>,
         code: String,
     },
+    TailnetPeers,
+    ChatList {
+        name: String,
+    },
+    ChatRename {
+        name: String,
+        id: String,
+        title: String,
+    },
+    ChatRm {
+        name: String,
+        id: String,
+    },
+    SpaceRemote {
+        name: String,
+        on: bool,
+    },
+    UpdateCheck {
+        refresh: bool,
+    },
+    Update {
+        code: String,
+    },
+    /// The logged-in account.
+    Account,
+    AccountPassword {
+        current: String,
+        new: String,
+        code: String,
+    },
+    /// A new authenticator secret to scan; it replaces the old one only
+    /// once AccountTotpFinish gets a code made from it.
+    AccountTotpBegin {
+        code: String,
+    },
+    AccountTotpFinish {
+        code: String,
+    },
 }
 
 impl Op {
@@ -175,6 +213,10 @@ impl Op {
                 | Op::SpaceScreen { .. }
                 | Op::HostPubkey { .. }
                 | Op::ConfigShow
+                | Op::TailnetPeers
+                | Op::ChatList { .. }
+                | Op::UpdateCheck { .. }
+                | Op::Account
         )
     }
 
@@ -186,7 +228,10 @@ impl Op {
             | Op::HostRm { code, .. }
             | Op::HostRescanConfirm { code, .. }
             | Op::HostMove { code, .. }
-            | Op::ConfigSet { code, .. } => Some(code),
+            | Op::ConfigSet { code, .. }
+            | Op::Update { code, .. }
+            | Op::AccountPassword { code, .. }
+            | Op::AccountTotpBegin { code } => Some(code),
             _ => None,
         }
     }
@@ -215,7 +260,14 @@ struct Server {
     failures: HashMap<String, (u32, u64)>,
     /// `claude --version` is slow; cache it.
     claude_version: Option<(u64, Option<String>)>,
+    /// Asking GitHub for the latest release, at most every few hours.
+    update: Option<(u64, ops::UpdateInfo)>,
+    /// Authenticator secrets being set up, per account.
+    pending_totp: HashMap<String, (String, u64)>,
 }
+
+const UPDATE_EVERY: u64 = 6 * 3600;
+const PENDING_TOTP: u64 = 10 * 60;
 
 pub fn serve() -> Result<()> {
     sys::require_root()?;
@@ -604,6 +656,96 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
             ..
         } => json(ops::host_move(&name, &target, port, &keys, client)?),
         Op::ConfigShow => json(ops::config_show()?),
+        Op::TailnetPeers => json(ops::tailnet_peers()),
+        Op::ChatList { name } => json(ops::chat_list(&name)?),
+        Op::ChatRename { name, id, title } => json(ops::chat_rename(&name, &id, &title)?),
+        Op::ChatRm { name, id } => json(ops::chat_rm(&name, &id)?),
+        Op::SpaceRemote { name, on } => json(ops::space_set_remote(&name, on)?),
+        Op::UpdateCheck { refresh } => {
+            let cached = {
+                let s = server.lock().expect("lock");
+                s.update.clone().filter(|(t, u)| {
+                    let ttl = if u.error.is_some() { 600 } else { UPDATE_EVERY };
+                    !refresh && now.saturating_sub(*t) < ttl
+                })
+            };
+            let mut info = match cached {
+                Some((_, u)) => u,
+                None => {
+                    let u = ops::update_check();
+                    server.lock().expect("lock").update = Some((now, u.clone()));
+                    u
+                }
+            };
+            info.running = matches!(
+                sys::unit_state(ops::UPDATE_UNIT).as_str(),
+                "active" | "activating"
+            );
+            json(info)
+        }
+        Op::Update { .. } => {
+            let tag = ops::update_start()?;
+            server.lock().expect("lock").update = None;
+            json(tag)
+        }
+        Op::Account => {
+            let users = Users::load(Path::new(paths::WEB_USERS_FILE))?;
+            let u = users.users.get(user).context("account removed")?;
+            json(serde_json::json!({ "user": user, "recovery_left": u.recovery.len() }))
+        }
+        Op::AccountPassword { current, new, .. } => {
+            let path = Path::new(paths::WEB_USERS_FILE);
+            let mut users = Users::load(path)?;
+            let u = users.users.get_mut(user).context("account removed")?;
+            if !webauth::verify_password(&current, &u.password) {
+                bail!("the current password is wrong");
+            }
+            webauth::check_password_strength(&new)?;
+            u.password = webauth::hash_password(&new)?;
+            users.save(path)?;
+            end_other_sessions(server, user, req.token.as_deref());
+            json("password changed; your other logins ended")
+        }
+        Op::AccountTotpBegin { .. } => {
+            let secret = webauth::new_secret();
+            let uri = webauth::otpauth_uri(user, &sys::hostname(), &secret);
+            let qr = webauth::qr_svg(&uri)?;
+            server
+                .lock()
+                .expect("lock")
+                .pending_totp
+                .insert(user.to_string(), (secret.clone(), now));
+            json(serde_json::json!({ "secret": secret, "qr": qr }))
+        }
+        Op::AccountTotpFinish { code } => {
+            let pending = server
+                .lock()
+                .expect("lock")
+                .pending_totp
+                .get(user)
+                .filter(|(_, t)| now - t < PENDING_TOTP)
+                .cloned();
+            let Some((secret, _)) = pending else {
+                bail!("start again: the new authenticator was not confirmed within 10 minutes");
+            };
+            let Some(step) = webauth::verify_totp(&secret, &code, now, 0) else {
+                bail!("that code does not match the new authenticator; check the phone's clock and try again");
+            };
+            let codes = webauth::new_recovery_codes();
+            let path = Path::new(paths::WEB_USERS_FILE);
+            let mut users = Users::load(path)?;
+            let u = users.users.get_mut(user).context("account removed")?;
+            u.totp_secret = secret;
+            u.last_step = step;
+            u.recovery = codes
+                .iter()
+                .map(|c| webauth::hash_password(c))
+                .collect::<Result<_>>()?;
+            users.save(path)?;
+            server.lock().expect("lock").pending_totp.remove(user);
+            end_other_sessions(server, user, req.token.as_deref());
+            json(codes)
+        }
         Op::ConfigSet { changes, .. } => {
             let r = ops::config_set(&changes, client, true)?;
             if r.web_moved.is_some() {
@@ -616,6 +758,16 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
             json(r)
         }
     }
+}
+
+/// After a password or authenticator change: every login of `user` but
+/// this one ends.
+fn end_other_sessions(server: &Mutex<Server>, user: &str, keep: Option<&str>) {
+    server
+        .lock()
+        .expect("lock")
+        .sessions
+        .retain(|t, s| s.user != user || Some(t.as_str()) == keep);
 }
 
 /// One example of every operation, for the test that the CLI offers each.
@@ -717,6 +869,28 @@ pub fn all_op_names() -> Vec<String> {
             changes: vec![],
             code: s(),
         },
+        Op::TailnetPeers,
+        Op::ChatList { name: s() },
+        Op::ChatRename {
+            name: s(),
+            id: s(),
+            title: s(),
+        },
+        Op::ChatRm { name: s(), id: s() },
+        Op::SpaceRemote {
+            name: s(),
+            on: true,
+        },
+        Op::UpdateCheck { refresh: false },
+        Op::Update { code: s() },
+        Op::Account,
+        Op::AccountPassword {
+            current: s(),
+            new: s(),
+            code: s(),
+        },
+        Op::AccountTotpBegin { code: s() },
+        Op::AccountTotpFinish { code: s() },
     ];
     for op in &all {
         match op {
@@ -748,7 +922,18 @@ pub fn all_op_names() -> Vec<String> {
             | Op::HostMoveScan { .. }
             | Op::HostMove { .. }
             | Op::ConfigShow
-            | Op::ConfigSet { .. } => {}
+            | Op::ConfigSet { .. }
+            | Op::TailnetPeers
+            | Op::ChatList { .. }
+            | Op::ChatRename { .. }
+            | Op::ChatRm { .. }
+            | Op::SpaceRemote { .. }
+            | Op::UpdateCheck { .. }
+            | Op::Update { .. }
+            | Op::Account
+            | Op::AccountPassword { .. }
+            | Op::AccountTotpBegin { .. }
+            | Op::AccountTotpFinish { .. } => {}
         }
     }
     all.iter().map(Op::name).collect()
