@@ -1297,6 +1297,7 @@ mod tests {
         let local = [ip("127.0.0.1"), ip("100.64.0.10")];
         let me = Some(ip("100.64.0.2"));
         let mut cfg = Config::default();
+        cfg.web.listen = vec!["0.0.0.0:7180".parse().unwrap()];
         assert!(check_settings(&cfg, &state, me, true, &local).is_ok());
         cfg.inbound.admin_from = vec![ip("100.64.0.5")];
         let e = check_settings(&cfg, &state, me, true, &local).unwrap_err();
