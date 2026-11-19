@@ -2,6 +2,16 @@
 (function () {
   "use strict";
 
+  // A poll that was sent to the login page means the session ended: go
+  // there, rather than showing the login page's HTML as data.
+  var loggedOut = function (r) {
+    if (r.redirected && new URL(r.url).pathname === "/login") {
+      window.location.assign("/login");
+      return true;
+    }
+    return false;
+  };
+
   // Ask before destructive forms.
   document.querySelectorAll("form[data-confirm]").forEach(function (f) {
     f.addEventListener("submit", function (e) {
@@ -15,7 +25,7 @@
     setInterval(function () {
       if (document.hidden) return;
       fetch(map.getAttribute("data-refresh"), { credentials: "same-origin" })
-        .then(function (r) { return r.ok ? r.text() : null; })
+        .then(function (r) { return r.ok && !loggedOut(r) ? r.text() : null; })
         .then(function (svg) {
           if (svg && svg.indexOf("<svg") === 0) map.innerHTML = svg;
         })
@@ -29,8 +39,9 @@
     var refresh = function () {
       if (document.hidden) return;
       fetch(screen.getAttribute("data-src"), { credentials: "same-origin" })
-        .then(function (r) { return r.text(); })
+        .then(function (r) { return r.ok && !loggedOut(r) ? r.text() : null; })
         .then(function (t) {
+          if (t === null) return;
           var atBottom = screen.scrollHeight - screen.scrollTop - screen.clientHeight < 30;
           screen.textContent = t.replace(/\s+$/, "");
           if (atBottom) screen.scrollTop = screen.scrollHeight;
