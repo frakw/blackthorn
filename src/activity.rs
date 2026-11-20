@@ -39,7 +39,17 @@ impl Entry {
         if w.next() != Some("ssh") {
             return None;
         }
-        w.find(|a| !a.starts_with('-'))
+        // Options that take a value (`-o BatchMode=yes`, `-p 22`).
+        while let Some(a) = w.next() {
+            match a.strip_prefix('-') {
+                Some(o) if o.len() == 1 && "bcDEeFIiJLlmOopQRSWw".contains(o) => {
+                    w.next();
+                }
+                Some(_) => {}
+                None => return Some(a),
+            }
+        }
+        None
     }
 }
 
