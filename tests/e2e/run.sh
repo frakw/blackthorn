@@ -415,6 +415,65 @@ expect_reach 20 t2-claude t2 ok
 for _ in $(seq 20); do tcp_open "$P-admin" "$HUB" 7180 && break; sleep 1; done
 admin curl -s -o /dev/null -w '%{http_code}' "http://$HUB:7180/login" | grep -q 200 && ok "web UI back after reboot" || fail "web UI back after reboot"
 
+say "a read-only login on t1; admin spaces run for a time"
+out=$(thorn host readonly t1 --print 2>/dev/null | docker exec -i "$P-t1" sh 2>&1)
+echo "$out" | grep -q "bt: done" && ok "the printed setup script ran on t1" || fail "setup script: $out"
+thorn host readonly t1 --verify | grep -q "has a read-only login: blackthorn" && ok "thorn host readonly --verify" || fail "readonly verify"
+thorn host ls | grep -q "blackthorn" && ok "host ls shows the read-only login" || fail "host ls"
+docker exec "$P-t1" grep -q 'command="/usr/local/libexec/blackthorn-ssh"' /home/alice/.ssh/authorized_keys && ok "the admin key logs its commands on t1 too" || fail "admin key line"
+[ "$(docker exec "$P-t1" stat -c %U /home/blackthorn/.ssh/authorized_keys)" = root ] && ok "the read-only user cannot change its own key line" || fail "ro key file owner"
+[ "$(hub systemctl is-enabled "blackthorn-space@$k1.service")" = disabled ] && ok "t1-main (admin) no longer starts at boot" || fail "admin space still enabled"
+thorn new t1 --name t1-ro | grep -q "read-only" && ok "new spaces on t1 are read-only" || fail "new read-only space"
+echo good-code | thorni login t1-ro >/dev/null
+kr=$(key_of t1-ro)
+hub grep -q "User blackthorn" "/var/lib/blackthorn/spaces/$kr/.ssh/config" && ok "t1-ro logs in as blackthorn" || fail "ro ssh config"
+hub grep -q "read-only" "/var/lib/blackthorn/spaces/$kr/t1-ro/CLAUDE.md" && ok "and its instructions say so" || fail "ro CLAUDE.md"
+expect_reach 30 t1-ro t1 ok
+want=$(hub cut -d' ' -f2 /etc/blackthorn/keys/t1.ro.pub)
+got=$(hub env SSH_AUTH_SOCK="/run/blackthorn-agent/$kr/agent.sock" ssh-add -L | cut -d' ' -f2)
+[ "$got" = "$want" ] && ok "its agent holds only the read-only key" || fail "ro agent keys: $got"
+[ "$(hub runuser -u "bt-$kr" -- ssh t1 id -un 2>/dev/null)" = blackthorn ] && ok "ssh t1 is the read-only user" || fail "ro login"
+if hub runuser -u "bt-$kr" -- ssh t1 'touch /root/x' 2>/dev/null; then fail "the read-only space wrote as root"; else ok "it cannot write where root can"; fi
+thorn stop t1-main >/dev/null
+thorn start t1-main --for 1m | grep -q "as admin until" && ok "an admin space starts for a time" || fail "start --for"
+thorn new t1 --access admin --name t1-adm2 >/dev/null
+echo good-code | thorni login t1-adm2 | grep -q "start it when you need it" && ok "a new admin space waits to be started" || fail "admin login"
+thorn start t1-adm2 --for 1h 2>&1 | grep -q "already working on t1 as admin" && ok "one admin space per machine at a time" || fail "second admin space started"
+# The reboot ended the web session: log in again.
+web_post /login --data-urlencode "user=frakw" --data-urlencode "password=$PASSWORD" --data-urlencode "code=$(fresh_code $WEB_SECRET)" >/dev/null
+C=$(csrf)
+r=$(web_post /space/t1-adm2/start --data-urlencode "csrf=$C")
+case "$r" in *"limited"*) ok "the web's plain Start will not start an admin space";; *) fail "web start: $r";; esac
+thorn access t1-adm2 readonly | grep -q "now read-only" && ok "thorn access" || fail "access change"
+thorn rm t1-adm2 --purge >/dev/null
+web_get /host/t1 | grep -q "Read-only login" && ok "the machine page shows the read-only login" || fail "host page"
+web_get /map.svg | grep -q 'class="wire ro"' && ok "the map draws read-only logins" || fail "map ro wire"
+
+say "what a space did: its commands, recorded by root"
+d="/var/lib/blackthorn/spaces/$kr/.claude/projects/-var-lib-blackthorn-spaces-$kr-t1-ro"
+cid=6c3d2e1f-1111-4222-8333-444455556666
+hubi runuser -u "bt-$kr" -- sh -c "mkdir -p '$d' && cat > '$d/$cid.jsonl'" <<'JSONL'
+{"type":"user","message":{"role":"user","content":"how full is the disk?"}}
+{"type":"assistant","timestamp":"2026-11-20T08:00:05.120Z","message":{"content":[{"type":"tool_use","id":"x1","name":"Bash","input":{"command":"ssh t1 'df -h /'"}}]}}
+JSONL
+thorn _tick >/dev/null 2>&1
+thorn log t1-ro | grep -q "ssh t1 'df -h /'" && ok "thorn log lists the command" || fail "thorn log: $(thorn log t1-ro)"
+[ "$(hub stat -c %U "/var/log/blackthorn/$kr.log")" = root ] && ok "kept in a root-owned log" || fail "log owner"
+web_get /space/t1-ro | grep -q "df -h /" && ok "the space page shows it under Activity" || fail "activity card"
+hubi runuser -u "bt-$kr" -- sh -c "echo '{}' > '$d/$cid.jsonl'"
+thorn _tick >/dev/null 2>&1
+thorn log t1-ro | grep -q "NOTE: transcript got shorter" && ok "a transcript that shrinks is noted" || fail "shrink note"
+thorn log t1-ro | grep -q "df -h" && ok "and what it held stays in the log" || fail "log kept"
+
+say "a new chat with a name"
+thorn chat new t2-claude --name "disk check" >/dev/null
+sleep 3
+hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args" | grep -q -- "--name disk check" && ok "the new chat starts with its name" || fail "chat name: $(hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args")"
+
+echo "   waiting for t1-main's admin time to run out (tick runs every minute)..."
+for _ in $(seq 75); do [ "$(hub systemctl is-active "blackthorn-space@$k1.service")" != active ] && break; sleep 2; done
+[ "$(hub systemctl is-active "blackthorn-space@$k1.service")" != active ] && ok "the admin space stopped by itself when its time was up" || fail "admin time limit"
+
 say "remove a space"
 thorn rm t2-claude >/dev/null
 hub id "bt-$k2" >/dev/null 2>&1 && fail "user bt-$k2 still exists" || ok "t2-claude's user removed"

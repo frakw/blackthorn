@@ -1,11 +1,15 @@
-//! The architecture map as SVG, drawn like a node editor: your devices on
-//! the left; this hub (blackthorn and its spaces) in one frame; the Claude
-//! app and the models a space uses in the cloud's frame; the machines the
-//! spaces work on to the right. Dashed wires are bridges (amber) and blocks
-//! (red).
+//! The architecture map as SVG, drawn like a node editor. Bands from top
+//! to bottom: the AI company's cloud (the Claude app, the API the agents
+//! call); your tailnet (its coordination server, your devices, this hub with
+//! blackthorn and its spaces, the machines on the tailnet); your LAN (its
+//! router, the machines on it). Arrows point the way commands go. Dashed
+//! wires are bridges (amber) and blocks (red); dotted ones are services a
+//! space uses.
 
-use crate::ops::{Overview, SpaceView};
+use crate::ops::{HostView, Overview, SpaceView};
+use crate::state::Access;
 use std::fmt::Write as _;
+use std::net::IpAddr;
 
 pub fn esc(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
@@ -42,6 +46,22 @@ pub fn state_class(state: &str) -> &'static str {
     }
 }
 
+/// A tailnet address (Tailscale's CGNAT range, or its IPv6 prefix).
+pub fn is_tailnet(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => v.octets()[0] == 100 && (v.octets()[1] & 0xc0) == 64,
+        IpAddr::V6(v) => v.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+    }
+}
+
+/// A private (LAN) address.
+pub fn is_lan(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => v.is_private() || v.is_link_local(),
+        IpAddr::V6(v) => !is_tailnet(ip) && (v.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
 /// How you reach this page, from where the web UI listens.
 fn web_path(listen: &[String]) -> &'static str {
     let ips: Vec<std::net::IpAddr> = listen
@@ -49,11 +69,7 @@ fn web_path(listen: &[String]) -> &'static str {
         .filter_map(|a| a.parse::<std::net::SocketAddr>().ok())
         .map(|a| a.ip())
         .collect();
-    let tailnet = |ip: &std::net::IpAddr| match ip {
-        std::net::IpAddr::V4(v) => v.octets()[0] == 100 && (v.octets()[1] & 0xc0) == 64,
-        std::net::IpAddr::V6(v) => v.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
-    };
-    if !ips.is_empty() && ips.iter().all(tailnet) {
+    if !ips.is_empty() && ips.iter().all(is_tailnet) {
         "over the tailnet"
     } else {
         "over your network"
@@ -61,11 +77,11 @@ fn web_path(listen: &[String]) -> &'static str {
 }
 
 // A node editor: boxes with a title bar, input ports on the left, output
-// ports on the right, and curved wires between them. Frames group the nodes
-// that run on one machine (this hub) or in one company's cloud. Arrows show
-// who opens the connection. The layout here is the starting point; the
-// page's script lets you drag nodes, pan and zoom, and remembers where you
-// put them.
+// ports on the right, and curved wires between them. Frames group what runs
+// in one place (a company's cloud, this hub) or on one network (the
+// tailnet, the LAN); a frame inside another is drawn with more padding. The
+// layout here is the starting point; the page's script lets you drag nodes,
+// pan and zoom, and remembers where you put them.
 
 const NW: i32 = 230; // node width
 const TITLE: i32 = 28;
@@ -76,7 +92,9 @@ const GAP_Y: i32 = 26;
 const COLS: [i32; 4] = [40, 330, 620, 910];
 const TOP: i32 = 40;
 const PAD: i32 = 16; // frame padding
+const OUTER: i32 = 34; // padding of a frame around a frame
 const FRAME_TITLE: i32 = 26;
+const BAND_GAP: i32 = 40; // between the cloud, tailnet and LAN bands
 const ICONS: i32 = 26; // the devices' icon row
 
 #[derive(Clone, Copy, PartialEq)]
@@ -113,36 +131,36 @@ impl Node {
     fn h(&self) -> i32 {
         self.body_y() + self.rows.len() as i32 * ROW + 6
     }
+
+    fn port_in(&self, name: &str) -> usize {
+        self.ins.iter().position(|p| *p == name).unwrap_or(0)
+    }
+
+    fn port_out(&self, name: &str) -> usize {
+        self.outs.iter().position(|p| *p == name).unwrap_or(0)
+    }
 }
 
-/// Who opens the connection a wire stands for.
-#[derive(Clone, Copy, PartialEq)]
-enum Dir {
-    /// The left end (an output port) connects to the right end.
-    Forward,
-    /// The right end connects to the left end (a space dialing out to the
-    /// Claude app's servers).
-    Back,
-}
-
+/// A wire from an output port to an input port. The arrow points the way
+/// commands go (always from left end to right end).
 struct Wire {
     from: String,
     fp: usize,
     to: String,
     tp: usize,
     class: &'static str,
-    dir: Dir,
+    arrow: bool,
     label: Option<String>,
 }
 
-fn wire(from: &str, fp: usize, to: &str, tp: usize, class: &'static str, dir: Dir) -> Wire {
+fn wire(from: &str, fp: usize, to: &str, tp: usize, class: &'static str) -> Wire {
     Wire {
         from: from.into(),
         fp,
         to: to.into(),
         tp,
         class,
-        dir,
+        arrow: true,
         label: None,
     }
 }
@@ -151,6 +169,7 @@ struct Frame {
     kind: &'static str,
     title: String,
     members: Vec<String>,
+    pad: i32,
 }
 
 /// The cubic curve from an output port to an input port.
@@ -165,7 +184,7 @@ struct Provider {
     company: &'static str,
     /// Where you chat with the agent's spaces from, if anywhere.
     app: Option<&'static str>,
-    models: &'static str,
+    api: &'static str,
 }
 
 fn provider(agent: &str) -> Option<Provider> {
@@ -174,23 +193,74 @@ fn provider(agent: &str) -> Option<Provider> {
             id: "anthropic",
             company: "Anthropic",
             app: Some("Claude app · claude.ai"),
-            models: "Claude models",
+            api: "Claude API",
         }),
         "codex" => Some(Provider {
             id: "openai",
             company: "OpenAI",
             app: None,
-            models: "OpenAI models",
+            api: "OpenAI API",
         }),
         _ => None,
     }
 }
 
-fn slots_of(agent: &str) -> (Vec<&'static str>, Vec<&'static str>) {
-    match provider(agent) {
-        Some(p) if p.app.is_some() => (vec!["blackthorn", "chats"], vec!["model", "ssh"]),
-        Some(_) => (vec!["blackthorn"], vec!["model", "ssh"]),
+/// A space's ports. In: Remote Control (from the app, above) on top, then
+/// blackthorn (from the hub, to the left). Out: the API (above) on top,
+/// then SSH to its machine.
+fn space_ports(s: &SpaceView) -> (Vec<&'static str>, Vec<&'static str>) {
+    match provider(&s.agent) {
+        Some(p) if p.app.is_some() && s.remote_control => {
+            (vec!["Remote Control", "blackthorn"], vec!["API", "ssh"])
+        }
+        Some(_) => (vec!["blackthorn"], vec!["API", "ssh"]),
         None => (vec!["blackthorn"], vec!["ssh"]),
+    }
+}
+
+/// Where a machine is drawn: on the tailnet, on the LAN, or elsewhere.
+#[derive(Clone, Copy, PartialEq)]
+enum Net {
+    Tailnet,
+    Lan,
+    Other,
+}
+
+fn net_of(h: &HostView) -> Net {
+    if is_tailnet(&h.address) {
+        Net::Tailnet
+    } else if is_lan(&h.address) {
+        Net::Lan
+    } else {
+        Net::Other
+    }
+}
+
+fn host_node(h: &HostView, spaces: usize) -> Node {
+    let mut rows = vec![(Tone::Dim, clip(&format!("{} · {}", h.address, h.os), 34))];
+    rows.push((Tone::Dim, clip(&format!("admin: {}", h.user), 34)));
+    if let Some(u) = &h.readonly {
+        rows.push((Tone::Ok, clip(&format!("read-only: {u}"), 34)));
+    }
+    rows.push(if h.blocked {
+        (Tone::Bad, clip(&h.status, 34))
+    } else if spaces == 0 {
+        (Tone::Dim, "no space yet".into())
+    } else {
+        (Tone::Ok, clip(&h.status, 34))
+    });
+    Node {
+        id: format!("host:{}", h.name),
+        kind: "host",
+        title: clip(&h.name, 24),
+        dot: None,
+        href: Some(format!("/host/{}", crate::webauth::url_encode(&h.name))),
+        ins: vec!["ssh"],
+        outs: vec![],
+        icons: false,
+        rows,
+        x: COLS[3],
+        y: 0,
     }
 }
 
@@ -199,8 +269,10 @@ pub fn svg(o: &Overview) -> String {
     let mut wires: Vec<Wire> = Vec::new();
     let mut frames: Vec<Frame> = Vec::new();
     let hub = &o.hub;
+    let net = &hub.net;
+    let tailnet = net.control.is_some();
 
-    // ---- the clouds: one frame per company, app on the left, models right.
+    // ---- the clouds: one frame per company, app on the left, API right.
     let mut y_cloud = TOP + FRAME_TITLE;
     let mut providers: Vec<Provider> = Vec::new();
     for s in &o.spaces {
@@ -211,7 +283,7 @@ pub fn svg(o: &Overview) -> String {
         }
     }
     let mut app_of: Vec<(&'static str, String)> = Vec::new(); // provider -> app node
-    let mut models_of: Vec<(&'static str, String)> = Vec::new();
+    let mut api_of: Vec<(&'static str, String)> = Vec::new();
     for p in &providers {
         let spaces: Vec<&SpaceView> = o
             .spaces
@@ -220,8 +292,8 @@ pub fn svg(o: &Overview) -> String {
             .collect();
         let mut members = Vec::new();
         let mut bottom = y_cloud;
-        let remote: Vec<&&SpaceView> = spaces.iter().filter(|s| s.remote_control).collect();
-        if let (Some(app), false) = (p.app, remote.is_empty()) {
+        let remote = spaces.iter().filter(|s| s.remote_control).count();
+        if let (Some(app), true) = (p.app, remote > 0) {
             let id = format!("app:{}", p.id);
             let n = Node {
                 id: id.clone(),
@@ -233,11 +305,9 @@ pub fn svg(o: &Overview) -> String {
                 outs: vec!["Remote Control"],
                 icons: false,
                 rows: vec![
-                    (Tone::Dim, "chats from phone, desktop, web".into()),
-                    (
-                        Tone::Dim,
-                        format!("{} space(s) with Remote Control", remote.len()),
-                    ),
+                    (Tone::Dim, "your chats, from phone, desktop, web".into()),
+                    (Tone::Dim, format!("{remote} space(s) with Remote Control")),
+                    (Tone::Dim, "spaces connect out to it".into()),
                 ],
                 x: COLS[1],
                 y: y_cloud,
@@ -247,20 +317,23 @@ pub fn svg(o: &Overview) -> String {
             members.push(id.clone());
             app_of.push((p.id, id));
         }
-        // The models in use, each with the spaces using it.
+        // The API the spaces call, with the models they use.
         let mut used: Vec<(String, Vec<&str>)> = Vec::new();
         for s in &spaces {
-            let m = s.model.clone().unwrap_or_else(|| "(not known yet)".into());
+            let m = s
+                .model
+                .clone()
+                .unwrap_or_else(|| "model not known yet".into());
             match used.iter_mut().find(|(n, _)| *n == m) {
                 Some((_, v)) => v.push(&s.name),
                 None => used.push((m, vec![&s.name])),
             }
         }
-        let id = format!("models:{}", p.id);
+        let id = format!("api:{}", p.id);
         let n = Node {
             id: id.clone(),
-            kind: "model",
-            title: p.models.into(),
+            kind: "api",
+            title: p.api.into(),
             dot: None,
             href: None,
             ins: vec!["spaces"],
@@ -276,22 +349,27 @@ pub fn svg(o: &Overview) -> String {
         bottom = bottom.max(n.y + n.h());
         nodes.push(n);
         members.push(id.clone());
-        models_of.push((p.id, id));
+        api_of.push((p.id, id));
         frames.push(Frame {
             kind: "cloud",
             title: format!("{} · cloud", p.company),
             members,
+            pad: PAD,
         });
-        y_cloud = bottom + PAD + 30 + FRAME_TITLE;
+        y_cloud = bottom + PAD + BAND_GAP + FRAME_TITLE;
     }
 
-    // ---- this hub: blackthorn and its spaces in one frame; the machines
-    // they work on to the right, level with their spaces.
-    let top = if providers.is_empty() {
+    // ---- the tailnet band: coordination server and your devices on the
+    // left, this hub's frame (blackthorn and its spaces), the machines on
+    // the tailnet (or elsewhere) level with their spaces.
+    let mut top = if providers.is_empty() {
         TOP + FRAME_TITLE
     } else {
         y_cloud
     };
+    if tailnet {
+        top += OUTER;
+    }
     let admin = if hub.admin_from.is_empty() {
         (Tone::Bad, "admin from: anywhere".to_string())
     } else {
@@ -311,6 +389,31 @@ pub fn svg(o: &Overview) -> String {
         )
     };
     let has_app = !app_of.is_empty();
+    let mut tail_members: Vec<String> = Vec::new();
+    let mut left_y = top;
+    if let Some(control) = &net.control {
+        let n = Node {
+            id: "control".into(),
+            kind: "net",
+            title: "Tailnet coordination".into(),
+            dot: None,
+            href: None,
+            ins: vec![],
+            outs: vec!["coordinates"],
+            icons: false,
+            rows: vec![
+                (Tone::Dim, clip(control, 34)),
+                (Tone::Dim, "hands out keys and addresses;".into()),
+                (Tone::Dim, "traffic goes device to device".into()),
+            ],
+            x: COLS[0],
+            y: left_y,
+        };
+        left_y += n.h() + GAP_Y;
+        nodes.push(n);
+        tail_members.push("control".into());
+    }
+    let devices_on_tailnet = web_path(&hub.web_listen) == "over the tailnet";
     nodes.push(Node {
         id: "devices".into(),
         kind: "devices",
@@ -319,7 +422,7 @@ pub fn svg(o: &Overview) -> String {
         href: None,
         ins: vec![],
         outs: if has_app {
-            vec!["web UI · SSH", "chats"]
+            vec!["chats", "web UI · SSH"]
         } else {
             vec!["web UI · SSH"]
         },
@@ -329,16 +432,29 @@ pub fn svg(o: &Overview) -> String {
             (Tone::Dim, format!("web UI {}", web_path(&hub.web_listen))),
         ],
         x: COLS[0],
-        y: 0,
+        y: left_y,
     });
+    if tailnet && devices_on_tailnet {
+        tail_members.push("devices".into());
+    }
+    let hub_ins = if tailnet {
+        vec!["tailnet", "admin"]
+    } else {
+        vec!["admin"]
+    };
+    let hub_outs = if net.router.is_some() {
+        vec!["runs", "internet"]
+    } else {
+        vec!["runs"]
+    };
     nodes.push(Node {
         id: "hub".into(),
         kind: "hub",
         title: "blackthorn".into(),
         dot: None,
         href: None,
-        ins: vec!["admin"],
-        outs: vec!["runs"],
+        ins: hub_ins,
+        outs: hub_outs,
         icons: false,
         rows: vec![
             if hub.firewall_loaded {
@@ -361,15 +477,35 @@ pub fn svg(o: &Overview) -> String {
         x: COLS[1],
         y: top,
     });
-    wires.push(wire("devices", 0, "hub", 0, "wire", Dir::Forward));
+    let hub_admin = if tailnet { 1 } else { 0 };
+    if tailnet {
+        wires.push(Wire {
+            arrow: false,
+            ..wire("control", 0, "hub", 0, "wire uses")
+        });
+    }
+    wires.push(wire(
+        "devices",
+        if has_app { 1 } else { 0 },
+        "hub",
+        hub_admin,
+        "wire",
+    ));
     for (_, app) in &app_of {
-        wires.push(wire("devices", 1, app, 0, "wire", Dir::Forward));
+        wires.push(wire("devices", 0, app, 0, "wire"));
     }
     let mut hub_members = vec!["hub".to_string()];
 
+    // Spaces of machines on the tailnet (or elsewhere) first, then those
+    // of LAN machines, so the wires down to the LAN band are short.
+    let lan_band = |h: &HostView| net_of(h) != Net::Tailnet && (tailnet || net_of(h) == Net::Lan);
+    let mut order: Vec<&HostView> = o.hosts.iter().filter(|h| !lan_band(*h)).collect();
+    order.extend(o.hosts.iter().filter(|h| lan_band(*h)));
+
     let mut sy = top;
     let mut hy = top;
-    for h in &o.hosts {
+    let mut lan_hosts: Vec<Node> = Vec::new();
+    for h in order {
         let spaces: Vec<&SpaceView> = o.spaces.iter().filter(|s| s.host == h.name).collect();
         let first = sy;
         for s in &spaces {
@@ -381,21 +517,33 @@ pub fn svg(o: &Overview) -> String {
             };
             let p = provider(&s.agent);
             let reach = match &p {
-                None => "terminal only".to_string(),
-                Some(p) if p.app.is_some() && s.remote_control => "Remote Control".into(),
-                Some(p) if p.app.is_some() => "local only (no Remote Control)".into(),
-                Some(_) => "terminal only".into(),
+                Some(p) if p.app.is_some() && s.remote_control => "Remote Control",
+                Some(p) if p.app.is_some() => "local only (no Remote Control)",
+                _ => "terminal only",
             };
-            let (ins, outs) = slots_of(&s.agent);
+            let (ins, outs) = space_ports(s);
             let id = format!("space:{}", s.name);
+            let access = match (s.access, s.until) {
+                (Access::Readonly, _) => (Tone::Ok, format!("read-only as {}", s.login)),
+                (Access::Admin, Some(u)) if s.state == "running" => (
+                    Tone::Bad,
+                    format!(
+                        "admin as {} · {} left",
+                        s.login,
+                        crate::ops::describe_left(u, crate::state::now())
+                    ),
+                ),
+                (Access::Admin, _) => (Tone::Bad, format!("admin as {}", s.login)),
+            };
             let mut rows = vec![
                 (Tone::Dim, format!("{} · {}", s.agent, s.state)),
+                (access.0, clip(&access.1, 34)),
                 (Tone::Dim, detail),
             ];
             if let Some(m) = &s.model {
                 rows.push((Tone::Dim, clip(&format!("model: {m}"), 34)));
             }
-            rows.push((Tone::Dim, reach));
+            rows.push((Tone::Dim, reach.into()));
             let n = Node {
                 id: id.clone(),
                 kind: "space",
@@ -403,59 +551,46 @@ pub fn svg(o: &Overview) -> String {
                 dot: Some(state_class(&s.state)),
                 href: Some(format!("/space/{}", crate::webauth::url_encode(&s.name))),
                 ins,
-                outs: outs.clone(),
+                outs,
                 icons: false,
                 rows,
                 x: COLS[2],
                 y: sy,
             };
             sy += n.h() + GAP_Y;
-            nodes.push(n);
-            hub_members.push(id.clone());
-            wires.push(wire("hub", 0, &id, 0, "wire", Dir::Forward));
+            wires.push(wire("hub", 0, &id, n.port_in("blackthorn"), "wire"));
             if let Some(p) = &p {
                 if s.remote_control {
                     if let Some((_, app)) = app_of.iter().find(|(q, _)| *q == p.id) {
-                        wires.push(wire(app, 0, &id, 1, "wire", Dir::Back));
+                        wires.push(wire(app, 0, &id, n.port_in("Remote Control"), "wire"));
                     }
                 }
-                if let Some((_, m)) = models_of.iter().find(|(q, _)| *q == p.id) {
-                    wires.push(wire(&id, 0, m, 0, "wire", Dir::Forward));
+                if let Some((_, api)) = api_of.iter().find(|(q, _)| *q == p.id) {
+                    wires.push(wire(&id, n.port_out("API"), api, 0, "wire uses"));
                 }
             }
-            let ssh = outs.len() - 1;
+            let class = if h.blocked {
+                "wire cut"
+            } else if s.access == Access::Readonly {
+                "wire ro"
+            } else {
+                "wire admin"
+            };
             wires.push(wire(
                 &id,
-                ssh,
+                n.port_out("ssh"),
                 &format!("host:{}", h.name),
                 0,
-                if h.blocked { "wire cut" } else { "wire" },
-                Dir::Forward,
+                class,
             ));
+            nodes.push(n);
+            hub_members.push(id);
         }
-        let node = Node {
-            id: format!("host:{}", h.name),
-            kind: "host",
-            title: clip(&h.name, 24),
-            dot: None,
-            href: Some(format!("/host/{}", crate::webauth::url_encode(&h.name))),
-            ins: vec!["ssh"],
-            outs: vec![],
-            icons: false,
-            rows: vec![
-                (Tone::Dim, clip(&format!("{}@{}", h.user, h.address), 34)),
-                (Tone::Dim, h.os.to_string()),
-                if h.blocked {
-                    (Tone::Bad, clip(&h.status, 34))
-                } else if spaces.is_empty() {
-                    (Tone::Dim, "no space yet".into())
-                } else {
-                    (Tone::Ok, clip(&h.status, 34))
-                },
-            ],
-            x: COLS[3],
-            y: 0,
-        };
+        let node = host_node(h, spaces.len());
+        if lan_band(h) {
+            lan_hosts.push(node);
+            continue;
+        }
         let height = node.h();
         let centre = if spaces.is_empty() {
             hy
@@ -464,20 +599,16 @@ pub fn svg(o: &Overview) -> String {
         };
         let y = centre.max(hy);
         hy = y + height + GAP_Y;
-        sy = sy.max(hy);
+        if tailnet && net_of(h) == Net::Tailnet {
+            tail_members.push(node.id.clone());
+        }
         nodes.push(Node { y, ..node });
     }
     for b in &o.bridges {
-        let ssh = slots_of(
-            &o.spaces
-                .iter()
-                .find(|s| s.name == b.from)
-                .map(|s| s.agent.clone())
-                .unwrap_or_default(),
-        )
-        .1
-        .len()
-            - 1;
+        let Some(from) = nodes.iter().find(|n| n.id == format!("space:{}", b.from)) else {
+            continue;
+        };
+        let ssh = from.port_out("ssh");
         wires.push(Wire {
             label: Some(format!("bridge {}", b.remaining)),
             ..wire(
@@ -486,28 +617,97 @@ pub fn svg(o: &Overview) -> String {
                 &format!("host:{}", b.host),
                 0,
                 "wire bridge",
-                Dir::Forward,
             )
         });
     }
+
+    // The devices halfway down the tailnet band.
+    let band_bottom = nodes
+        .iter()
+        .filter(|n| n.y >= top - OUTER)
+        .map(|n| n.y + n.h())
+        .max()
+        .unwrap_or(top)
+        .max(top + 200);
+    let control_h = nodes
+        .iter()
+        .find(|n| n.id == "control")
+        .map_or(0, |n| n.h() + GAP_Y);
+    if let Some(d) = nodes.iter_mut().find(|n| n.id == "devices") {
+        d.y = ((top + control_h + band_bottom) / 2 - d.h() / 2).max(top + control_h);
+    }
+    tail_members.extend(hub_members.iter().cloned());
+    frames.push(Frame {
+        kind: "net",
+        title: format!("tailnet · {}", net.control.clone().unwrap_or_default()),
+        members: if tailnet { tail_members } else { Vec::new() },
+        pad: OUTER,
+    });
     frames.push(Frame {
         kind: "machine",
         title: format!("{} · this hub", clip(&hub.hostname, 30)),
         members: hub_members,
+        pad: PAD,
     });
 
-    // The devices halfway down everything.
+    // ---- the LAN band: the router (the hub's way to the internet) and the
+    // machines on the LAN.
+    let band_bottom = nodes
+        .iter()
+        .map(|n| n.y + n.h())
+        .max()
+        .unwrap_or(top)
+        .max(top + 200);
+    let mut ly = band_bottom + if tailnet { OUTER } else { PAD } + BAND_GAP + FRAME_TITLE + PAD;
+    if net.router.is_some() || !lan_hosts.is_empty() {
+        let mut lan_members = Vec::new();
+        if let Some(r) = net.router {
+            nodes.push(Node {
+                id: "router".into(),
+                kind: "net",
+                title: "Router".into(),
+                dot: None,
+                href: None,
+                ins: vec!["hub"],
+                outs: vec![],
+                icons: false,
+                rows: vec![
+                    (Tone::Dim, format!("{r} · the hub's gateway")),
+                    (Tone::Dim, "its way to the internet".into()),
+                ],
+                x: COLS[2],
+                y: ly,
+            });
+            lan_members.push("router".to_string());
+            wires.push(wire("hub", 1, "router", 0, "wire uses"));
+        }
+        for n in lan_hosts {
+            let h = n.h();
+            if is_lan_node(&n, o) {
+                lan_members.push(n.id.clone());
+            }
+            nodes.push(Node { y: ly, ..n });
+            ly += h + GAP_Y;
+        }
+        frames.push(Frame {
+            kind: "lan",
+            title: match &net.lan {
+                Some(l) => format!("LAN · {l}"),
+                None => "LAN".into(),
+            },
+            members: lan_members,
+            pad: PAD,
+        });
+    }
+
     let bottom = nodes
         .iter()
         .map(|n| n.y + n.h())
         .max()
         .unwrap_or(0)
         .max(220);
-    if let Some(d) = nodes.iter_mut().find(|n| n.id == "devices") {
-        d.y = ((bottom + TOP) / 2 - d.h() / 2).max(TOP);
-    }
     let width = COLS[3] + NW + 40;
-    let height = bottom + PAD + 40;
+    let height = bottom + OUTER + 40;
 
     let mut out = String::new();
     let _ = write!(
@@ -529,13 +729,14 @@ pub fn svg(o: &Overview) -> String {
         if ms.is_empty() {
             continue;
         }
-        let x1 = ms.iter().map(|n| n.x).min().unwrap_or(0) - PAD;
-        let y1 = ms.iter().map(|n| n.y).min().unwrap_or(0) - PAD - FRAME_TITLE;
-        let x2 = ms.iter().map(|n| n.x + NW).max().unwrap_or(0) + PAD;
-        let y2 = ms.iter().map(|n| n.y + n.h()).max().unwrap_or(0) + PAD;
+        let pad = f.pad;
+        let x1 = ms.iter().map(|n| n.x).min().unwrap_or(0) - pad;
+        let y1 = ms.iter().map(|n| n.y).min().unwrap_or(0) - pad - FRAME_TITLE;
+        let x2 = ms.iter().map(|n| n.x + NW).max().unwrap_or(0) + pad;
+        let y2 = ms.iter().map(|n| n.y + n.h()).max().unwrap_or(0) + pad;
         let _ = write!(
             out,
-            "<g class=\"frame kind-{}\" data-members=\"{}\"><rect class=\"frame-body\" x=\"{x1}\" y=\"{y1}\" \
+            "<g class=\"frame kind-{}\" data-pad=\"{pad}\" data-members=\"{}\"><rect class=\"frame-body\" x=\"{x1}\" y=\"{y1}\" \
              width=\"{}\" height=\"{}\" rx=\"12\"/><text class=\"frame-title\" x=\"{}\" y=\"{}\">{}</text></g>",
             f.kind,
             esc(&f.members.join(" ")),
@@ -556,9 +757,10 @@ pub fn svg(o: &Overview) -> String {
         };
         let (x1, y1) = (a.x + NW, a.y + SLOT_Y + w.fp as i32 * SLOT_ROW);
         let (x2, y2) = (b.x, b.y + SLOT_Y + w.tp as i32 * SLOT_ROW);
-        let marker = match w.dir {
-            Dir::Forward => "marker-end=\"url(#arrow)\"",
-            Dir::Back => "marker-start=\"url(#arrow)\"",
+        let marker = if w.arrow {
+            "marker-end=\"url(#arrow)\""
+        } else {
+            ""
         };
         let ends = format!(
             "data-from=\"{}\" data-fp=\"{}\" data-to=\"{}\" data-tp=\"{}\"",
@@ -674,6 +876,14 @@ pub fn svg(o: &Overview) -> String {
     out
 }
 
+/// LAN machines go in the LAN frame; other ones only sit in its band.
+fn is_lan_node(n: &Node, o: &Overview) -> bool {
+    o.hosts
+        .iter()
+        .find(|h| format!("host:{}", h.name) == n.id)
+        .is_some_and(|h| net_of(h) == Net::Lan)
+}
+
 /// Phone, laptop, desktop and terminal, drawn in lines (20 px high).
 const DEVICE_ICONS: &str = "<rect x=\"2\" y=\"1\" width=\"11\" height=\"18\" rx=\"2\"/><path d=\"M6 16h3\"/>\
     <g transform=\"translate(24,0)\"><rect x=\"3\" y=\"3\" width=\"18\" height=\"11\" rx=\"1.5\"/><path d=\"M0 17h24\"/></g>\
@@ -696,17 +906,18 @@ mod tests {
         assert_eq!(web_path(&l(&["192.168.10.106:7180"])), "over your network");
         assert_eq!(web_path(&l(&["100.128.0.1:7180"])), "over your network");
     }
-    use crate::ops::{BridgeView, HostView, HubView};
+    use crate::ops::{BridgeView, HubView, NetView};
     use crate::state::{Mode, Os};
 
     fn overview() -> Overview {
-        let host = |n: &str, blocked| HostView {
+        let host = |n: &str, ip: &str, blocked| HostView {
             name: n.into(),
-            address: "100.80.0.3".parse().unwrap(),
+            address: ip.parse().unwrap(),
             port: 22,
             user: "root".into(),
             os: Os::Linux,
             spaces: vec![],
+            readonly: (n == "fig").then(|| "blackthorn".to_string()),
             blocked,
             status: if blocked {
                 "BLOCKED".into()
@@ -727,6 +938,20 @@ mod tests {
             chats_24h: Some(2),
             reachable: vec![],
             model: (n == "fig-claude").then(|| "Opus 5.5".to_string()),
+            access: if n == "fig-claude" {
+                Access::Readonly
+            } else {
+                Access::Admin
+            },
+            login: if n == "fig-claude" {
+                "blackthorn"
+            } else {
+                "root"
+            }
+            .into(),
+            limited: n == "fig-aider",
+            until: None,
+            unattended: false,
         };
         Overview {
             hub: HubView {
@@ -737,15 +962,24 @@ mod tests {
                 https_anywhere: true,
                 admin_from: vec![],
                 denied_inbound: vec![],
-                web_listen: vec![],
+                web_listen: vec!["100.64.0.10:7180".into()],
                 memory_available_mb: None,
+                net: NetView {
+                    control: Some("headscale.example.com".into()),
+                    lan: Some("192.168.10.0/24".into()),
+                    router: Some("192.168.10.1".parse().unwrap()),
+                },
             },
             spaces: vec![
                 space("fig-claude", "fig", "running"),
                 space("fig-aider", "fig", "stopped"),
                 space("nas-<x>", "nas", "needs login"),
             ],
-            hosts: vec![host("fig", false), host("nas", true), host("pine", false)],
+            hosts: vec![
+                host("fig", "100.80.0.3", false),
+                host("nas", "192.168.10.5", true),
+                host("pine", "100.80.0.9", false),
+            ],
             bridges: vec![BridgeView {
                 from: "fig-claude".into(),
                 to: "nas-<x>".into(),
@@ -767,24 +1001,40 @@ mod tests {
         assert_eq!(s.matches("class=\"node kind-hub\"").count(), 1);
         assert_eq!(s.matches("class=\"node kind-devices\"").count(), 1);
         assert_eq!(s.matches("class=\"node kind-app\"").count(), 1);
-        assert_eq!(s.matches("class=\"node kind-model\"").count(), 1);
-        // devices->hub and ->app, hub->3 spaces, app->2 spaces with Remote
-        // Control, 3 spaces->models, 3 spaces->their machines, 1 bridge.
-        assert_eq!(s.matches("<path class=\"wire").count(), 14);
+        assert_eq!(s.matches("class=\"node kind-api\"").count(), 1);
+        assert_eq!(
+            s.matches("class=\"node kind-net\"").count(),
+            2,
+            "control and router"
+        );
+        // control->hub, devices->hub and ->app, hub->3 spaces, app->2 spaces
+        // with Remote Control, 3 spaces->API, 3 spaces->their machines,
+        // 1 bridge, hub->router.
+        assert_eq!(s.matches("<path class=\"wire").count(), 16);
+        // Arrows go the way commands go: the Claude app to a space.
+        assert!(s.contains(
+            "data-from=\"app:anthropic\" data-fp=\"0\" data-to=\"space:fig-claude\" data-tp=\"0\" marker-end"
+        ));
+        assert!(!s.contains("marker-start"));
+        // Read-only and admin logins, a blocked machine, a bridge.
+        assert!(s.contains(
+            "class=\"wire ro\" data-from=\"space:fig-claude\" data-fp=\"1\" data-to=\"host:fig\""
+        ));
+        assert!(s.contains("class=\"wire admin\" data-from=\"space:fig-aider\""));
         assert!(s.contains(
             "class=\"wire cut\" data-from=\"space:nas-&lt;x&gt;\" data-fp=\"1\" data-to=\"host:nas\""
         ));
         assert!(s.contains(
             "class=\"wire bridge\" data-from=\"space:fig-claude\" data-fp=\"1\" data-to=\"host:nas\""
         ));
-        // Spaces dial out to the Claude app: the arrow points back to it.
-        assert!(s.contains(
-            "data-from=\"app:anthropic\" data-fp=\"0\" data-to=\"space:fig-claude\" data-tp=\"1\" marker-start"
-        ));
+        assert!(s.contains("class=\"wire uses\" data-from=\"space:fig-claude\" data-fp=\"0\" data-to=\"api:anthropic\""));
         assert!(
-            !s.contains("data-to=\"space:fig-aider\" data-tp=\"1\""),
-            "Remote Control off"
+            !s.contains("data-from=\"app:anthropic\" data-fp=\"0\" data-to=\"space:fig-aider\""),
+            "Remote Control off: no wire from the app"
         );
+        assert!(s.contains("read-only as blackthorn"));
+        assert!(s.contains("admin as root"));
+        assert!(s.contains("read-only: blackthorn"));
         assert!(s.contains("bridge for 52m"));
         assert!(s.contains("no space yet"), "pine has none");
         assert!(s.contains("href=\"/space/fig-claude\""));
@@ -792,26 +1042,50 @@ mod tests {
         assert!(s.contains("admin from: anywhere"));
         assert!(s.contains("Opus 5.5: fig-claude"));
         assert!(s.contains("model: Opus 5.5"));
-        // Frames: this hub (blackthorn and its spaces), and the cloud.
+        // Frames: the cloud, the tailnet around this hub, the LAN.
+        assert!(s.contains("class=\"frame kind-cloud\" data-pad=\"16\" data-members=\"app:anthropic api:anthropic\""));
         assert!(s.contains(
-            "class=\"frame kind-machine\" data-members=\"hub space:fig-claude space:fig-aider space:nas-&lt;x&gt;\""
+            "class=\"frame kind-machine\" data-pad=\"16\" data-members=\"hub space:fig-claude space:fig-aider space:nas-&lt;x&gt;\""
         ));
         assert!(s.contains(
-            "class=\"frame kind-cloud\" data-members=\"app:anthropic models:anthropic\""
+            "class=\"frame kind-net\" data-pad=\"34\" data-members=\"control devices host:fig host:pine hub space:fig-claude"
         ));
+        assert!(
+            s.contains("class=\"frame kind-lan\" data-pad=\"16\" data-members=\"router host:nas\"")
+        );
+        assert!(s.contains("tailnet · headscale.example.com"));
+        assert!(s.contains("LAN · 192.168.10.0/24"));
         assert!(s.contains("Anthropic · cloud"));
     }
 
     #[test]
-    fn without_claude_spaces_no_cloud() {
+    fn networks_of_machines() {
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        assert!(is_tailnet(&ip("100.80.0.3")));
+        assert!(!is_tailnet(&ip("100.128.0.1")));
+        assert!(is_tailnet(&ip("fd7a:115c:a1e0::5")));
+        assert!(is_lan(&ip("192.168.10.5")));
+        assert!(is_lan(&ip("10.0.0.2")));
+        assert!(!is_lan(&ip("100.80.0.3")));
+        assert!(!is_lan(&ip("fd7a:115c:a1e0::5")));
+        assert!(is_lan(&ip("fd00::1")));
+        assert!(!is_lan(&ip("8.8.8.8")));
+    }
+
+    #[test]
+    fn without_networks_or_claude() {
         let mut o = overview();
+        o.hub.net = NetView::default();
         for s in o.spaces.iter_mut() {
             s.agent = "aider".into();
         }
         let s = svg(&o);
         assert!(!s.contains("kind-cloud"));
         assert!(!s.contains("kind-app"));
+        assert!(!s.contains("frame kind-net"));
         assert!(s.contains("terminal only"));
+        // Without a tailnet the LAN machine still sits in the LAN frame.
+        assert!(s.contains("class=\"frame kind-lan\" data-pad=\"16\" data-members=\"host:nas\""));
     }
 
     #[test]
@@ -831,7 +1105,7 @@ mod tests {
                 .unwrap();
             boxes.push((x.parse().unwrap(), y.parse().unwrap(), h.parse().unwrap()));
         }
-        assert_eq!(boxes.len(), 10);
+        assert_eq!(boxes.len(), 12);
         for (i, a) in boxes.iter().enumerate() {
             for b in &boxes[i + 1..] {
                 if a.0 == b.0 {

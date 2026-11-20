@@ -446,7 +446,11 @@ pub fn tick() -> Result<()> {
     let mut ctx = Ctx::open()?;
     let lifted = ctx.state.expire_blocks(ctx.now);
     let ended = ctx.state.expire_bridges(ctx.now);
-    if lifted.is_empty() && ended.is_empty() {
+    let admin_ended = ops::expire_admin(&mut ctx);
+    for s in &admin_ended {
+        println!("admin time up: {s} stopped");
+    }
+    if lifted.is_empty() && ended.is_empty() && admin_ended.is_empty() {
         apply::firewall_rules(&ctx.cfg, &ctx.state, ctx.now, false)?;
     } else {
         ctx.commit()?;
@@ -462,7 +466,8 @@ pub fn tick() -> Result<()> {
     let cfg = ctx.cfg.clone();
     drop(ctx);
     crate::tls::tick(&cfg);
-    crate::notify::tick(&state, &lifted, &ended);
+    crate::activity::tick(&state);
+    crate::notify::tick(&state, &lifted, &ended, &admin_ended);
     Ok(())
 }
 
@@ -474,12 +479,7 @@ pub fn load_keys(key: &str) -> Result<()> {
         bail!("no space with key {key}");
     };
     keys::wait_for_socket(key)?;
-    let hosts: Vec<&str> = state
-        .reachable_hosts(name, now())
-        .into_iter()
-        .map(|(n, _)| n)
-        .collect();
-    keys::sync_agent(key, &hosts)
+    keys::sync_agent(key, &apply::agent_keys(&state, name, now()))
 }
 
 #[cfg(test)]

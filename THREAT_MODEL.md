@@ -61,12 +61,14 @@ they are enforced by the kernel or by what the space has, not by the model.
 | Managed machines cannot reach the hub | The hub's input rules drop every connection from a managed machine (and from `never_manage`/`deny_from` addresses), and note who tried, for notifications. Replies to the hub's own SSH connections still arrive. blackthorn refuses to manage an address listed in `inbound.admin_from` or the address you are connected from. |
 | Admin ports only from your devices | If `inbound.admin_from` is set, only those addresses may reach SSH and the web UI. |
 | Spaces never see private keys | Keys are root-only files. Root loads them into the space's ssh-agent, which marks itself non-dumpable so the space user cannot read its memory. |
+| Read-only means read-only on the machine | With `thorn host readonly`, a read-only space's agent holds only the read-only login's key; that user has no password, reads logs through groups, and may use sudo only for listed Docker commands that read. Its home and key file are root's, so it cannot change its own key line. Admin spaces on such a machine start only when you start them, for at most a day, need a code from the web, stop by themselves, and run one at a time per machine. |
+| Commands leave a record | Root copies every shell command from each space's chats into a log the space cannot write, once a minute. On machines with a read-only login, both blackthorn keys run a logger first (`command=`), so the machine's own system log has every command, out of reach of the read-only user. |
 | Stolen keys are useless elsewhere | The suggested `authorized_keys` line has `from="<hub address>"` and `restrict`: usable only from the hub, with no port, agent or X11 forwarding and no pty. |
 | Host identities are pinned | Machines are stored by IP address, not name, and their host keys are recorded when added, after you confirm the fingerprints. |
 | Spaces cannot change the system | systemd sandbox: `ProtectSystem=strict`, `ProtectHome`, `NoNewPrivileges`, `PrivateTmp`, `RestrictSUIDSGID`, and more. |
 | Without the firewall, nothing runs | Space units require the firewall unit, and stopping the firewall unit leaves its rules loaded. |
 | The web UI's network side has no power | The HTTP listener runs as the unprivileged `blackthorn-web` user in a tight systemd sandbox, with no access to blackthorn's files. It forwards requests to a root API on a Unix socket, which accepts only that user, checks the password (Argon2id) and TOTP code itself, keeps the sessions, and enforces the CSRF value. A compromised web process can act only through a session a user has logged in to. |
-| Logins resist guessing | Password and TOTP are both needed; each code works once; five failures lock the account and the address for 15 minutes. Deleting spaces, removing machines, moving them, renaming anything, opening bridges, accepting new host keys, changing settings or notifications, updating blackthorn and changing your password or authenticator need a fresh code. A new authenticator replaces the old one only after a code made from it is accepted; password and authenticator changes end your other logins. Accounts are created and removed only on the hub's command line. Passkeys must verify the user (PIN or biometrics) and are checked for the hub's name and origin, a one-time challenge, the signature and a growing counter. |
+| Logins resist guessing | Password and TOTP are both needed; each code works once; five failures lock the account and the address for 15 minutes. Deleting spaces, removing machines, moving them, renaming anything, opening bridges, accepting new host keys, changing settings or notifications, updating blackthorn, starting an admin space, changing a space's access, setting up a read-only login and changing your password or authenticator need a fresh code. A new authenticator replaces the old one only after a code made from it is accepted; password and authenticator changes end your other logins. Accounts are created and removed only on the hub's command line. Passkeys must verify the user (PIN or biometrics) and are checked for the hub's name and origin, a one-time challenge, the signature and a growing counter. |
 | Account secrets do not linger | The terminal that showed a new account's QR code and recovery codes is cleared, scrollback included, once you have written them down. |
 | Root does not follow a space's links | Listing, naming and deleting chats reads and writes files in the space's home as root; it skips symbolic links, opens transcripts with `O_NOFOLLOW`, and acts only on files the space user owns. Generated files (such as CLAUDE.md in the space's own work folder) are written through a temporary file created anew (`O_EXCL`), owned and set by its descriptor, so a link planted at that name is never followed (before v0.6 it was). |
 | Web pages are hard to abuse | SameSite=Strict, HttpOnly session cookie; a CSRF value on every form; a CSP that allows no inline script or third-party resource; a small HTTP parser with size, time and connection limits. |
@@ -89,8 +91,18 @@ Know these before you rely on it.
    other. Keep bridges short, and between machines you trust alike.
 
 3. **A space can do anything its remote user can.** blackthorn decides
-   *whether* a space reaches a machine, not *what* it does there. Use a
-   non-root remote user, and sudo rules, for limits on the machine itself.
+   *whether* a space reaches a machine; the login decides *what* it does
+   there. An admin space (root, or a sudoer) is unlimited on its machine,
+   and from there it can also reach the internet, past the hub's firewall.
+   Give machines a read-only login (`thorn host readonly`) and keep admin
+   spaces for when you need them. Even read-only, a space can send out
+   anything that user can read (logs included), from the machine itself:
+   read-only stops changes, not reading. A rule you add to the sudoers
+   file yourself can undo all of it; the docker group or `docker exec` is
+   root. The command record misses what a space writes and erases within
+   the same minute on the hub, and a script fed over standard input
+   (`ssh host sh < script`) is logged on the machine only as its command
+   line.
 
 4. **Data can leave over HTTPS.** By default spaces may open HTTPS
    connections to any address, because Claude Code must reach Anthropic and

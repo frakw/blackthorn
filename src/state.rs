@@ -72,6 +72,43 @@ pub struct Host {
     pub os: Os,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block: Option<Block>,
+    /// The read-only login made by `thorn host readonly` (e.g.
+    /// "blackthorn"), with a key of its own. None: the machine has only
+    /// the admin login (`user`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readonly: Option<String>,
+}
+
+/// What a space may do on its machine.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Access {
+    /// Logs in as the machine's admin login (usually root). Spaces from
+    /// before v0.7 are admin spaces.
+    #[default]
+    Admin,
+    /// Logs in as the machine's read-only login: look, do not touch.
+    Readonly,
+}
+
+impl std::fmt::Display for Access {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Access::Admin => "admin",
+            Access::Readonly => "read-only",
+        })
+    }
+}
+
+/// How a space logs in to a machine it can reach.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Login<'a> {
+    pub host: &'a str,
+    pub h: &'a Host,
+    pub user: &'a str,
+    pub readonly: bool,
+    /// Reached through a bridge (not the space's own machine).
+    pub bridged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -122,6 +159,21 @@ pub struct Space {
     #[serde(default)]
     pub args: Vec<String>,
     pub created: u64,
+    /// Admin or read-only on its machine.
+    #[serde(default, skip_serializing_if = "is_admin")]
+    pub access: Access,
+    /// An admin space on a machine with a read-only login runs for a
+    /// limited time: it is stopped at this time (Unix seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<u64>,
+    /// The name a new conversation gets when it starts (single mode and
+    /// spaces without Remote Control).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+fn is_admin(a: &Access) -> bool {
+    *a == Access::Admin
 }
 
 fn yes() -> bool {
@@ -225,6 +277,49 @@ impl State {
             .filter(|(_, h)| !h.blocked(now))
             .map(|(n, h)| (n.as_str(), h))
             .collect()
+    }
+
+    /// How space `space` logs in to each machine it may reach now. Its own
+    /// machine: by its access. A bridged machine: its read-only login if it
+    /// has one (a bridge is for looking), else its admin login. A read-only
+    /// space on a machine that lost its read-only login gets nothing.
+    pub fn logins<'a>(&'a self, space: &str, now: u64) -> Vec<Login<'a>> {
+        let Some(s) = self.spaces.get(space) else {
+            return Vec::new();
+        };
+        self.reachable_hosts(space, now)
+            .into_iter()
+            .filter_map(|(name, h)| {
+                let own = name == s.host;
+                let ro = if own {
+                    s.access == Access::Readonly
+                } else {
+                    h.readonly.is_some()
+                };
+                let user = if ro {
+                    h.readonly.as_deref()?
+                } else {
+                    h.user.as_str()
+                };
+                Some(Login {
+                    host: name,
+                    h,
+                    user,
+                    readonly: ro,
+                    bridged: !own,
+                })
+            })
+            .collect()
+    }
+
+    /// An admin space whose machine has a read-only login: it runs only for
+    /// a limited time, one at a time per machine, and not at boot.
+    pub fn limited(&self, s: &Space) -> bool {
+        s.access == Access::Admin
+            && self
+                .hosts
+                .get(&s.host)
+                .is_some_and(|h| h.readonly.is_some())
     }
 
     /// Lifts blocks whose time is up. Returns the hosts that were unblocked.
@@ -381,6 +476,7 @@ mod tests {
             host_keys: vec![],
             os: Os::Linux,
             block,
+            readonly: None,
         }
     }
 
@@ -396,6 +492,9 @@ mod tests {
             conversation: "7bb9dc88-2ec5-4933-90b6-b872466876b2".into(),
             args: vec![],
             created: 0,
+            access: Access::Admin,
+            until: None,
+            title: None,
         }
     }
 
@@ -484,6 +583,48 @@ mod tests {
         assert_eq!(names(&st, "fig-claude", 100), vec!["fig"], "expired");
         assert_eq!(st.expire_bridges(100), vec!["fig-claude -> nas-claude"]);
         assert_eq!(st.bridges.len(), 1);
+    }
+
+    #[test]
+    fn logins_follow_access_and_bridges() {
+        let mut st = State::default();
+        st.hosts.insert("fig".into(), host(None));
+        let mut nas = host(None);
+        nas.readonly = Some("blackthorn".into());
+        st.hosts.insert("nas".into(), nas);
+        st.spaces.insert("fig-claude".into(), space("fig"));
+        let mut ro = space("nas");
+        ro.access = Access::Readonly;
+        st.spaces.insert("nas-ro".into(), ro);
+        st.spaces.insert("nas-admin".into(), space("nas"));
+        st.bridges.push(Bridge {
+            from: "fig-claude".into(),
+            to: "nas-admin".into(),
+            since: 0,
+            until: None,
+        });
+        let l = st.logins("fig-claude", 5);
+        assert_eq!(l.len(), 2);
+        assert_eq!(
+            (l[0].host, l[0].user, l[0].readonly),
+            ("fig", "frakw", false)
+        );
+        assert_eq!(
+            (l[1].host, l[1].user, l[1].readonly, l[1].bridged),
+            ("nas", "blackthorn", true, true),
+            "a bridge reaches the read-only login"
+        );
+        let l = st.logins("nas-ro", 5);
+        assert_eq!((l[0].user, l[0].readonly), ("blackthorn", true));
+        assert_eq!(st.logins("nas-admin", 5)[0].user, "frakw");
+        assert!(st.limited(&st.spaces["nas-admin"]));
+        assert!(!st.limited(&st.spaces["nas-ro"]));
+        assert!(
+            !st.limited(&st.spaces["fig-claude"]),
+            "fig has no read-only login"
+        );
+        st.hosts.get_mut("nas").unwrap().readonly = None;
+        assert!(st.logins("nas-ro", 5).is_empty(), "no read-only login left");
     }
 
     #[test]

@@ -192,7 +192,7 @@
   if (map) initMap(map);
 
   function initMap(wrap) {
-    var POS = "bt-map-pos2", VIEW = "bt-map-view2"; // v0.5 layout
+    var POS = "bt-map-pos3", VIEW = "bt-map-view3"; // v0.7 layout
     var NW = 230, SLOT_Y = 42, SLOT_ROW = 18, PAD = 16, FRAME_TITLE = 26;
     var svg, view, nodes, busy = false;
     var tools = document.querySelector(".graph-tools");
@@ -243,10 +243,11 @@
         });
         if (!b) return;
         var rect = f.querySelector(".frame-body"), t = f.querySelector(".frame-title");
-        var x = b.x1 - PAD, y = b.y1 - PAD - FRAME_TITLE;
+        var pad = +f.getAttribute("data-pad") || PAD;
+        var x = b.x1 - pad, y = b.y1 - pad - FRAME_TITLE;
         rect.setAttribute("x", x); rect.setAttribute("y", y);
-        rect.setAttribute("width", b.x2 - b.x1 + 2 * PAD);
-        rect.setAttribute("height", b.y2 - b.y1 + 2 * PAD + FRAME_TITLE);
+        rect.setAttribute("width", b.x2 - b.x1 + 2 * pad);
+        rect.setAttribute("height", b.y2 - b.y1 + 2 * pad + FRAME_TITLE);
         if (t) { t.setAttribute("x", x + 12); t.setAttribute("y", y + 18); }
       });
     }

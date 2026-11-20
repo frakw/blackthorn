@@ -24,12 +24,21 @@
   --title-space: #dfe0f3;
   --title-host: #ece4d6;
   --title-app: #f3e3d8;
-  --title-model: #f0dccd;
   --frame-machine: rgba(47, 107, 79, .07);
   --frame-machine-line: rgba(47, 107, 79, .35);
   --frame-cloud: rgba(201, 100, 66, .07);
   --frame-cloud-line: rgba(201, 100, 66, .35);
   --wire: #7d8a84;
+  --logo-branch: #111111;
+  --logo-berry: #4a2672;
+  --readonly: #2f6b4f;
+  --admin: #b0412f;
+  --frame-net: rgba(79, 84, 168, .05);
+  --frame-net-line: rgba(79, 84, 168, .35);
+  --frame-lan: rgba(138, 148, 143, .07);
+  --frame-lan-line: rgba(138, 148, 143, .5);
+  --title-net: #e2e3f0;
+  --title-api: #f0dccd;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
@@ -57,12 +66,21 @@
     --title-space: #2e3158;
     --title-host: #45392a;
     --title-app: #4a3226;
-    --title-model: #553425;
     --frame-machine: rgba(95, 174, 134, .08);
     --frame-machine-line: rgba(95, 174, 134, .35);
     --frame-cloud: rgba(224, 128, 96, .08);
     --frame-cloud-line: rgba(224, 128, 96, .35);
     --wire: #8b9a93;
+    --logo-branch: #ece8f2;
+    --logo-berry: #9a72d6;
+    --readonly: #5fae86;
+    --admin: #ec7a5c;
+    --frame-net: rgba(141, 146, 224, .06);
+    --frame-net-line: rgba(141, 146, 224, .35);
+    --frame-lan: rgba(111, 122, 117, .08);
+    --frame-lan-line: rgba(111, 122, 117, .5);
+    --title-net: #2e3045;
+    --title-api: #553425;
     color-scheme: dark;
   }
 }
@@ -89,10 +107,8 @@ h2 { font-size: 16px; margin: 0 0 8px; }
 .brand { font-weight: 700; color: var(--ink); text-decoration: none; letter-spacing: .02em;
   display: inline-flex; align-items: center; gap: 8px; }
 .logo { flex: none; }
-.logo-stem { stroke: var(--accent); }
-.logo-thorn { fill: var(--accent); }
-.logo-berry { fill: var(--berry); }
-.logo-bloom { fill: #ffffff; fill-opacity: .4; }
+.logo-branch { fill: var(--logo-branch); }
+.logo-berry { fill: var(--logo-berry); }
 .version { color: var(--dim); font-size: .8em; margin-left: 6px; }
 .menu { display: flex; gap: 4px; flex: 1; }
 .menu a, .me a { color: var(--dim); text-decoration: none; padding: 5px 10px; border-radius: 8px; white-space: nowrap; }
@@ -150,6 +166,12 @@ details.pop > .pop-body { position: fixed; z-index: 21; left: 50%; top: 18vh; tr
 details.pop .pop-body h2 { margin: 0; font-size: 17px; }
 .chat-actions details.pop > summary.btn { font-size: 13.5px; padding: 3px 10px; }
 .badge { font-size: 12px; border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; color: var(--dim); white-space: nowrap; }
+.badge.ro { border-color: color-mix(in srgb, var(--readonly) 55%, var(--line)); color: var(--readonly); }
+.badge.admin { border-color: color-mix(in srgb, var(--admin) 55%, var(--line)); color: var(--admin); }
+.acts { list-style: none; padding: 0; margin: 0; display: grid; gap: 8px; }
+.act { display: grid; gap: 2px; min-width: 0; }
+.act pre.cmd { margin: 0; padding: 6px 8px; background: var(--code-bg); border-radius: 6px; font-size: 12.5px;
+  white-space: pre-wrap; overflow-wrap: anywhere; max-height: 9em; overflow: auto; }
 .badge.local { border-color: color-mix(in srgb, var(--berry) 50%, var(--line)); color: var(--berry); }
 .page-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .page-head h1 { margin-bottom: 4px; }
@@ -225,10 +247,13 @@ svg.map .kind-hub .node-title { fill: var(--title-hub); }
 svg.map .kind-space .node-title { fill: var(--title-space); }
 svg.map .kind-host .node-title { fill: var(--title-host); }
 svg.map .kind-app .node-title { fill: var(--title-app); }
-svg.map .kind-model .node-title { fill: var(--title-model); }
+svg.map .kind-api .node-title { fill: var(--title-api); }
+svg.map .kind-net .node-title { fill: var(--title-net); }
 svg.map .frame-body { stroke-width: 1.4; stroke-dasharray: 6 4; }
 svg.map .kind-machine .frame-body { fill: var(--frame-machine); stroke: var(--frame-machine-line); }
 svg.map .kind-cloud .frame-body { fill: var(--frame-cloud); stroke: var(--frame-cloud-line); }
+svg.map .frame.kind-net .frame-body { fill: var(--frame-net); stroke: var(--frame-net-line); }
+svg.map .frame.kind-lan .frame-body { fill: var(--frame-lan); stroke: var(--frame-lan-line); }
 svg.map .frame-title { fill: var(--dim); font-weight: 650; font-size: 13px; }
 svg.map .icons { fill: none; stroke: var(--dim); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 svg.map .arrow { fill: var(--wire); }
@@ -238,6 +263,9 @@ svg.map a:hover .node-name { fill: var(--accent); text-decoration-color: current
 svg.map .port { fill: var(--wire); stroke: var(--node); stroke-width: 2; }
 svg.map .slot { fill: var(--dim); font-size: 11px; }
 svg.map .wire { fill: none; stroke: var(--wire); stroke-width: 2.2; }
+svg.map .wire.ro { stroke: var(--readonly); }
+svg.map .wire.admin { stroke: var(--admin); }
+svg.map .wire.uses { stroke-width: 1.6; stroke-dasharray: 2 5; stroke-linecap: round; }
 svg.map .wire.cut { stroke: var(--bad); stroke-dasharray: 4 5; }
 svg.map .wire.bridge { stroke: var(--bridge); stroke-width: 2; stroke-dasharray: 8 6; }
 svg.map .wire-label { fill: var(--bridge); font-size: 12px; paint-order: stroke; stroke: var(--canvas); stroke-width: 4px; }
@@ -250,6 +278,9 @@ svg.map .wire-label { fill: var(--bridge); font-size: 12px; paint-order: stroke;
 .swatch { display: inline-block; width: 22px; height: 0; border-top: 2px dashed var(--bridge); margin-right: -8px; flex: none; }
 .item-head .swatch { margin-right: 0; }
 .swatch.cut { border-top-color: var(--bad); }
+.swatch.ro { border-top: 2px solid var(--readonly); }
+.swatch.admin { border-top: 2px solid var(--admin); }
+.swatch.uses { border-top: 2px dotted var(--wire); }
 .t-bad { color: var(--bad); }
 
 .table-wrap { overflow-x: auto; margin-bottom: 14px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }

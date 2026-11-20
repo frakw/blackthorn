@@ -12,13 +12,22 @@ pub fn new(o: NewSpace) -> Result<()> {
     let (_, state) = ctx::read_only()?;
     let s = state.space(&name)?;
     println!(
-        "created space {name}: {} on {} (Remote Control name {}, user {})",
+        "created space {name}: {} on {}, {} (Remote Control name {}, user {})",
         s.agent,
         s.host,
+        s.access,
         s.rc_name,
         paths::unix_user(&s.key)
     );
-    if ops::logged_in(s) {
+    if state.limited(s) {
+        println!(
+            "it is an admin space on a machine with a read-only login: it runs only when you start it, for a time"
+        );
+        if !ops::logged_in(s) {
+            println!("\nnext: sign it in to Claude (once):\n  sudo thorn login {name}");
+        }
+        println!("then: sudo thorn start {name} --for 1h");
+    } else if ops::logged_in(s) {
         println!("it is running; open it with: sudo thorn attach {name}");
     } else {
         println!("\nnext: sign it in to Claude (once; it starts right after):");
@@ -52,11 +61,17 @@ pub fn login(name: &str) -> Result<()> {
     if !status.success() {
         bail!("sign-in did not complete");
     }
-    sys::systemctl(&["restart", &paths::space_unit(&s.key)])?;
-    println!(
-        "\nspace {name} is running; it appears in Remote Control as {}",
-        s.rc_name
-    );
+    if ops::start_after_login(name)? {
+        println!(
+            "\nspace {name} is running; it appears in Remote Control as {}",
+            s.rc_name
+        );
+    } else {
+        println!(
+            "\nsigned in. {name} is an admin space: start it when you need it, for a time:\n  \
+             sudo thorn start {name} --for 1h"
+        );
+    }
     Ok(())
 }
 
@@ -80,11 +95,18 @@ pub fn rename(old: &str, new: &str, rc_name: Option<String>) -> Result<()> {
     Ok(())
 }
 
-pub fn control(action: Action, names: &[String], all: bool) -> Result<()> {
+pub fn control(action: Action, names: &[String], all: bool, duration: Option<&str>) -> Result<()> {
     if names.is_empty() && !all {
         bail!("name a space, or use --all");
     }
-    for line in ops::space_control(action, names)? {
+    // From the command line (root on the hub), an admin space may start
+    // without being told for how long: the default.
+    let admin_for = match duration {
+        Some(d) => Some(ops::parse_duration(d)?),
+        None if !all => Some(ops::ADMIN_DEFAULT),
+        None => None,
+    };
+    for line in ops::space_control(action, names, admin_for)? {
         println!("{line}");
     }
     Ok(())
@@ -129,6 +151,7 @@ pub fn ls() -> Result<()> {
         "NAME".to_string(),
         "HOST".into(),
         "AGENT".into(),
+        "ACCESS".into(),
         "STATE".into(),
         "REMOTE CONTROL".into(),
         "CAN REACH".into(),
@@ -139,7 +162,16 @@ pub fn ls() -> Result<()> {
             s.name.clone(),
             s.host.clone(),
             agent_label(&s.agent, s.mode),
-            s.state.clone(),
+            s.access.to_string(),
+            match s.until {
+                Some(u) if s.state == "running" => {
+                    format!(
+                        "running ({} left)",
+                        ops::describe_left(u, crate::state::now())
+                    )
+                }
+                _ => s.state.clone(),
+            },
             s.rc_name.clone(),
             if s.reachable.is_empty() {
                 "nothing".into()
@@ -269,6 +301,23 @@ fn ago(secs: u64) -> String {
     }
 }
 
+pub fn log(space: &str, n: usize) -> Result<()> {
+    let v = crate::activity::list(space, n)?;
+    if v.is_empty() {
+        println!("no commands recorded for {space} yet");
+        return Ok(());
+    }
+    for e in v.iter().rev() {
+        let when = ops::rfc3339(e.t);
+        if e.note.is_empty() {
+            println!("{when}  {}  {}", e.chat, e.cmd.replace('\n', "\n    "));
+        } else {
+            println!("{when}  {}  NOTE: {}", e.chat, e.note);
+        }
+    }
+    Ok(())
+}
+
 pub fn chat_rename(space: &str, id: &str, title: &str) -> Result<()> {
     let id = ops::chat_rename(space, id, title)?;
     println!("chat {} is now called {title:?}", &id[..8]);
@@ -281,8 +330,8 @@ pub fn chat_rm(space: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn chat_open(space: &str, id: Option<&str>) -> Result<()> {
-    let o = ops::chat_open(space, id)?;
+pub fn chat_open(space: &str, id: Option<&str>, title: Option<&str>) -> Result<()> {
+    let o = ops::chat_open(space, id, title)?;
     let what = if id.is_some() {
         "back to chat"
     } else {
@@ -299,6 +348,11 @@ pub fn chat_open(space: &str, id: Option<&str>) -> Result<()> {
     } else {
         println!("{space}: {what} {}; it starts with the space", &o.id[..8]);
     }
+    Ok(())
+}
+
+pub fn access(name: &str, access: crate::state::Access) -> Result<()> {
+    println!("{}", ops::space_access(name, access)?);
     Ok(())
 }
 

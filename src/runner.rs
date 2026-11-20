@@ -86,6 +86,7 @@ pub fn agent_args(launch: &Launch, resume: bool) -> Vec<String> {
         LaunchKind::ClaudeServer | LaunchKind::ClaudeSingle if !launch.remote_control => {
             args.push(if resume { "--resume" } else { "--session-id" }.into());
             args.push(launch.conversation.clone());
+            name_new(&mut args, launch, resume);
         }
         LaunchKind::ClaudeServer => {
             args.extend([
@@ -100,12 +101,20 @@ pub fn agent_args(launch: &Launch, resume: bool) -> Vec<String> {
             // First start: create the conversation under our id.
             args.push(if resume { "--resume" } else { "--session-id" }.into());
             args.push(launch.conversation.clone());
+            name_new(&mut args, launch, resume);
             args.extend(["--remote-control".into(), launch.rc_name.clone()]);
         }
         LaunchKind::Command => {}
     }
     args.extend(launch.args.iter().cloned());
     args
+}
+
+/// A new conversation starts with the name it was given, if any.
+fn name_new(args: &mut Vec<String>, launch: &Launch, resume: bool) {
+    if !resume && !launch.title.is_empty() {
+        args.extend(["--name".into(), launch.title.clone()]);
+    }
 }
 
 pub fn backoff(failures: u32) -> Duration {
@@ -144,6 +153,7 @@ mod tests {
             capacity: 8,
             args: vec!["--permission-mode".into(), "acceptEdits".into()],
             workdir: "/var/lib/blackthorn/spaces/k/fig-claude".into(),
+            title: String::new(),
         }
     }
 
@@ -180,6 +190,10 @@ mod tests {
             ]
         );
         assert_eq!(agent_args(&l, true)[0], "--resume");
+        let mut named = l.clone();
+        named.title = "disk usage".into();
+        assert_eq!(agent_args(&named, false)[2..4], ["--name", "disk usage"]);
+        assert!(!agent_args(&named, true).contains(&"--name".to_string()));
     }
 
     #[test]

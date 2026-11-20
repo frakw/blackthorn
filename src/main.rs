@@ -1,5 +1,6 @@
 //! thorn: the command-line interface of blackthorn.
 
+mod activity;
 mod api;
 mod apply;
 mod config;
@@ -15,6 +16,7 @@ mod map;
 mod notify;
 mod ops;
 mod paths;
+mod remote;
 mod render;
 mod runner;
 mod space_cmd;
@@ -93,6 +95,10 @@ enum Cmd {
         /// Extra argument for the agent, e.g. --arg=--permission-mode --arg=acceptEdits.
         #[arg(long = "arg", allow_hyphen_values = true)]
         args: Vec<String>,
+        /// readonly or admin on its machine. Default: readonly if the
+        /// machine has a read-only login (thorn host readonly), else admin.
+        #[arg(long, value_parser = ["readonly", "admin"])]
+        access: Option<String>,
     },
     /// Sign a Claude space in, then start it.
     Login { name: String },
@@ -111,11 +117,14 @@ enum Cmd {
         #[arg(long)]
         rc_name: Option<String>,
     },
-    /// Start spaces.
+    /// Start spaces. An admin space on a machine with a read-only login
+    /// runs for a limited time: --for (default 1h, at most 1d).
     Start {
         names: Vec<String>,
         #[arg(long)]
         all: bool,
+        #[arg(long = "for", value_name = "DURATION")]
+        duration: Option<String>,
     },
     /// Stop spaces.
     Stop {
@@ -143,6 +152,21 @@ enum Cmd {
         /// Type the text without pressing Enter.
         #[arg(long)]
         no_enter: bool,
+    },
+    /// Make a space read-only or admin on its machine (read-only needs the
+    /// machine's read-only login: thorn host readonly).
+    Access {
+        name: String,
+        #[arg(value_parser = ["readonly", "admin"])]
+        access: String,
+    },
+    /// The commands a space ran, oldest first (copied from its chats every
+    /// minute into /var/log/blackthorn).
+    Log {
+        name: String,
+        /// How many of the latest.
+        #[arg(short = 'n', long, default_value_t = 50)]
+        lines: usize,
     },
     /// Turn a Claude space's Remote Control on or off. Off, it is one local
     /// conversation, reached only from the hub (thorn attach, the web UI).
@@ -234,7 +258,12 @@ enum ChatCmd {
     /// Start a new chat. A one-conversation space (single mode, Remote
     /// Control off) restarts into it; a Remote Control space runs it in a
     /// window of its own, shown in the Claude app.
-    New { space: String },
+    New {
+        space: String,
+        /// Its name (default: Claude names it).
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Go back to an earlier chat, the same way.
     Open { space: String, id: String },
 }
@@ -300,6 +329,24 @@ enum HostCmd {
     Pubkey { name: String },
     /// Check that blackthorn can log in, and learn the machine's OS.
     Check { name: String },
+    /// Give a Linux machine a read-only login for spaces: a user (default
+    /// "blackthorn") that reads logs and runs read-only Docker commands, with
+    /// a key of its own; and log every command blackthorn's keys run there.
+    /// Logs in as the machine's admin login to set it up (or --print the
+    /// script to run there as root, then run this again with --verify).
+    /// Afterwards new spaces on it are read-only by default, and its admin
+    /// spaces run only for a limited time, one at a time.
+    Readonly {
+        name: String,
+        #[arg(long, default_value = "blackthorn")]
+        user: String,
+        /// Print the setup script instead of running it.
+        #[arg(long, conflicts_with = "verify")]
+        print: bool,
+        /// You ran the printed script yourself: check the login, record it.
+        #[arg(long)]
+        verify: bool,
+    },
     /// Re-read the machine's host keys (after reinstalling it).
     Rescan {
         name: String,
@@ -409,6 +456,14 @@ enum FirewallCmd {
     },
 }
 
+fn parse_access(a: &str) -> state::Access {
+    if a == "readonly" {
+        state::Access::Readonly
+    } else {
+        state::Access::Admin
+    }
+}
+
 fn main() {
     if let Err(e) = run(Cli::parse()) {
         eprintln!("thorn: {e:#}");
@@ -436,6 +491,7 @@ fn run(cli: Cli) -> Result<()> {
             local,
             rc_name,
             args,
+            access,
         } => s::new(ops::NewSpace {
             host,
             agent,
@@ -444,13 +500,20 @@ fn run(cli: Cli) -> Result<()> {
             local,
             rc_name,
             args,
+            access: access.as_deref().map(parse_access),
         }),
         Cmd::Login { name } => s::login(&name),
         Cmd::Rm { name, purge } => s::rm(&name, purge),
         Cmd::Rename { old, new, rc_name } => s::rename(&old, &new, rc_name),
-        Cmd::Start { names, all } => s::control(Action::Start, &names, all),
-        Cmd::Stop { names, all } => s::control(Action::Stop, &names, all),
-        Cmd::Restart { names, all } => s::control(Action::Restart, &names, all),
+        Cmd::Start {
+            names,
+            all,
+            duration,
+        } => s::control(Action::Start, &names, all, duration.as_deref()),
+        Cmd::Stop { names, all } => s::control(Action::Stop, &names, all, None),
+        Cmd::Restart { names, all } => s::control(Action::Restart, &names, all, None),
+        Cmd::Access { name, access } => s::access(&name, parse_access(&access)),
+        Cmd::Log { name, lines } => s::log(&name, lines),
         Cmd::Attach { name } => s::attach(&name),
         Cmd::Screen { name } => s::screen(&name),
         Cmd::Send {
@@ -464,8 +527,8 @@ fn run(cli: Cli) -> Result<()> {
             ChatCmd::Ls { space } => s::chat_ls(&space),
             ChatCmd::Rename { space, id, title } => s::chat_rename(&space, &id, &title),
             ChatCmd::Rm { space, id } => s::chat_rm(&space, &id),
-            ChatCmd::New { space } => s::chat_open(&space, None),
-            ChatCmd::Open { space, id } => s::chat_open(&space, Some(&id)),
+            ChatCmd::New { space, name } => s::chat_open(&space, None, name.as_deref()),
+            ChatCmd::Open { space, id } => s::chat_open(&space, Some(&id), None),
         },
         Cmd::Update { check } => config_cmd::update(check),
         Cmd::Notify(n) => match n {
@@ -507,6 +570,12 @@ fn run(cli: Cli) -> Result<()> {
             HostCmd::Pubkey { name } => host_cmd::pubkey(&name),
             HostCmd::Check { name } => host_cmd::check(&name),
             HostCmd::Rescan { name, yes } => host_cmd::rescan(&name, yes),
+            HostCmd::Readonly {
+                name,
+                user,
+                print,
+                verify,
+            } => host_cmd::readonly(&name, &user, print, verify),
             HostCmd::SetAddress {
                 name,
                 target,
@@ -672,6 +741,10 @@ mod tests {
             ("notify_set", &["notify", "set"]),
             ("notify_test", &["notify", "test"]),
             ("passkey_rm", &["web", "user", "passkey-rm"]),
+            ("space_start_for", &["start"]),
+            ("space_access", &["access"]),
+            ("host_readonly", &["host", "readonly"]),
+            ("activity", &["log"]),
         ];
         // Operations that exist only because of the web: sessions.
         // Passkeys are made and used in a browser.

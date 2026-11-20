@@ -18,15 +18,20 @@ pub fn everything(cfg: &Config, state: &State, now: u64) -> Result<()> {
     for (name, s) in &state.spaces {
         space_files(cfg, state, name, s, now)
             .with_context(|| format!("updating files of space {name}"))?;
-        let hosts: Vec<&str> = state
-            .reachable_hosts(name, now)
-            .into_iter()
-            .map(|(n, _)| n)
-            .collect();
-        keys::sync_agent(&s.key, &hosts)
+        keys::sync_agent(&s.key, &agent_keys(state, name, now))
             .with_context(|| format!("updating the keys of space {name}"))?;
     }
     Ok(())
+}
+
+/// The keys a space's agent holds: one per machine it may reach now, for
+/// the login it uses there.
+pub fn agent_keys(state: &State, space: &str, now: u64) -> Vec<std::path::PathBuf> {
+    state
+        .logins(space, now)
+        .iter()
+        .map(keys::login_key)
+        .collect()
 }
 
 /// Every address that must never open a connection to the hub.
@@ -102,7 +107,7 @@ pub fn space_files(cfg: &Config, state: &State, name: &str, s: &Space, now: u64)
     if !home.exists() {
         return Ok(());
     }
-    let reachable = state.reachable_hosts(name, now);
+    let logins = state.logins(name, now);
 
     // ~/.ssh belongs to root so the generated files are not the space's to
     // change (see THREAT_MODEL.md for what that does and does not stop).
@@ -111,13 +116,13 @@ pub fn space_files(cfg: &Config, state: &State, name: &str, s: &Space, now: u64)
     sys::chown(&ssh_dir, 0, 0)?;
     sys::write_file(
         &ssh_dir.join("config"),
-        &render::ssh_config(&s.key, &reachable),
+        &render::ssh_config(&s.key, &logins),
         0o644,
         None,
     )?;
     sys::write_file(
         &ssh_dir.join("known_hosts"),
-        &render::known_hosts(&reachable),
+        &render::known_hosts(&logins),
         0o644,
         None,
     )?;

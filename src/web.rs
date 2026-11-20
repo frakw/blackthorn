@@ -347,6 +347,11 @@ fn route(
                     .split_whitespace()
                     .map(String::from)
                     .collect(),
+                access: match f(form, "access") {
+                    "readonly" => Some(crate::state::Access::Readonly),
+                    "admin" => Some(crate::state::Access::Admin),
+                    _ => None,
+                },
             };
             match get::<String>(&c, Op::SpaceNew { space }) {
                 Ok(n) => back(
@@ -578,14 +583,12 @@ fn page_with(c: &Ctx, title: &str, body: &str, flash: &Flash, head: &str) -> Str
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The logo inline (colored by the stylesheet), and as a file (favicon).
-const LOGO: &str = "<svg class=\"logo\" viewBox=\"0 0 32 32\" width=\"22\" height=\"22\" aria-hidden=\"true\">\
-    <path class=\"logo-stem\" d=\"M5 27 L22.2 9.8\" stroke-width=\"2.6\" stroke-linecap=\"round\" fill=\"none\"/>\
-    <path class=\"logo-thorn\" d=\"M20.9 8.4 L23.6 11.1 L29 3 Z\"/>\
-    <path class=\"logo-thorn\" d=\"M8.9 23.1 L11.6 20.4 L6.6 15.6 Z\"/>\
-    <path class=\"logo-thorn\" d=\"M14.9 17.1 L17.6 14.4 L23 19.4 Z\"/>\
-    <path class=\"logo-stem\" d=\"M18.4 13.6 Q16.6 11 14.9 11.8\" stroke-width=\"1.4\" stroke-linecap=\"round\" fill=\"none\"/>\
-    <circle class=\"logo-berry\" cx=\"12\" cy=\"9.6\" r=\"4.8\"/>\
-    <circle class=\"logo-bloom\" cx=\"10.4\" cy=\"8\" r=\"1.3\"/></svg>";
+const LOGO: &str =
+    "<svg class=\"logo\" viewBox=\"0 0 32 32\" width=\"22\" height=\"22\" aria-hidden=\"true\">\
+    <path class=\"logo-branch\" d=\"M3.1 26.5 L5.5 28.9 L21.7 12.7 L28.8 3.2 L19.3 10.3 Z\"/>\
+    <path class=\"logo-branch\" d=\"M13.4 21 L16.4 18 L23.4 21.4 Z\"/>\
+    <path class=\"logo-branch\" d=\"M5 24.6 L7.4 22.2 L1.6 17.2 Z\"/>\
+    <circle class=\"logo-berry\" cx=\"10.6\" cy=\"12.4\" r=\"6\"/></svg>";
 const LOGO_FILE: &str = include_str!("../assets/logo.svg");
 
 fn csrf(c: &Ctx) -> String {
@@ -634,6 +637,31 @@ fn rename_dialog(
         esc(what),
         esc(current),
         code_field()
+    )
+}
+
+/// A button that pops up a small form (like `rename_dialog`): `fields` go
+/// inside, with the CSRF value; `summary_class` styles the button.
+fn pop_dialog(
+    c: &Ctx,
+    action: &str,
+    label: &str,
+    summary_class: &str,
+    title: &str,
+    fields: &str,
+    submit: &str,
+) -> String {
+    format!(
+        "<details class=\"pop\"><summary class=\"btn {summary_class}\">{}</summary>\
+         <form method=\"post\" action=\"{}\" class=\"stack pop-body\" role=\"dialog\" aria-label=\"{}\">{}\
+         <h2>{}</h2>{fields}<div class=\"buttons\"><button class=\"primary\">{}</button>\
+         <button type=\"button\" class=\"link\" data-close hidden>Cancel</button></div></form></details>",
+        esc(label),
+        esc(action),
+        esc(title),
+        csrf(c),
+        esc(title),
+        esc(submit)
     )
 }
 
@@ -878,10 +906,13 @@ fn map_page(c: &Ctx, flash: &Flash) -> Reply {
          <div class=\"graph-wrap\" id=\"map\" data-refresh=\"/map.svg\">{}</div>\
          <p class=\"legend\"><span class=\"dot ok\"></span>running <span class=\"dot warn\"></span>needs \
          login <span class=\"dot idle\"></span>stopped <span class=\"dot bad\"></span>failed \
+         <span class=\"swatch ro\"></span>read-only login <span class=\"swatch admin\"></span>admin login \
          <span class=\"swatch bridge\"></span>bridge <span class=\"swatch cut\"></span>blocked (a machine you cut off) \
-         <span>Arrows point from who opens the connection to whom: spaces dial out to the Claude app, \
-         and the machines never connect back to the hub. Dashed frames are one machine (this hub) or one \
-         company's cloud.</span></p></section>",
+         <span class=\"swatch uses\"></span>a service it uses \
+         <span>Arrows point the way commands go: from you, through the Claude app or the hub, to a space, to its \
+         machine. Every connection is opened from the left end except Remote Control, which the space keeps open \
+         out to the Claude app; machines never connect back to the hub. Frames are a company's cloud, this hub, \
+         and your networks.</span></p></section>",
         map::svg(&o)
     ));
     Reply::Html(200, page(c, "Map", &b, flash))
@@ -908,8 +939,43 @@ fn space_controls(c: &Ctx, s: &SpaceView) -> String {
             button(c, &format!("/space/{n}/restart"), "Restart", "", ""),
             button(c, &format!("/space/{n}/stop"), "Stop", "", "")
         )
+    } else if s.limited {
+        start_for_dialog(c, s)
     } else {
         button(c, &format!("/space/{n}/start"), "Start", "primary", "")
+    }
+}
+
+/// Starting an admin space on a machine with a read-only login: for how
+/// long, with a code.
+fn start_for_dialog(c: &Ctx, s: &SpaceView) -> String {
+    pop_dialog(
+        c,
+        &format!("/space/{}/start-for", url_encode(&s.name)),
+        "Start as admin…",
+        "primary",
+        &format!("Start {} as admin", s.name),
+        &format!(
+            "<p class=\"hint\">It logs in to {} as <b>{}</b>, which can change anything there. It stops by \
+             itself when the time is up; only one admin space per machine runs at a time.</p>{}{}",
+            esc(&s.host),
+            esc(&s.login),
+            duration_select(&["15m", "30m", "1h", "2h", "4h", "8h"], "1h", false),
+            code_field()
+        ),
+        "Start",
+    )
+}
+
+/// The space's access as a badge: read-only, admin, admin with time left.
+fn access_badge(s: &SpaceView) -> String {
+    match (s.access, s.until) {
+        (crate::state::Access::Readonly, _) => "<span class=\"badge ro\">read-only</span>".into(),
+        (_, Some(u)) if s.state == "running" => format!(
+            "<span class=\"badge admin\">admin · {} left</span>",
+            esc(&crate::ops::describe_left(u, crate::state::now()))
+        ),
+        _ => "<span class=\"badge admin\">admin</span>".into(),
     }
 }
 
@@ -920,11 +986,12 @@ fn space_card(c: &Ctx, s: &SpaceView) -> String {
         .unwrap_or_default();
     format!(
         "<article class=\"item\"><div class=\"item-head\"><span class=\"dot {}\"></span>\
-         <a class=\"item-name\" href=\"/space/{}\">{}</a>{}</div>\
+         <a class=\"item-name\" href=\"/space/{}\">{}</a>{}{}</div>\
          <p class=\"item-meta\">on {} · {} · {}{chats}</p><div class=\"buttons\">{}</div></article>",
         map::state_class(&s.state),
         url_encode(&s.name),
         esc(&s.name),
+        access_badge(s),
         reach_badge(s),
         esc(&s.host),
         esc(&crate::space_cmd::agent_label(&s.agent, s.mode)),
@@ -958,7 +1025,9 @@ fn spaces_page(c: &Ctx, flash: &Flash) -> Reply {
         b.push_str(&format!(
             "<details class=\"card add\"{}><summary>+ New space</summary><form method=\"post\" action=\"/spaces\" class=\"stack\">{}\
              <div class=\"fields\"><label>Machine <select name=\"host\">{hosts}</select></label>\
-             <label>Agent <select name=\"agent\">{agents}</select></label></div>\
+             <label>Agent <select name=\"agent\">{agents}</select></label>\
+             <label>Access <select name=\"access\"><option value=\"\">default: read-only if the machine has a read-only login</option>\
+             <option value=\"readonly\">read-only</option><option value=\"admin\">admin (runs for a limited time where there is a read-only login)</option></select></label></div>\
              <details class=\"more\"><summary>More options</summary><div class=\"stack\">\
              <label>Name <input name=\"name\" placeholder=\"machine-agent\"></label>\
              <label>Claude: Remote Control name, as the Claude app lists it <input name=\"rc_name\" \
@@ -995,18 +1064,27 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
     let claude = s.agent == crate::config::CLAUDE;
     let mut b = format!(
         "<div class=\"page-head\"><h1><span class=\"dot {}\"></span>{}</h1><div class=\"buttons\">{}{}</div></div>\
-         <p class=\"item-meta\">on <a href=\"/host/{}\">{}</a> · {} · {}{} {}</p>",
+         <p class=\"item-meta\">on <a href=\"/host/{}\">{}</a> as {} · {} · {}{} {}{}</p>",
         map::state_class(&s.state),
         esc(&s.name),
         space_controls(c, s),
         rename_dialog(c, &format!("/space/{n}/rename"), "space", "new", &s.name, ""),
         url_encode(&s.host),
         esc(&s.host),
+        esc(&s.login),
         esc(&crate::space_cmd::agent_label(&s.agent, s.mode)),
         esc(&s.state),
         s.memory_mb.map(|m| format!(" · {m} MB")).unwrap_or_default(),
+        access_badge(s),
         reach_badge(s),
     );
+    if s.access == crate::state::Access::Admin && s.unattended {
+        b.push_str(
+            "<p class=\"flash err\">This admin space skips permission prompts (its arguments include auto or \
+             bypass permission mode): its agent changes the machine without asking. Prefer a read-only space, \
+             or drop those arguments.</p>",
+        );
+    }
     if s.reachable.is_empty() {
         b.push_str("<p class=\"t-bad\">It can reach no machine right now (blocked?).</p>");
     } else if s.reachable.len() > 1 {
@@ -1026,6 +1104,7 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
 
     if claude {
         b.push_str(&chats_card(c, s));
+        b.push_str(&activity_card(c, s));
     }
 
     // Terminal.
@@ -1114,6 +1193,11 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
 
     // Settings of the space.
     b.push_str("<section class=\"row\">");
+    b.push_str(&access_card(
+        c,
+        s,
+        o.hosts.iter().find(|h| h.name == s.host),
+    ));
     if claude {
         let (text, label, on, class) = if s.remote_control {
             (
@@ -1233,13 +1317,13 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
     }
     let (confirm, how) = if one {
         (
-            "Start a new chat? The space restarts into it; the current one stays in this list.".to_string(),
+            "The space restarts into it; the current chat stays in the list.".to_string(),
             "This space runs one chat at a time: start a new one, or continue an earlier one, and the space restarts into it."
                 .to_string(),
         )
     } else {
         (
-            "Start a new chat? It runs next to the others and shows in the Claude app.".to_string(),
+            "It runs next to the others and shows in the Claude app.".to_string(),
             format!(
                 "Chats started here run next to the ones from the Claude app, and show there too (under <b>{}</b>). \
                  They run until closed or the space stops.",
@@ -1247,10 +1331,18 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
             ),
         )
     };
-    let new_chat = format!(
-        "<form method=\"post\" action=\"/space/{n}/chat-new\" class=\"inline\" data-confirm=\"{confirm}\">{}\
-         <button class=\"primary\">+ New chat</button></form>",
-        csrf(c)
+    let new_chat = pop_dialog(
+        c,
+        &format!("/space/{n}/chat-new"),
+        "+ New chat",
+        "primary",
+        "New chat",
+        &format!(
+            "<p class=\"hint\">{}</p><label>Name <input name=\"title\" maxlength=\"100\" autocomplete=\"off\" \
+             placeholder=\"optional: Claude names it otherwise\" autofocus></label>",
+            esc(&confirm)
+        ),
+        "Start chat",
     );
     format!(
         "<section class=\"card\" id=\"chats\"><div class=\"page-head\"><h2>Chats</h2>{new_chat}</div>\
@@ -1259,6 +1351,113 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
             "<p>No chats yet.</p>".to_string()
         } else {
             format!("<ul class=\"chats\">{rows}</ul>")
+        }
+    )
+}
+
+fn access_card(c: &Ctx, s: &SpaceView, h: Option<&HostView>) -> String {
+    let n = url_encode(&s.name);
+    let ro_login = h.and_then(|h| h.readonly.clone());
+    let (text, change) = match s.access {
+        crate::state::Access::Readonly => (
+            format!(
+                "<b>Read-only</b>: it logs in to {} as <b>{}</b>, which can read logs and run read-only Docker \
+                 commands, and change nothing.",
+                esc(&s.host),
+                esc(&s.login)
+            ),
+            Some(("admin", "Make it admin…", "It will log in as the machine's admin login and can change anything. \
+                   It stops now and then runs only when you start it, for a time.")),
+        ),
+        crate::state::Access::Admin => (
+            format!(
+                "<b>Admin</b>: it logs in to {} as <b>{}</b> and can change anything there.{}",
+                esc(&s.host),
+                esc(&s.login),
+                if s.limited {
+                    " Because the machine has a read-only login, it runs only when you start it, for a time, \
+                     and never next to another admin space on the same machine."
+                } else {
+                    ""
+                }
+            ),
+            ro_login.as_ref().map(|_| {
+                ("readonly", "Make it read-only…", "It will log in as the machine's read-only login. A running \
+                  space restarts; its chats stay.")
+            }),
+        ),
+    };
+    let action = match change {
+        Some((to, label, why)) => pop_dialog(
+            c,
+            &format!("/space/{n}/access"),
+            label,
+            "",
+            label.trim_end_matches('…'),
+            &format!(
+                "<p class=\"hint\">{why}</p><input type=\"hidden\" name=\"access\" value=\"{to}\">{}",
+                code_field()
+            ),
+            "Change",
+        ),
+        None => format!(
+            "<p class=\"hint\">For a read-only space, give {} a read-only login first, on <a href=\"/host/{}\">its page</a>.</p>",
+            esc(&s.host),
+            url_encode(&s.host)
+        ),
+    };
+    format!("<section class=\"card\" id=\"access\"><h2>Access</h2><p>{text}</p>{action}</section>")
+}
+
+fn activity_card(c: &Ctx, s: &SpaceView) -> String {
+    let entries = match get::<Vec<crate::activity::Entry>>(
+        c,
+        Op::Activity {
+            name: s.name.clone(),
+            limit: 30,
+        },
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return format!(
+                "<section class=\"card\" id=\"activity\"><h2>Activity</h2><p class=\"t-bad\">{}</p></section>",
+                esc(&e)
+            )
+        }
+    };
+    let now = crate::state::now();
+    let rows: String = entries
+        .iter()
+        .map(|e| {
+            if !e.note.is_empty() {
+                return format!(
+                    "<li class=\"act note\"><span class=\"item-meta\">{} · chat {}</span><span class=\"t-bad\">{}</span></li>",
+                    ago(now.saturating_sub(e.t)),
+                    esc(&e.chat),
+                    esc(&e.note)
+                );
+            }
+            format!(
+                "<li class=\"act\"><span class=\"item-meta\">{} · chat <code>{}</code>{}</span><pre class=\"cmd\">{}</pre></li>",
+                ago(now.saturating_sub(e.t)),
+                esc(&e.chat),
+                e.host()
+                    .map(|h| format!(" · on <b>{}</b>", esc(h)))
+                    .unwrap_or_default(),
+                esc(&e.cmd)
+            )
+        })
+        .collect();
+    format!(
+        "<section class=\"card\" id=\"activity\"><h2>Activity</h2><p class=\"hint\">The commands its chats ran, \
+         newest first, copied every minute into a log on the hub that the space cannot change (all of it: \
+         <code>sudo thorn log {}</code>). Machines with a read-only login also keep their own record: \
+         <code>journalctl -t blackthorn</code> there.</p>{}</section>",
+        esc(&s.name),
+        if rows.is_empty() {
+            "<p>Nothing yet.</p>".to_string()
+        } else {
+            format!("<ul class=\"acts\">{rows}</ul>")
         }
     )
 }
@@ -1442,6 +1641,7 @@ fn space_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>)
                 Op::ChatOpen {
                     name: name.into(),
                     id: (action == "chat-open").then(|| f(form, "id").to_string()),
+                    title: (action == "chat-new").then(|| f(form, "title").to_string()),
                 },
             )
             .map(|o| {
@@ -1454,6 +1654,36 @@ fn space_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>)
                     format!("{what}; it runs when the space starts")
                 }
             }),
+        ),
+        "start-for" => back(
+            &here,
+            get::<Option<u64>>(
+                c,
+                Op::SpaceStartFor {
+                    name: name.into(),
+                    duration: f(form, "duration").into(),
+                    code: f(form, "code").into(),
+                },
+            )
+            .map(|u| match u {
+                Some(u) => format!("started as admin until {} UTC", crate::ops::rfc3339(u)),
+                None => "started".into(),
+            }),
+        ),
+        "access" => back(
+            &here,
+            get::<String>(
+                c,
+                Op::SpaceAccess {
+                    name: name.into(),
+                    access: if f(form, "access") == "readonly" {
+                        crate::state::Access::Readonly
+                    } else {
+                        crate::state::Access::Admin
+                    },
+                    code: f(form, "code").into(),
+                },
+            ),
         ),
         "chat-rm" => back(
             &format!("{here}#chats"),
@@ -1501,11 +1731,15 @@ fn hosts_page(c: &Ctx, flash: &Flash) -> Reply {
 fn host_card(h: &HostView) -> String {
     format!(
         "<article class=\"item\"><div class=\"item-head\"><span class=\"dot {}\"></span>\
-         <a class=\"item-name\" href=\"/host/{}\">{}</a></div>\
+         <a class=\"item-name\" href=\"/host/{}\">{}</a>{}</div>\
          <p class=\"item-meta\">{}@{}{} · {}</p><p class=\"item-meta\">spaces: {}</p><p class=\"{}\">{}</p></article>",
         if h.blocked { "bad" } else { "ok" },
         url_encode(&h.name),
         esc(&h.name),
+        match &h.readonly {
+            Some(u) => format!("<span class=\"badge ro\">read-only login: {}</span>", esc(u)),
+            None => String::new(),
+        },
         esc(&h.user),
         h.address,
         if h.port == 22 { String::new() } else { format!(":{}", h.port) },
@@ -1639,6 +1873,7 @@ fn host_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
         button(c, &format!("/host/{n}/check"), "Check login", "primary", ""),
         button(c, &format!("/host/{n}/rescan"), "Check its host keys again", "", "")
     ));
+    b.push_str(&readonly_card(c, h));
     b.push_str("<section class=\"row\">");
     b.push_str(&format!(
         "<section class=\"card\"><h2>Address</h2><p>Moved {} to another network, such as its tailnet \
@@ -1680,9 +1915,76 @@ fn host_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
     Reply::Html(200, page(c, &h.name, &b, flash))
 }
 
+fn readonly_card(c: &Ctx, h: &HostView) -> String {
+    let n = url_encode(&h.name);
+    let user = h.readonly.clone().unwrap_or_else(|| "blackthorn".into());
+    let setup = pop_dialog(
+        c,
+        &format!("/host/{n}/readonly"),
+        if h.readonly.is_some() { "Set it up again…" } else { "Set up a read-only login…" },
+        if h.readonly.is_some() { "" } else { "primary" },
+        "Read-only login",
+        &format!(
+            "<p class=\"hint\">blackthorn logs in to {} as <b>{}</b> and: creates the user below (groups \
+             <code>adm</code> and <code>systemd-journal</code>, home owned by root), gives it a key of its own and \
+             sudo for read-only Docker commands only (installing sudo if missing), and makes both its keys log every \
+             command to the system log. Linux only. Or run it yourself: <code>sudo thorn host readonly {} --print</code>.</p>\
+             <label>User <input name=\"user\" value=\"{}\" required maxlength=\"32\" autocomplete=\"off\"></label>{}",
+            esc(&h.name),
+            esc(&h.user),
+            esc(&h.name),
+            esc(&user),
+            code_field()
+        ),
+        "Set up",
+    );
+    let text = match &h.readonly {
+        Some(u) => format!(
+            "<p>Spaces can log in as <b>{}</b>: they read logs and run <code>docker ps</code>, <code>logs</code>, \
+             <code>stats</code>, <code>images</code>, <code>top</code> and <code>system df</code>, and change nothing. \
+             New spaces here are read-only; admin spaces run only when started, for a time, one at a time.</p>\
+             <p class=\"hint\">Every command blackthorn's keys run here is in its system log: \
+             <code>journalctl -t blackthorn</code>. Set it up again after giving the machine a new address.</p>",
+            esc(u)
+        ),
+        None => format!(
+            "<p>Every space here logs in as <b>{}</b>, so its agent can change anything. A read-only login lets \
+             most spaces only look, and keeps admin access for when you need it, for a limited time.</p>",
+            esc(&h.user)
+        ),
+    };
+    format!(
+        "<section class=\"card\" id=\"readonly\"><h2>Read-only login</h2>{text}{setup}</section>"
+    )
+}
+
 fn host_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>) -> Reply {
     let here = format!("/host/{}", url_encode(name));
     match action {
+        "readonly" => back(
+            &here,
+            get::<ops::ReadonlyDone>(
+                c,
+                Op::HostReadonly {
+                    name: name.into(),
+                    user: f(form, "user").into(),
+                    code: f(form, "code").into(),
+                },
+            )
+            .map(|d| {
+                let mut m = format!("{name} has a read-only login: {}", d.user);
+                if !d.report.is_empty() {
+                    m.push_str(&format!(" ({})", d.report.join("; ")));
+                }
+                if !d.limited.is_empty() {
+                    m.push_str(&format!(
+                        ". Admin spaces here ({}) now run only when started, for a time",
+                        d.limited.join(", ")
+                    ));
+                }
+                m
+            }),
+        ),
         "check" => back(
             &here,
             get::<String>(c, Op::HostCheck { name: name.into() })

@@ -99,7 +99,8 @@ pub fn ls() -> Result<()> {
     let mut rows = vec![vec![
         "NAME".to_string(),
         "ADDRESS".into(),
-        "USER".into(),
+        "ADMIN".into(),
+        "READ-ONLY".into(),
         "OS".into(),
         "SPACES".into(),
         "STATUS".into(),
@@ -114,6 +115,7 @@ pub fn ls() -> Result<()> {
             h.name.clone(),
             addr,
             h.user.clone(),
+            h.readonly.clone().unwrap_or_else(|| "-".into()),
             h.os.to_string(),
             if h.spaces.is_empty() {
                 "-".into()
@@ -154,6 +156,40 @@ pub fn pubkey(name: &str) -> Result<()> {
 pub fn check(name: &str) -> Result<()> {
     let os = ops::host_check(name)?;
     println!("ok: blackthorn can log in to {name} ({os})");
+    Ok(())
+}
+
+pub fn readonly(name: &str, user: &str, print: bool, verify: bool) -> Result<()> {
+    if print {
+        print!("{}", ops::host_readonly_script(name, user)?);
+        eprintln!(
+            "\n# Run that as root on {name} (e.g. save it as setup.sh, then: sudo sh setup.sh),\n\
+             # then: sudo thorn host readonly {name} --user {user} --verify"
+        );
+        return Ok(());
+    }
+    if !verify {
+        println!("setting up a read-only login on {name}, as its admin login...");
+    }
+    let done = ops::host_readonly(name, user, !verify)?;
+    for line in &done.report {
+        println!("  {line}");
+    }
+    println!(
+        "{name} has a read-only login: {}. New spaces on it are read-only by default.",
+        done.user
+    );
+    println!(
+        "commands blackthorn's keys run there are in its system log: journalctl -t blackthorn"
+    );
+    if !done.limited.is_empty() {
+        println!(
+            "admin spaces on {name} ({}) now run only when started, for a time, one at a time; \
+             those running now keep running until stopped. Make one read-only with: \
+             sudo thorn access SPACE readonly",
+            done.limited.join(", ")
+        );
+    }
     Ok(())
 }
 

@@ -42,6 +42,30 @@ pub fn pubkey_file(host: &str) -> PathBuf {
     PathBuf::from(KEYS_DIR).join(format!("{host}.pub"))
 }
 
+/// The key of a machine's read-only login (`thorn host readonly`). Host
+/// names have no '.', so these never clash with another host's key.
+pub fn ro_key_file(host: &str) -> PathBuf {
+    PathBuf::from(KEYS_DIR).join(format!("{host}.ro"))
+}
+
+pub fn ro_pubkey_file(host: &str) -> PathBuf {
+    PathBuf::from(KEYS_DIR).join(format!("{host}.ro.pub"))
+}
+
+/// The commands each space ran, copied from its transcripts by root:
+/// /var/log/blackthorn/<key>.log.
+pub const ACTIVITY_DIR: &str = "/var/log/blackthorn";
+/// How far each transcript has been copied.
+pub const ACTIVITY_SEEN_FILE: &str = "/var/lib/blackthorn/activity.toml";
+
+pub fn activity_file(key: &str) -> PathBuf {
+    PathBuf::from(ACTIVITY_DIR).join(format!("{key}.log"))
+}
+
+/// On a managed machine: the forced command of blackthorn's keys, which logs
+/// each command to the system log before running it.
+pub const REMOTE_LOGGER: &str = "/usr/local/libexec/blackthorn-ssh";
+
 pub fn space_home(key: &str) -> PathBuf {
     PathBuf::from(SPACES_DIR).join(key)
 }

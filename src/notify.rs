@@ -218,7 +218,7 @@ const RELEASE_EVERY: u64 = 6 * 3600;
 
 /// Run every minute by `thorn _tick`: report what changed. `lifted` and
 /// `ended` are the blocks and bridges that tick just let go.
-pub fn tick(state: &State, lifted: &[String], ended: &[String]) {
+pub fn tick(state: &State, lifted: &[String], ended: &[String], admin_ended: &[String]) {
     let n = Notify::load();
     let attempts = take_connect_back_attempts();
     if !n.on() {
@@ -283,6 +283,13 @@ pub fn tick(state: &State, lifted: &[String], ended: &[String]) {
             format!("bridge {b} ended"),
             "The time it was given ran out.".into(),
             "link",
+        ));
+    }
+    for s in admin_ended {
+        msgs.push((
+            format!("admin space {s} stopped"),
+            "Its time ran out. Start it again when you need it.".into(),
+            "lock",
         ));
     }
     let t = now();

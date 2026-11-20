@@ -170,6 +170,31 @@ pub enum Op {
     ChatOpen {
         name: String,
         id: Option<String>,
+        /// A new chat's name.
+        #[serde(default)]
+        title: Option<String>,
+    },
+    /// Starts an admin space on a machine with a read-only login, for a
+    /// time.
+    SpaceStartFor {
+        name: String,
+        duration: String,
+        code: String,
+    },
+    SpaceAccess {
+        name: String,
+        access: crate::state::Access,
+        code: String,
+    },
+    HostReadonly {
+        name: String,
+        user: String,
+        code: String,
+    },
+    /// The latest commands a space ran.
+    Activity {
+        name: String,
+        limit: usize,
     },
     HostRename {
         old: String,
@@ -258,6 +283,7 @@ impl Op {
                 | Op::ConfigShow
                 | Op::TailnetPeers
                 | Op::ChatList { .. }
+                | Op::Activity { .. }
                 | Op::UpdateCheck { .. }
                 | Op::Account
                 | Op::NotifyShow
@@ -283,7 +309,10 @@ impl Op {
             | Op::AccountRename { code, .. }
             | Op::NotifySet { code, .. }
             | Op::PasskeyAdd { code, .. }
-            | Op::PasskeyRm { code, .. } => Some(code),
+            | Op::PasskeyRm { code, .. }
+            | Op::SpaceStartFor { code, .. }
+            | Op::SpaceAccess { code, .. }
+            | Op::HostReadonly { code, .. } => Some(code),
             _ => None,
         }
     }
@@ -836,7 +865,7 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
             if names.is_empty() {
                 bail!("name a space");
             }
-            json(ops::space_control(action, &names)?)
+            json(ops::space_control(action, &names, None)?)
         }
         Op::SpaceScreen { name } => json(ops::space_screen(&name)?),
         Op::SpaceSend {
@@ -908,7 +937,23 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
         Op::ChatRename {
             name, id, title, ..
         } => json(ops::chat_rename(&name, &id, &title)?),
-        Op::ChatOpen { name, id } => json(ops::chat_open(&name, id.as_deref())?),
+        Op::ChatOpen { name, id, title } => {
+            json(ops::chat_open(&name, id.as_deref(), title.as_deref())?)
+        }
+        Op::SpaceStartFor { name, duration, .. } => {
+            let secs = ops::parse_duration(duration.trim())?;
+            json(ops::start_unit(&name, false, Some(secs))?)
+        }
+        Op::SpaceAccess { name, access, .. } => json(ops::space_access(&name, access)?),
+        Op::HostReadonly { name, user, .. } => {
+            let user = if user.trim().is_empty() {
+                "blackthorn"
+            } else {
+                user.trim()
+            };
+            json(ops::host_readonly(&name, user, true)?)
+        }
+        Op::Activity { name, limit } => json(crate::activity::list(&name, limit.min(500))?),
         Op::HostRename { old, new, .. } => json(ops::host_rename(&old, &new)?),
         Op::AccountRename { new, .. } => {
             crate::web_cmd::rename_account(user, &new)?;
@@ -1210,6 +1255,26 @@ pub fn all_op_names() -> Vec<String> {
         Op::ChatOpen {
             name: s(),
             id: None,
+            title: None,
+        },
+        Op::SpaceStartFor {
+            name: s(),
+            duration: s(),
+            code: s(),
+        },
+        Op::SpaceAccess {
+            name: s(),
+            access: Default::default(),
+            code: s(),
+        },
+        Op::HostReadonly {
+            name: s(),
+            user: s(),
+            code: s(),
+        },
+        Op::Activity {
+            name: s(),
+            limit: 0,
         },
         Op::HostRename {
             old: s(),
@@ -1264,6 +1329,10 @@ pub fn all_op_names() -> Vec<String> {
             | Op::SpaceRm { .. }
             | Op::SpaceRename { .. }
             | Op::SpaceControl { .. }
+            | Op::SpaceStartFor { .. }
+            | Op::SpaceAccess { .. }
+            | Op::HostReadonly { .. }
+            | Op::Activity { .. }
             | Op::SpaceScreen { .. }
             | Op::SpaceSend { .. }
             | Op::LoginStart { .. }

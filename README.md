@@ -1,13 +1,11 @@
-<p align="center"><img src="assets/logo.svg" width="96" height="96" alt=""></p>
-
-# blackthorn
+# <img src="assets/logo.svg" width="40" height="40" alt="" align="top"> blackthorn
 
 blackthorn turns one small, isolated machine into the place where your AI
 coding agents live. They keep running there, you reach them from your phone
 or laptop, and each one can work on exactly one of your machines, over SSH,
 one way only.
 
-Status: **early (v0.4)**. It works and is tested end to end, but expect
+Status: **early (v0.7)**. It works and is tested end to end, but expect
 changes. Read [THREAT_MODEL.md](THREAT_MODEL.md) before trusting it with
 anything important.
 
@@ -25,11 +23,15 @@ anything important.
    reach the hub at all. To let a space work on a second machine for a
    while, open a **bridge**. Cut a machine off from everything with one
    **block**. All of it is enforced by the kernel, not by asking the model.
+   On the machines themselves, a **read-only login** lets most spaces only
+   look, and keeps admin access for when you need it, for a limited time.
 4. **Keys stay on the hub.** Private keys never leave root-only files; each
    space gets only its own key, through an agent it cannot read. Keys only
    work from the hub's address.
 5. **See everything.** A web UI with a live map of machines, spaces and
-   bridges, or the same from the command line.
+   bridges, or the same from the command line. Every command a space runs
+   is recorded on the hub, and on machines with a read-only login, in
+   their own system log too.
 
 ## How it works
 
@@ -144,6 +146,15 @@ sudo thorn login fig-claude
 sudo thorn status                  # the map, in text
 ```
 
+Give it a read-only login, so spaces only look unless you say otherwise
+(see [Read-only logins](#read-only-logins)):
+
+```sh
+sudo thorn host readonly fig       # new spaces on fig are read-only
+sudo thorn new fig --access admin  # "fig-admin": runs only when started, for a time
+sudo thorn start fig-admin --for 1h
+```
+
 Cut a machine off for an hour, or let `fig-claude` reach `nas` for 30
 minutes:
 
@@ -253,19 +264,23 @@ restores the old settings at any time.
 | `thorn init [--claude-from PATH] [--no-web]` | Set up the hub (the installer runs it), or update Claude Code |
 | `thorn status [--json]` | The map: machines, spaces, bridges, hub health |
 | `thorn ls` | Spaces: machine, agent, state, what they can reach |
-| `thorn new HOST [--agent A] [--name N] [--single] [--local] [--arg A]...` | Create a space on a machine |
+| `thorn new HOST [--agent A] [--name N] [--access readonly\|admin] [--single] [--local] [--arg A]...` | Create a space on a machine |
 | `thorn login SPACE` | Sign a Claude space in, then start it |
 | `thorn start\|stop\|restart SPACE... \| --all` | Control spaces |
+| `thorn start SPACE --for 1h` | Start an admin space on a machine with a read-only login, for a time |
+| `thorn access SPACE readonly\|admin` | Change what a space may do on its machine |
+| `thorn log SPACE [-n 50]` | The commands a space ran (recorded by root) |
 | `thorn attach SPACE` | Open the space's terminal |
 | `thorn screen SPACE` / `thorn send SPACE TEXT` | Read or type into the terminal without attaching |
 | `thorn rename OLD NEW [--rc-name N]` | Rename; same chats |
 | `thorn chat ls SPACE` / `chat rename SPACE ID NAME` / `chat rm SPACE ID` | A space's Claude chats |
-| `thorn chat new SPACE` / `chat open SPACE ID` | Start a new chat, or go back to one |
+| `thorn chat new SPACE [--name N]` / `chat open SPACE ID` | Start a new chat, or go back to one |
 | `thorn remote SPACE on\|off` | Remote Control on, or off: one local conversation, only from the hub |
 | `thorn rm SPACE [--purge]` | Delete; files are archived unless `--purge` |
 | `thorn bridge add FROM TO [--for 1h]` / `bridge rm` / `bridge ls` | Let one space reach another space's machine for a while |
 | `thorn host add NAME USER@IP [--port P]` | Register a machine and create its key |
 | `thorn host ls` / `host check` / `host pubkey` / `host rescan` / `host rename` / `host rm` | Manage machines |
+| `thorn host readonly NAME [--user U] [--print \| --verify]` | Give a Linux machine a read-only login, and log blackthorn's commands there |
 | `thorn host set-address NAME USER@IP [--port P]` | Move a machine to a new address (e.g. LAN to tailnet); its spaces stay |
 | `thorn host block NAME [--for 30m] [--reason R]` / `host unblock` | Cut a machine off from every space |
 | `thorn web enable\|disable` / `web user add\|rm\|ls\|rename\|passwd\|totp-reset` | The web UI and its accounts |
@@ -305,7 +320,55 @@ instructions = "CONVENTIONS.md"   # where it reads its instructions
 ```
 
 Every space gets an instructions file (`CLAUDE.md`, or the agent's own)
-listing what it can reach and the rules of the hub.
+listing what it can reach, as whom, and the rules of the hub.
+
+### Read-only logins
+
+The hub decides *which* machine a space reaches; what the space may do
+there is up to the login it uses. If that login is root, an agent misled by
+text it read (or simply wrong) runs as root, and from that machine it can
+also reach the internet past the hub's firewall. So the real limit has to
+be on the machine.
+
+`thorn host readonly NAME` gives a Linux machine a second login for spaces.
+blackthorn logs in as the machine's admin login once and:
+
+- creates a user (`blackthorn` by default) with no password, in the `adm`
+  and `systemd-journal` groups, so it reads `/var/log` and `journalctl`
+  (and `systemctl status`) without sudo;
+- gives it a key of its own (`from="<hub>",restrict`), in a home and key
+  file owned by root, so the user cannot replace its own key line;
+- lets it run, with sudo and nothing else, the Docker commands that only
+  read: `docker ps`, `logs`, `stats --no-stream`, `images`, `top`,
+  `system df`, with their output recorded (`log_output`; installs sudo if
+  missing; the rules are checked with `visudo` first);
+- puts a logger in front of both blackthorn keys (`command=` in the key
+  line), so every command they run is in the machine's system log:
+  `journalctl -t blackthorn`.
+
+Not in the read-only list, on purpose, because each amounts to root or
+hands out secrets: the `docker` group, `docker exec`, `run`, `cp`,
+`compose`, `docker inspect` (environment variables hold passwords), `apt`,
+`systemctl restart`.
+
+Once a machine has a read-only login, new spaces on it are read-only. An
+**admin** space there (`--access admin`) does not start at boot: start it
+when you need it, for a time (`thorn start SPACE --for 1h`, or *Start as
+admin…* with an authenticator code on the web); it stops by itself, and
+only one admin space per machine runs at a time. Prefer not to give admin
+spaces `--permission-mode bypassPermissions` or auto mode; the web UI warns
+when they have it.
+
+Rather not let the hub log in as admin to set it up? `thorn host readonly
+NAME --print` prints the script; run it there as root, then `thorn host
+readonly NAME --verify`. Run it again after the machine moves address.
+
+### What a space did
+
+Every shell command a Claude space runs is copied from its chats into
+`/var/log/blackthorn/<space>.log` once a minute, by root: `thorn log SPACE`,
+or the space's *Activity* card. The chats belong to the space and it could
+rewrite them; the copy is root's, and a chat that shrinks is noted.
 
 ## Configuration
 

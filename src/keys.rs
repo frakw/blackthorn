@@ -9,11 +9,24 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 pub fn generate(host: &str) -> Result<()> {
-    let key = paths::key_file(host);
+    keygen(
+        &paths::key_file(host),
+        &format!("blackthorn@{}:{host}", crate::sys::hostname()),
+    )
+}
+
+/// The key of the machine's read-only login.
+pub fn generate_ro(host: &str) -> Result<()> {
+    keygen(
+        &paths::ro_key_file(host),
+        &format!("blackthorn@{}:{host}:readonly", crate::sys::hostname()),
+    )
+}
+
+fn keygen(key: &Path, comment: &str) -> Result<()> {
     if key.exists() {
         return Ok(());
     }
-    let comment = format!("blackthorn@{}:{host}", crate::sys::hostname());
     crate::sys::run(
         "ssh-keygen",
         &[
@@ -23,7 +36,7 @@ pub fn generate(host: &str) -> Result<()> {
             "-N",
             "",
             "-C",
-            &comment,
+            comment,
             "-f",
             key.to_str().context("key path")?,
         ],
@@ -31,7 +44,12 @@ pub fn generate(host: &str) -> Result<()> {
 }
 
 pub fn remove(host: &str) -> Result<()> {
-    for p in [paths::key_file(host), paths::pubkey_file(host)] {
+    for p in [
+        paths::key_file(host),
+        paths::pubkey_file(host),
+        paths::ro_key_file(host),
+        paths::ro_pubkey_file(host),
+    ] {
         match std::fs::remove_file(&p) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -42,7 +60,14 @@ pub fn remove(host: &str) -> Result<()> {
 }
 
 pub fn public_key(host: &str) -> Result<String> {
-    let p = paths::pubkey_file(host);
+    read_public(&paths::pubkey_file(host))
+}
+
+pub fn ro_public_key(host: &str) -> Result<String> {
+    read_public(&paths::ro_pubkey_file(host))
+}
+
+fn read_public(p: &Path) -> Result<String> {
     Ok(std::fs::read_to_string(&p)
         .with_context(|| format!("reading {}", p.display()))?
         .trim()
@@ -63,6 +88,14 @@ pub fn key_line(public_key: &str, from: &[IpAddr]) -> String {
         let list: Vec<String> = from.iter().map(|a| a.to_string()).collect();
         format!("from=\"{}\",restrict {public_key}", list.join(","))
     }
+}
+
+/// The same, with blackthorn's logger as forced command: the machine
+/// records every command run with this key (see `remote::LOGGER`).
+pub fn logged_key_line(public_key: &str, from: &[IpAddr]) -> String {
+    let line = key_line(public_key, from);
+    let (opts, key) = line.split_once(' ').expect("options, then the key");
+    format!("{opts},command=\"{}\" {key}", paths::REMOTE_LOGGER)
 }
 
 /// The host's public keys as "<type> <base64>", fetched with ssh-keyscan.
@@ -143,9 +176,9 @@ pub fn fingerprints(host_keys: &[String]) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Replaces everything in a space's agent with the keys of `hosts`.
-/// Does nothing if the agent is not running.
-pub fn sync_agent(key: &str, hosts: &[&str]) -> Result<()> {
+/// Replaces everything in a space's agent with these keys. Does nothing
+/// if the agent is not running.
+pub fn sync_agent(key: &str, files: &[std::path::PathBuf]) -> Result<()> {
     let sock = paths::agent_socket(key);
     if !sock.exists() {
         return Ok(());
@@ -158,13 +191,21 @@ pub fn sync_agent(key: &str, hosts: &[&str]) -> Result<()> {
             Err(e)
         }
     })?;
-    for h in hosts {
-        let file = paths::key_file(h);
+    for file in files {
         if file.exists() {
             ssh_add(&sock, &[file.to_str().context("key path")?])?;
         }
     }
     Ok(())
+}
+
+/// The key file for a login.
+pub fn login_key(l: &crate::state::Login) -> std::path::PathBuf {
+    if l.readonly {
+        paths::ro_key_file(l.host)
+    } else {
+        paths::key_file(l.host)
+    }
 }
 
 fn ssh_add(sock: &Path, args: &[&str]) -> Result<()> {
@@ -211,6 +252,10 @@ mod tests {
         assert_eq!(
             key_line("ssh-ed25519 AAAA c", &from),
             "from=\"100.64.0.10,fd7a::a\",restrict ssh-ed25519 AAAA c"
+        );
+        assert_eq!(
+            logged_key_line("ssh-ed25519 AAAA c", &from[..1]),
+            "from=\"100.64.0.10\",restrict,command=\"/usr/local/libexec/blackthorn-ssh\" ssh-ed25519 AAAA c"
         );
     }
 

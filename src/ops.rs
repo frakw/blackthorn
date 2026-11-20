@@ -6,7 +6,7 @@
 use crate::config::{Config, CLAUDE};
 use crate::ctx::{self, Ctx};
 use crate::state::{
-    now, validate_name, validate_rc_name, Block, Bridge, Host, Mode, Os, Space, State,
+    now, validate_name, validate_rc_name, Access, Block, Bridge, Host, Mode, Os, Space, State,
 };
 use crate::{apply, keys, paths, render, sys, units};
 use anyhow::{anyhow, bail, Context, Result};
@@ -38,6 +38,22 @@ pub struct HubView {
     pub denied_inbound: Vec<IpAddr>,
     pub web_listen: Vec<String>,
     pub memory_available_mb: Option<u64>,
+    /// The networks the hub is on, for the map.
+    #[serde(default)]
+    pub net: NetView,
+}
+
+/// The hub's networks: its tailnet (and who coordinates it) and its LAN
+/// (and the router that is its way to the internet).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct NetView {
+    /// The tailnet's coordination server: "Tailscale", or your headscale's
+    /// host name. None: not on a tailnet.
+    pub control: Option<String>,
+    /// The hub's LAN, e.g. "192.168.10.0/24".
+    pub lan: Option<String>,
+    /// Its default gateway.
+    pub router: Option<IpAddr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +79,22 @@ pub struct SpaceView {
     /// The model it last answered with ("Opus 5.5"), Claude only.
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub access: Access,
+    /// The login it uses on its machine ("blackthorn", "root").
+    #[serde(default)]
+    pub login: String,
+    /// An admin space on a machine with a read-only login: runs only for a
+    /// time, one at a time, not at boot.
+    #[serde(default)]
+    pub limited: bool,
+    /// When it is stopped, while it runs as a limited admin space.
+    #[serde(default)]
+    pub until: Option<u64>,
+    /// Its extra arguments skip permission prompts (auto mode): risky with
+    /// admin access.
+    #[serde(default)]
+    pub unattended: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +105,9 @@ pub struct HostView {
     pub user: String,
     pub os: Os,
     pub spaces: Vec<String>,
+    /// The read-only login's user, if it has one.
+    #[serde(default)]
+    pub readonly: Option<String>,
     pub blocked: bool,
     /// "BLOCKED for 42m (kernel upgrade)" or "open".
     pub status: String,
@@ -106,6 +141,7 @@ pub fn overview(with_version: bool) -> Result<Overview> {
         denied_inbound: crate::apply::denied_inbound(&cfg, &state),
         web_listen: cfg.web.listen.iter().map(|a| a.to_string()).collect(),
         memory_available_mb: memory_available_mb(),
+        net: net_view(),
     };
     let spaces = state
         .spaces
@@ -141,6 +177,18 @@ pub fn overview(with_version: bool) -> Result<Overview> {
                     .into_iter()
                     .map(|(n, _)| n.to_string())
                     .collect(),
+                access: s.access,
+                login: state
+                    .hosts
+                    .get(&s.host)
+                    .map(|h| match s.access {
+                        Access::Admin => h.user.clone(),
+                        Access::Readonly => h.readonly.clone().unwrap_or_default(),
+                    })
+                    .unwrap_or_default(),
+                limited: state.limited(s),
+                until: s.until.filter(|u| *u > t),
+                unattended: unattended(&cfg.claude_args) || unattended(&s.args),
             }
         })
         .collect();
@@ -158,6 +206,7 @@ pub fn overview(with_version: bool) -> Result<Overview> {
                 .into_iter()
                 .map(String::from)
                 .collect(),
+            readonly: h.readonly.clone(),
             blocked: h.blocked(t),
             status: match &h.block {
                 Some(b) if b.active(t) => describe_block(b, t),
@@ -188,6 +237,81 @@ pub fn overview(with_version: bool) -> Result<Overview> {
         bridges,
         agents: cfg.agent_names(),
     })
+}
+
+/// Agent arguments that let it act without asking first.
+pub fn unattended(args: &[String]) -> bool {
+    args.iter().enumerate().any(|(i, a)| {
+        a == "--dangerously-skip-permissions"
+            || a == "--permission-mode=bypassPermissions"
+            || a == "--permission-mode=auto"
+            || (a == "--permission-mode"
+                && args
+                    .get(i + 1)
+                    .is_some_and(|m| m == "bypassPermissions" || m == "auto"))
+    })
+}
+
+fn net_view() -> NetView {
+    let control = if tailscale_ips().is_empty() {
+        None
+    } else {
+        Some(
+            sys::output("tailscale", &["debug", "prefs"])
+                .ok()
+                .and_then(|p| control_name(&p))
+                .unwrap_or_else(|| "Tailscale".into()),
+        )
+    };
+    let route = sys::output("ip", &["-4", "route", "show", "default"]).unwrap_or_default();
+    let (router, dev) = default_route(&route);
+    let lan = dev.and_then(|d| {
+        let a = sys::output("ip", &["-o", "-4", "addr", "show", "dev", &d]).ok()?;
+        lan_of(&a)
+    });
+    NetView {
+        control,
+        lan,
+        router,
+    }
+}
+
+/// "Tailscale" for Tailscale's own server, else the server's host name,
+/// from `tailscale debug prefs`.
+fn control_name(prefs: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(prefs).ok()?;
+    let url = v["ControlURL"].as_str().unwrap_or("");
+    let host = url
+        .split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("");
+    Some(if host.is_empty() || host.ends_with("tailscale.com") {
+        "Tailscale".into()
+    } else {
+        host.to_string()
+    })
+}
+
+/// The gateway and device of `ip -4 route show default`.
+fn default_route(out: &str) -> (Option<IpAddr>, Option<String>) {
+    let line = out.lines().next().unwrap_or("");
+    let w: Vec<&str> = line.split_whitespace().collect();
+    let after = |k: &str| w.windows(2).find(|p| p[0] == k).map(|p| p[1].to_string());
+    (after("via").and_then(|v| v.parse().ok()), after("dev"))
+}
+
+/// "192.168.10.0/24" from `ip -o -4 addr show dev X`.
+fn lan_of(out: &str) -> Option<String> {
+    let cidr = out.split_whitespace().skip_while(|w| *w != "inet").nth(1)?;
+    let (addr, len) = cidr.split_once('/')?;
+    let addr: std::net::Ipv4Addr = addr.parse().ok()?;
+    let len: u32 = len.parse().ok().filter(|l| *l <= 32)?;
+    let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+    let net = std::net::Ipv4Addr::from(u32::from(addr) & mask);
+    Some(format!("{net}/{len}"))
 }
 
 pub fn claude_version(cfg: &Config) -> Option<String> {
@@ -294,6 +418,12 @@ pub fn describe_until(until: Option<u64>, now: u64) -> String {
     }
 }
 
+/// "52m", "1h 5m": time left until `u`, in whole minutes.
+pub fn describe_left(u: u64, now: u64) -> String {
+    humantime::format_duration(Duration::from_secs(u.saturating_sub(now).div_ceil(60) * 60))
+        .to_string()
+}
+
 pub fn describe_block(b: &Block, now: u64) -> String {
     let mut s = match b.until {
         None => "BLOCKED".to_string(),
@@ -332,6 +462,9 @@ pub struct NewSpace {
     pub rc_name: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Default: read-only if the machine has a read-only login, else admin.
+    #[serde(default)]
+    pub access: Option<Access>,
 }
 
 pub fn logged_in(s: &Space) -> bool {
@@ -354,7 +487,26 @@ pub fn space_new(o: NewSpace) -> Result<String> {
             paths::CONFIG_FILE
         );
     }
-    let name = o.name.unwrap_or_else(|| format!("{}-{agent}", o.host));
+    let readonly_login = ctx.state.host(&o.host)?.readonly.is_some();
+    let access = o.access.unwrap_or(if readonly_login {
+        Access::Readonly
+    } else {
+        Access::Admin
+    });
+    if access == Access::Readonly && !readonly_login {
+        bail!(
+            "{} has no read-only login yet; set one up first (thorn host readonly {})",
+            o.host,
+            o.host
+        );
+    }
+    let name = o.name.unwrap_or_else(|| {
+        if access == Access::Admin && readonly_login {
+            format!("{}-admin", o.host)
+        } else {
+            format!("{}-{agent}", o.host)
+        }
+    });
     validate_name("space", &name)?;
     if ctx.state.spaces.contains_key(&name) {
         bail!("there is already a space named {name:?}; choose another with --name");
@@ -413,12 +565,18 @@ pub fn space_new(o: NewSpace) -> Result<String> {
         conversation: uuid::Uuid::new_v4().to_string(),
         args: o.args,
         created: ctx.now,
+        access,
+        until: None,
+        title: None,
     };
-    let start_now = logged_in(&space);
+    let limited = ctx.state.limited(&space);
+    let start_now = logged_in(&space) && !limited;
     ctx.state.spaces.insert(name.clone(), space);
     ctx.commit()?;
     drop(ctx);
-    sys::systemctl(&["enable", &paths::space_unit(&key)])?;
+    if !limited {
+        sys::systemctl(&["enable", &paths::space_unit(&key)])?;
+    }
     if start_now {
         sys::systemctl(&["start", &paths::space_unit(&key)])?;
     }
@@ -658,9 +816,21 @@ impl Action {
     }
 }
 
+/// How long an admin space runs when no time is given (signing in, or
+/// `thorn start` without --for), and the longest it may.
+pub const ADMIN_DEFAULT: u64 = 3600;
+pub const ADMIN_MAX: u64 = 86_400;
+
 /// Starts, stops or restarts spaces (all of them if `names` is empty).
-/// Returns one line per space.
-pub fn space_control(action: Action, names: &[String]) -> Result<Vec<String>> {
+/// Returns one line per space. An admin space on a machine with a
+/// read-only login starts only with `admin_for` (seconds): it runs that
+/// long. Over the web that takes an authenticator code (SpaceStartFor), so
+/// the plain web Start passes None.
+pub fn space_control(
+    action: Action,
+    names: &[String],
+    admin_for: Option<u64>,
+) -> Result<Vec<String>> {
     sys::require_root()?;
     let (_, state) = ctx::read_only()?;
     let targets: Vec<(String, Space)> = if names.is_empty() {
@@ -675,16 +845,159 @@ pub fn space_control(action: Action, names: &[String]) -> Result<Vec<String>> {
             .map(|n| state.space(n).map(|s| (n.clone(), s.clone())))
             .collect::<Result<_>>()?
     };
+    let all = names.is_empty();
     let mut out = Vec::new();
     for (name, s) in targets {
         if action != Action::Stop && !logged_in(&s) {
             out.push(format!("{name}: not signed in yet (thorn login {name})"));
             continue;
         }
-        sys::systemctl(&[action.verb(), &paths::space_unit(&s.key)])?;
-        out.push(format!("{name}: {}", action.done()));
+        if action == Action::Stop {
+            sys::systemctl(&["stop", &paths::space_unit(&s.key)])?;
+            out.push(format!("{name}: stopped"));
+            continue;
+        }
+        // `--all` leaves limited admin spaces alone rather than failing.
+        if all && state.limited(&s) && admin_for.is_none() {
+            out.push(format!(
+                "{name}: admin space, not started (start it on its own, for a time)"
+            ));
+            continue;
+        }
+        match start_unit(&name, action == Action::Restart, admin_for)? {
+            Some(until) => out.push(format!(
+                "{name}: {} as admin until {} UTC",
+                action.done(),
+                rfc3339(until)
+            )),
+            None => out.push(format!("{name}: {}", action.done())),
+        }
     }
     Ok(out)
+}
+
+/// Starts (or restarts) a space. A limited admin space (its machine has a
+/// read-only login) needs `admin_for`, unless it is running and only
+/// restarted (then it keeps its time), and may not run next to another
+/// admin space on the same machine. Returns until when it runs as admin.
+pub fn start_unit(name: &str, restart: bool, admin_for: Option<u64>) -> Result<Option<u64>> {
+    let mut ctx = Ctx::open()?;
+    let s = ctx.state.space(name)?.clone();
+    let unit = paths::space_unit(&s.key);
+    let running = sys::unit_state(&unit) == "active";
+    if !ctx.state.limited(&s) {
+        drop(ctx);
+        sys::systemctl(&[if restart { "restart" } else { "start" }, &unit])?;
+        return Ok(None);
+    }
+    if running && (restart || admin_for.is_none()) {
+        drop(ctx);
+        if restart {
+            sys::systemctl(&["restart", &unit])?;
+        }
+        return Ok(s.until);
+    }
+    let Some(secs) = admin_for else {
+        bail!(
+            "{name} has admin access to {}, which has a read-only login: start it for a limited \
+             time (thorn start {name} --for 1h; on the web, Start for…)",
+            s.host
+        );
+    };
+    if secs == 0 || secs > ADMIN_MAX {
+        bail!("an admin space runs for 1 minute to 1 day at a time");
+    }
+    if let Some((other, _)) = ctx.state.spaces.iter().find(|(n, o)| {
+        *n != name
+            && o.host == s.host
+            && o.access == Access::Admin
+            && sys::unit_state(&paths::space_unit(&o.key)) == "active"
+    }) {
+        bail!(
+            "{other} is already working on {} as admin; stop it first (one admin space per machine at a time)",
+            s.host
+        );
+    }
+    let until = ctx.now + secs;
+    ctx.state.spaces.get_mut(name).expect("checked").until = Some(until);
+    ctx.commit()?;
+    drop(ctx);
+    sys::systemctl(&[if running { "restart" } else { "start" }, &unit])?;
+    Ok(Some(until))
+}
+
+/// After signing in: start the space, unless it is a limited admin space
+/// (those start only when you say for how long). Returns whether it started.
+pub fn start_after_login(name: &str) -> Result<bool> {
+    let (_, state) = ctx::read_only()?;
+    let s = state.space(name)?;
+    if state.limited(s) {
+        return Ok(false);
+    }
+    sys::systemctl(&["restart", &paths::space_unit(&s.key)])?;
+    Ok(true)
+}
+
+/// Stops admin spaces whose time is up. Returns their names.
+pub fn expire_admin(ctx: &mut Ctx) -> Vec<String> {
+    let mut ended = Vec::new();
+    for (name, s) in ctx.state.spaces.iter_mut() {
+        if s.until.is_some_and(|u| u <= ctx.now) {
+            s.until = None;
+            if sys::unit_state(&paths::space_unit(&s.key)) == "active" {
+                let _ = sys::systemctl(&["stop", &paths::space_unit(&s.key)]);
+                ended.push(name.clone());
+            }
+        }
+    }
+    ended
+}
+
+/// Makes a space admin or read-only on its machine. Read-only needs the
+/// machine's read-only login. A running space restarts (its open SSH
+/// connections close); one that becomes a limited admin space stops
+/// instead, and starts again only for a time. Returns what happened.
+pub fn space_access(name: &str, access: Access) -> Result<String> {
+    let mut ctx = Ctx::open()?;
+    let s = ctx.state.space(name)?.clone();
+    let h = ctx.state.host(&s.host)?.clone();
+    if access == Access::Readonly && h.readonly.is_none() {
+        bail!(
+            "{} has no read-only login yet; set one up first (thorn host readonly {})",
+            s.host,
+            s.host
+        );
+    }
+    if s.access == access {
+        return Ok(format!("{name} is already {access}"));
+    }
+    let sp = ctx.state.spaces.get_mut(name).expect("checked");
+    sp.access = access;
+    sp.until = None;
+    let limited = ctx.state.limited(&ctx.state.spaces[name]);
+    ctx.commit()?;
+    drop(ctx);
+    let unit = paths::space_unit(&s.key);
+    let running = sys::unit_state(&unit) == "active";
+    if limited {
+        sys::systemctl(&["disable", &unit])?;
+        if running {
+            sys::systemctl(&["stop", &unit])?;
+        }
+        return Ok(format!(
+            "{name} is now admin on {}; it stopped: start it for a limited time when you need it",
+            s.host
+        ));
+    }
+    sys::systemctl(&["enable", &unit])?;
+    if running {
+        sys::systemctl(&["restart", &unit])?;
+        return Ok(format!(
+            "{name} is now {access} on {}; it restarted",
+            s.host
+        ));
+    }
+    Ok(format!("{name} is now {access} on {}", s.host))
 }
 
 /// The text on the space's terminal right now.
@@ -772,7 +1085,7 @@ pub struct Chat {
 /// Transcripts: ~/.claude/projects/<dir>/<uuid>.jsonl, real files and
 /// directories only (the space user owns these; root never follows a link
 /// it may have planted).
-fn chat_files(key: &str) -> Vec<(String, PathBuf)> {
+pub(crate) fn chat_files(key: &str) -> Vec<(String, PathBuf)> {
     let projects = paths::space_home(key).join(".claude/projects");
     let Ok(dirs) = std::fs::read_dir(projects) else {
         return Vec::new();
@@ -1047,7 +1360,13 @@ fn chat_windows(key: &str) -> Vec<String> {
 /// its own next to the Remote Control server, itself on Remote Control,
 /// so it shows in the Claude app. It runs until it is closed or the space
 /// stops.
-fn open_window(name: &str, s: &Space, cfg: &Config, id: Option<&str>) -> Result<ChatOpened> {
+fn open_window(
+    name: &str,
+    s: &Space,
+    cfg: &Config,
+    id: Option<&str>,
+    title: Option<&str>,
+) -> Result<ChatOpened> {
     let sock = paths::tmux_socket(&s.key);
     if !sock.exists() || sys::unit_state(&paths::space_unit(&s.key)) != "active" {
         bail!("space {name} is not running; start it first");
@@ -1101,6 +1420,9 @@ fn open_window(name: &str, s: &Space, cfg: &Config, id: Option<&str>) -> Result<
         "--remote-control",
         &l.rc_name,
     ];
+    if let (false, Some(t)) = (resume, title) {
+        args.extend(["--name", t]);
+    }
     args.extend(l.args.iter().map(String::as_str));
     sys::run("tmux", &args)?;
     Ok(ChatOpened {
@@ -1114,7 +1436,14 @@ fn open_window(name: &str, s: &Space, cfg: &Config, id: Option<&str>) -> Result<
 /// run a new conversation (`id` None) or an earlier one. The chat it ran
 /// before stays in the list. With Remote Control in server mode there is
 /// nothing to switch: new chats are started from the Claude app.
-pub fn chat_open(name: &str, id: Option<&str>) -> Result<ChatOpened> {
+pub fn chat_open(name: &str, id: Option<&str>, title: Option<&str>) -> Result<ChatOpened> {
+    let title = title.map(str::trim).filter(|t| !t.is_empty());
+    if let Some(t) = title {
+        if t.chars().count() > 100 || t.chars().any(char::is_control) {
+            bail!("a chat name is 1 to 100 characters on one line");
+        }
+    }
+    let title = title.filter(|_| id.is_none());
     let mut ctx = Ctx::open()?;
     let s = ctx.state.space(name)?.clone();
     if s.agent != CLAUDE {
@@ -1126,7 +1455,7 @@ pub fn chat_open(name: &str, id: Option<&str>) -> Result<ChatOpened> {
     if main_conversation(&s).is_none() {
         let cfg = ctx.cfg.clone();
         drop(ctx);
-        return open_window(name, &s, &cfg, id);
+        return open_window(name, &s, &cfg, id, title);
     }
     let id = match id {
         None => uuid::Uuid::new_v4().to_string(),
@@ -1139,11 +1468,9 @@ pub fn chat_open(name: &str, id: Option<&str>) -> Result<ChatOpened> {
             window: false,
         });
     }
-    ctx.state
-        .spaces
-        .get_mut(name)
-        .expect("checked")
-        .conversation = id.clone();
+    let sp = ctx.state.spaces.get_mut(name).expect("checked");
+    sp.conversation = id.clone();
+    sp.title = title.map(String::from);
     ctx.commit()?;
     drop(ctx);
     let unit = paths::space_unit(&s.key);
@@ -1446,7 +1773,7 @@ pub fn login_finish(name: &str, code: &str) -> Result<()> {
         std::thread::sleep(Duration::from_millis(500));
         if creds.exists() {
             login_cancel(&s.key);
-            sys::systemctl(&["restart", &paths::space_unit(&s.key)])?;
+            start_after_login(name)?;
             return Ok(());
         }
     }
@@ -1636,6 +1963,7 @@ pub fn host_add(
             host_keys,
             os: Os::Linux,
             block: None,
+            readonly: None,
         },
     );
     ctx.commit()?;
@@ -1747,6 +2075,8 @@ pub fn host_rename(old: &str, new: &str) -> Result<()> {
     let moves = [
         (paths::key_file(old), paths::key_file(new)),
         (paths::pubkey_file(old), paths::pubkey_file(new)),
+        (paths::ro_key_file(old), paths::ro_key_file(new)),
+        (paths::ro_pubkey_file(old), paths::ro_pubkey_file(new)),
     ];
     for (_, to) in &moves {
         if to.exists() {
@@ -1806,37 +2136,7 @@ pub fn host_check(name: &str) -> Result<Os> {
     sys::require_root()?;
     let (_, state) = ctx::read_only()?;
     let h = state.host(name)?.clone();
-    let known = PathBuf::from(format!("/run/blackthorn-check-{name}.known_hosts"));
-    let lines: String = h
-        .host_keys
-        .iter()
-        .map(|k| format!("blackthorn-{name} {k}\n"))
-        .collect();
-    sys::write_file(&known, &lines, 0o600, None)?;
-    let out = Command::new("ssh")
-        .args([
-            "-F",
-            "/dev/null",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "IdentitiesOnly=yes",
-            "-o",
-            "IdentityAgent=none",
-        ])
-        .args(["-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10"])
-        .arg("-o")
-        .arg(format!("UserKnownHostsFile={}", known.display()))
-        .arg("-o")
-        .arg(format!("HostKeyAlias=blackthorn-{name}"))
-        .arg("-i")
-        .arg(paths::key_file(name))
-        .args(["-p", &h.port.to_string()])
-        .arg(format!("{}@{}", h.user, h.address))
-        .arg("uname -s")
-        .output();
-    let _ = std::fs::remove_file(&known);
-    let out = out.context("running ssh")?;
+    let out = crate::remote::ssh(name, &h, &paths::key_file(name), &h.user, "uname -s", None)?;
     if !out.status.success() {
         bail!(
             "could not log in to {name}: {}\nis the line from `thorn host pubkey {name}` in its authorized_keys?",
@@ -1858,6 +2158,156 @@ pub fn host_check(name: &str) -> Result<Os> {
         ctx.commit()?;
     }
     Ok(os)
+}
+
+/// What `host_readonly` did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadonlyDone {
+    pub user: String,
+    /// The setup script's own report ("installed sudo", ...).
+    pub report: Vec<String>,
+    /// Admin spaces on the machine, which from now on run for a limited
+    /// time and not at boot.
+    pub limited: Vec<String>,
+}
+
+/// The read-only login's setup for a machine: the script to run as root
+/// there, from the keys and addresses blackthorn has.
+fn readonly_script(cfg: &Config, state: &State, name: &str, user: &str) -> Result<String> {
+    let h = state.host(name)?;
+    if h.os != Os::Linux {
+        bail!(
+            "{name} runs {}; read-only logins are for Linux machines for now",
+            h.os
+        );
+    }
+    crate::state::validate_remote_user(user)?;
+    if user == "root" || user == h.user {
+        bail!("the read-only login needs a user of its own, not {user}");
+    }
+    keys::generate_ro(name)?;
+    let from = hub_addresses(cfg, h.address);
+    let admin_pub = keys::public_key(name)?;
+    let admin_key = admin_pub
+        .split_whitespace()
+        .nth(1)
+        .context("the admin public key has no key part")?
+        .to_string();
+    Ok(crate::remote::setup_script(&crate::remote::Setup {
+        user,
+        ro_line: &keys::logged_key_line(&keys::ro_public_key(name)?, &from),
+        admin_user: &h.user,
+        admin_key: &admin_key,
+        admin_line: &keys::logged_key_line(&admin_pub, &from),
+    }))
+}
+
+/// The setup script, to run by hand as root on the machine (instead of
+/// letting the hub log in as its admin to run it).
+pub fn host_readonly_script(name: &str, user: &str) -> Result<String> {
+    sys::require_root()?;
+    let (cfg, state) = ctx::read_only()?;
+    readonly_script(&cfg, &state, name, user)
+}
+
+/// Gives a machine a read-only login: runs the setup as its admin login
+/// (unless `run` is false: you ran the script yourself), checks that the
+/// new login works and cannot use sudo for anything else, and records it.
+pub fn host_readonly(name: &str, user: &str, run: bool) -> Result<ReadonlyDone> {
+    sys::require_root()?;
+    let (cfg, state) = ctx::read_only()?;
+    let h = state.host(name)?.clone();
+    let mut report = Vec::new();
+    if run {
+        let script = readonly_script(&cfg, &state, name, user)?;
+        let cmd = if h.user == "root" {
+            "sh -s"
+        } else {
+            "sudo -n sh -s"
+        };
+        let out = crate::remote::ssh(
+            name,
+            &h,
+            &paths::key_file(name),
+            &h.user,
+            cmd,
+            Some(&script),
+        )?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        report = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("bt: "))
+            .filter(|l| *l != "done")
+            .map(String::from)
+            .collect();
+        if !out.status.success() || !text.lines().any(|l| l == "bt: done") {
+            bail!(
+                "setting up {name} failed: {}{}",
+                String::from_utf8_lossy(&out.stderr).trim(),
+                if h.user == "root" {
+                    ""
+                } else {
+                    " (the admin login needs sudo without a password; or run the script yourself: \
+                     thorn host readonly NAME --print)"
+                }
+            );
+        }
+    } else if !paths::ro_key_file(name).exists() {
+        bail!("no read-only key for {name} yet: print the script first (thorn host readonly {name} --print)");
+    }
+    readonly_verify(name, &h, user)?;
+
+    let mut ctx = Ctx::open()?;
+    let host = ctx
+        .state
+        .hosts
+        .get_mut(name)
+        .with_context(|| format!("{name} was removed meanwhile"))?;
+    host.readonly = Some(user.to_string());
+    let limited: Vec<(String, String)> = ctx
+        .state
+        .spaces
+        .iter()
+        .filter(|(_, s)| s.host == name && s.access == Access::Admin)
+        .map(|(n, s)| (n.clone(), s.key.clone()))
+        .collect();
+    ctx.commit()?;
+    drop(ctx);
+    for (_, key) in &limited {
+        let _ = sys::systemctl(&["disable", &paths::space_unit(key)]);
+    }
+    Ok(ReadonlyDone {
+        user: user.to_string(),
+        report,
+        limited: limited.into_iter().map(|(n, _)| n).collect(),
+    })
+}
+
+/// Logs in with the read-only key: it must work, and sudo must not run
+/// just anything.
+fn readonly_verify(name: &str, h: &Host, user: &str) -> Result<()> {
+    let out = crate::remote::ssh(
+        name,
+        h,
+        &paths::ro_key_file(name),
+        user,
+        "id -un; if sudo -n true 2>/dev/null; then echo SUDO-ANYTHING; fi",
+        None,
+    )?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() || text.lines().next() != Some(user) {
+        bail!(
+            "could not log in to {name} as {user}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    if text.contains("SUDO-ANYTHING") {
+        bail!(
+            "{user} on {name} can run anything with sudo, so it is not read-only; \
+             remove its other sudo rules first"
+        );
+    }
+    Ok(())
 }
 
 /// Reads a machine's host keys again. Returns the scan and whether they
@@ -2150,6 +2600,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn networks_of_the_hub() {
+        assert_eq!(
+            control_name(r#"{"ControlURL":"https://headscale.example.com:443/"}"#).as_deref(),
+            Some("headscale.example.com")
+        );
+        assert_eq!(
+            control_name(r#"{"ControlURL":"https://controlplane.tailscale.com"}"#).as_deref(),
+            Some("Tailscale")
+        );
+        assert_eq!(
+            default_route("default via 192.168.10.1 dev ens18 proto static onlink \n"),
+            (Some("192.168.10.1".parse().unwrap()), Some("ens18".into()))
+        );
+        assert_eq!(default_route(""), (None, None));
+        assert_eq!(
+            lan_of("2: ens18    inet 192.168.10.106/24 brd 192.168.10.255 scope global ens18\\       valid_lft forever").as_deref(),
+            Some("192.168.10.0/24")
+        );
+        assert!(unattended(&[
+            "--permission-mode".into(),
+            "bypassPermissions".into()
+        ]));
+        assert!(unattended(&["--dangerously-skip-permissions".into()]));
+        assert!(!unattended(&[
+            "--permission-mode".into(),
+            "acceptEdits".into()
+        ]));
+    }
+
+    #[test]
     fn setting_checks() {
         let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
         let mut state = State::default();
@@ -2162,6 +2642,7 @@ mod tests {
                 host_keys: vec![],
                 os: Os::Linux,
                 block: None,
+                readonly: None,
             },
         );
         let local = [ip("127.0.0.1"), ip("100.64.0.10")];
