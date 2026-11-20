@@ -68,7 +68,7 @@ pub fn ro_public_key(host: &str) -> Result<String> {
 }
 
 fn read_public(p: &Path) -> Result<String> {
-    Ok(std::fs::read_to_string(&p)
+    Ok(std::fs::read_to_string(p)
         .with_context(|| format!("reading {}", p.display()))?
         .trim()
         .to_string())
