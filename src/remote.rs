@@ -237,16 +237,18 @@ pub fn ssh(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn();
-    let out = (|| -> Result<Output> {
-        let mut child = child.context("running ssh")?;
-        if let Some(text) = input {
-            let mut stdin = child.stdin.take().context("ssh stdin")?;
-            stdin.write_all(text.as_bytes())?;
-        }
-        Ok(child.wait_with_output()?)
-    })();
+    let out = finish(child, input);
     let _ = std::fs::remove_file(&known);
     out
+}
+
+fn finish(child: std::io::Result<std::process::Child>, input: Option<&str>) -> Result<Output> {
+    let mut child = child.context("running ssh")?;
+    if let Some(text) = input {
+        let mut stdin = child.stdin.take().context("ssh stdin")?;
+        stdin.write_all(text.as_bytes())?;
+    }
+    Ok(child.wait_with_output()?)
 }
 
 #[cfg(test)]

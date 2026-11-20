@@ -499,8 +499,8 @@ pub fn svg(o: &Overview) -> String {
     // Spaces of machines on the tailnet (or elsewhere) first, then those
     // of LAN machines, so the wires down to the LAN band are short.
     let lan_band = |h: &HostView| net_of(h) != Net::Tailnet && (tailnet || net_of(h) == Net::Lan);
-    let mut order: Vec<&HostView> = o.hosts.iter().filter(|h| !lan_band(*h)).collect();
-    order.extend(o.hosts.iter().filter(|h| lan_band(*h)));
+    let mut order: Vec<&HostView> = o.hosts.iter().filter(|h| !lan_band(h)).collect();
+    order.extend(o.hosts.iter().filter(|h| lan_band(h)));
 
     let mut sy = top;
     let mut hy = top;

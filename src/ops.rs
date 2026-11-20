@@ -800,13 +800,6 @@ pub enum Action {
 }
 
 impl Action {
-    pub fn verb(self) -> &'static str {
-        match self {
-            Action::Start => "start",
-            Action::Stop => "stop",
-            Action::Restart => "restart",
-        }
-    }
     pub fn done(self) -> &'static str {
         match self {
             Action::Start => "started",
