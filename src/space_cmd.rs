@@ -91,6 +91,10 @@ pub fn rename(old: &str, new: &str, rc_name: Option<String>) -> Result<()> {
     println!("renamed space {old} to {new}");
     if restarted {
         println!("restarted it so Remote Control shows the new name");
+        println!(
+            "the old name stays in the Claude app's list of environments, offline, \
+             until Anthropic clears it"
+        );
     }
     Ok(())
 }

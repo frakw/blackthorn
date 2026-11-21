@@ -72,6 +72,7 @@ they are enforced by the kernel or by what the space has, not by the model.
 | Account secrets do not linger | The terminal that showed a new account's QR code and recovery codes is cleared, scrollback included, once you have written them down. |
 | Root does not follow a space's links | Listing, naming and deleting chats reads and writes files in the space's home as root; it skips symbolic links, opens transcripts with `O_NOFOLLOW`, and acts only on files the space user owns. Generated files (such as CLAUDE.md in the space's own work folder) are written through a temporary file created anew (`O_EXCL`), owned and set by its descriptor, so a link planted at that name is never followed (before v0.6 it was). |
 | Web pages are hard to abuse | SameSite=Strict, HttpOnly session cookie; a CSRF value on every form; a CSP that allows no inline script or third-party resource; a small HTTP parser with size, time and connection limits. |
+| Exports are root's | `thorn export` runs only as root on the hub (not from the web), writes a new file readable by root alone, and refuses to overwrite one. The file holds every private key, Claude login and account secret on the hub. `thorn import` takes only an export from the same version, unpacks only blackthorn's own folders, and sets aside what was there instead of deleting it. |
 | SSH changes cannot lock you out | `thorn harden ssh` checks your authenticator first, validates sshd's configuration, and undoes itself unless you confirm from a new login. |
 
 ## What blackthorn does not protect against

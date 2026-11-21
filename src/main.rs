@@ -3,6 +3,7 @@
 mod activity;
 mod api;
 mod apply;
+mod backup;
 mod config;
 mod config_cmd;
 mod ctx;
@@ -181,6 +182,21 @@ enum Cmd {
     /// Let one space reach another space's machine for a while.
     #[command(subcommand)]
     Bridge(BridgeCmd),
+    /// Save everything blackthorn keeps (settings, machine keys, accounts,
+    /// spaces with their Claude logins and chats, logs) to one file. It
+    /// holds every secret on the hub: keep it like one.
+    Export {
+        /// Where to write it (a .tar.gz).
+        file: std::path::PathBuf,
+    },
+    /// Bring back an export from this same version of blackthorn, on this
+    /// hub or a new one (after `thorn init`). What is here is set aside.
+    Import {
+        file: std::path::PathBuf,
+        /// Replace the spaces and machines this hub has now.
+        #[arg(long)]
+        replace: bool,
+    },
     /// Install the latest blackthorn release (settings, accounts and spaces
     /// stay).
     Update {
@@ -530,6 +546,32 @@ fn run(cli: Cli) -> Result<()> {
             ChatCmd::New { space, name } => s::chat_open(&space, None, name.as_deref()),
             ChatCmd::Open { space, id } => s::chat_open(&space, Some(&id), None),
         },
+        Cmd::Export { file } => {
+            let m = backup::export(&file)?;
+            println!(
+                "exported blackthorn {} ({} space(s)) to {}",
+                m.version,
+                m.owners.len(),
+                file.display()
+            );
+            println!("it holds every key and Claude login on this hub; keep it like one");
+            println!("import it with the same version: sudo thorn import FILE");
+            Ok(())
+        }
+        Cmd::Import { file, replace } => {
+            let r = backup::import(&file, replace)?;
+            println!(
+                "imported blackthorn {} from {}: {} space(s), {} machine(s)",
+                r.manifest.version, r.manifest.hostname, r.spaces, r.hosts
+            );
+            if !r.started.is_empty() {
+                println!("started: {}", r.started.join(", "));
+            }
+            for p in &r.before {
+                println!("what was here before: {}", p.display());
+            }
+            Ok(())
+        }
         Cmd::Update { check } => config_cmd::update(check),
         Cmd::Notify(n) => match n {
             NotifyCmd::Show => notify::cmd_show(),

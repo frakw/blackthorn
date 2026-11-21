@@ -1391,6 +1391,7 @@ fn open_window(
     let workdir = s.workdir();
     let env_home = format!("HOME={}", home.display());
     let env_agent = format!("SSH_AUTH_SOCK={}", paths::agent_socket(&s.key).display());
+    let prefix = crate::runner::remote_control_prefix(&l);
     let mut args: Vec<&str> = vec![
         "-S",
         sock.to_str().context("socket path")?,
@@ -1410,12 +1411,14 @@ fn open_window(
         &l.bin,
         if resume { "--resume" } else { "--session-id" },
         &id,
-        "--remote-control",
-        &l.rc_name,
     ];
     if let (false, Some(t)) = (resume, title) {
         args.extend(["--name", t]);
     }
+    // Without a name after it, so the Claude app shows the chat's own name
+    // (see runner::remote_control_prefix).
+    args.push("--remote-control");
+    args.extend(prefix.iter().map(String::as_str));
     args.extend(l.args.iter().map(String::as_str));
     sys::run("tmux", &args)?;
     Ok(ChatOpened {

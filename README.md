@@ -5,7 +5,7 @@ coding agents live. They keep running there, you reach them from your phone
 or laptop, and each one can work on exactly one of your machines, over SSH,
 one way only.
 
-Status: **early (v0.7)**. It works and is tested end to end, but expect
+Status: **early (v0.8)**. It works and is tested end to end, but expect
 changes. Read [THREAT_MODEL.md](THREAT_MODEL.md) before trusting it with
 anything important.
 
@@ -167,10 +167,12 @@ sudo thorn bridge add fig-claude nas-claude --for 30m
 
 The web UI is the everyday way to run blackthorn, on a laptop or a phone:
 
-- **Map**: your devices, the hub (blackthorn and its spaces, framed as one
-  machine), the Claude app and the models your spaces use (framed as
-  Anthropic's cloud), and the machines the spaces work on, as boxes and
-  wires like a node editor. Arrows point from whoever opens the connection.
+- **Map**: the Claude app and the models your spaces use (framed as
+  Anthropic's cloud, with your devices beside it), your tailnet and LAN
+  (with their coordination server and router), the device you manage the
+  hub from, the hub (blackthorn and its spaces, framed as one machine), and
+  the machines the spaces work on, as boxes and wires like a node editor.
+  Arrows point the way commands go.
   Drag boxes around, pan and zoom; the layout is remembered in your browser.
 - **Spaces**: each one's chats (new, continue, rename, delete; with Remote
   Control a new chat runs next to the others and shows in the Claude app),
@@ -292,6 +294,7 @@ restores the old settings at any time.
 | `thorn firewall show [--planned]` / `firewall apply` | Inspect or reload the rules |
 | `thorn apply` | Rewrite all generated files and reload everything |
 | `thorn update [--check]` | Install the latest release (settings, accounts and spaces stay) |
+| `thorn export FILE` / `thorn import FILE [--replace]` | Save everything to one file; bring it back with the same version |
 
 Commands that change anything must run as root.
 
@@ -369,6 +372,42 @@ Every shell command a Claude space runs is copied from its chats into
 `/var/log/blackthorn/<space>.log` once a minute, by root: `thorn log SPACE`,
 or the space's *Activity* card. The chats belong to the space and it could
 rewrite them; the copy is root's, and a chat that shrinks is noted.
+
+### Names in the Claude app
+
+The Claude app lists each Remote Control space as an *environment* named
+after its folder, which is its Remote Control name. Each chat in it shows
+under the chat's own name: the one given with *New chat* (or `thorn chat new
+SPACE --name`) or a rename, else Claude's title for it, else
+`<Remote Control name>-<random>` until it has one. A space no longer makes
+an empty chat when it starts.
+
+Changing a Remote Control name moves the folder, so the app gets a new
+environment. The old one stays in its list, offline, until Anthropic clears
+it: Claude Code keeps it on purpose so a restarted space can take its chats
+back, and offers no way to delete it.
+
+## Backup and moving to a new hub
+
+```sh
+sudo thorn export /root/blackthorn.tar.gz          # on the old hub
+sudo thorn import /root/blackthorn.tar.gz          # on the new one, after install and thorn init
+```
+
+The file holds `/etc/blackthorn`, `/var/lib/blackthorn` and
+`/var/log/blackthorn`: settings, machine keys, web accounts, every space
+with its Claude login and chats, and what the spaces ran. It is written
+readable by root only; it holds every secret on the hub, so keep it like
+one. Only the version of blackthorn that made it imports it (`thorn
+update` first, or install that version), so nothing is read by code that
+expects something else.
+
+Importing sets aside what the hub has (`/etc/blackthorn.before-import-*`
+and so on), stops and removes the spaces' users, unpacks the file, gives
+each space a user again, reloads the firewall and starts the spaces. A hub
+that already has spaces or machines needs `--replace`. The settings come
+along as they were, including the web UI's address: on a hub with another
+address, set it again with `thorn config set`.
 
 ## Configuration
 

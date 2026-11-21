@@ -30,7 +30,16 @@ pub fn run(key: &str) -> Result<()> {
         let text = std::fs::read_to_string(&launch_path)
             .with_context(|| format!("reading {}", launch_path.display()))?;
         let launch: Launch = toml::from_str(&text)?;
-        let args = agent_args(&launch, conversation_exists(&home, &launch.conversation));
+        let mut args = agent_args(&launch, conversation_exists(&home, &launch.conversation));
+        if launch.kind == LaunchKind::ClaudeServer
+            && launch.remote_control
+            && !knows_option(&launch.bin, &home, "create-session-in-dir")
+        {
+            // An older Claude Code: it makes the empty chat in the folder,
+            // so give it the Remote Control name.
+            args.retain(|a| a != "--no-create-session-in-dir");
+            args.splice(1..1, ["--name".to_string(), launch.rc_name.clone()]);
+        }
 
         println!("blackthorn: starting space {}", launch.name);
         let started = Instant::now();
@@ -89,25 +98,74 @@ pub fn agent_args(launch: &Launch, resume: bool) -> Vec<String> {
             name_new(&mut args, launch, resume);
         }
         LaunchKind::ClaudeServer => {
-            args.extend([
-                "remote-control".into(),
-                "--name".into(),
-                launch.rc_name.clone(),
-            ]);
+            // No empty chat made at start: chats come from the Claude app
+            // (named by Claude) and from the hub (named there). The
+            // environment in the app is named after the folder.
+            args.extend(["remote-control".into(), "--no-create-session-in-dir".into()]);
             args.extend(["--spawn".into(), "same-dir".into()]);
             args.extend(["--capacity".into(), launch.capacity.to_string()]);
+            args.extend(remote_control_prefix(launch));
         }
         LaunchKind::ClaudeSingle => {
             // First start: create the conversation under our id.
             args.push(if resume { "--resume" } else { "--session-id" }.into());
             args.push(launch.conversation.clone());
             name_new(&mut args, launch, resume);
-            args.extend(["--remote-control".into(), launch.rc_name.clone()]);
+            args.push("--remote-control".into());
+            args.extend(remote_control_prefix(launch));
         }
         LaunchKind::Command => {}
     }
     args.extend(launch.args.iter().cloned());
     args
+}
+
+/// `--remote-control NAME` would fix the chat's name in the Claude app to
+/// NAME, whatever it is called. Without it the app shows the chat's own
+/// name (given with --name or renamed later), else Claude's title for it,
+/// else "<space's Remote Control name>-<random>" until there is one.
+pub fn remote_control_prefix(launch: &Launch) -> [String; 2] {
+    [
+        "--remote-control-session-name-prefix".into(),
+        launch.rc_name.clone(),
+    ]
+}
+
+/// Whether `claude remote-control --help` mentions an option. Waits at most
+/// ten seconds.
+fn knows_option(bin: &str, home: &Path, option: &str) -> bool {
+    use std::io::Read;
+    let Ok(mut child) = Command::new(bin)
+        .args(["remote-control", "--help"])
+        .env("HOME", home)
+        .env("DISABLE_AUTOUPDATER", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < Duration::from_secs(10) => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+    let mut text = String::new();
+    child
+        .stdout
+        .take()
+        .is_some_and(|mut o| o.read_to_string(&mut text).is_ok())
+        && text.contains(option)
 }
 
 /// A new conversation starts with the name it was given, if any.
@@ -163,12 +221,13 @@ mod tests {
             agent_args(&launch(LaunchKind::ClaudeServer), false),
             vec![
                 "remote-control",
-                "--name",
-                "fig-claude",
+                "--no-create-session-in-dir",
                 "--spawn",
                 "same-dir",
                 "--capacity",
                 "8",
+                "--remote-control-session-name-prefix",
+                "fig-claude",
                 "--permission-mode",
                 "acceptEdits"
             ]
@@ -184,6 +243,7 @@ mod tests {
                 "--session-id",
                 "c0ffee00-0000-4000-8000-000000000000",
                 "--remote-control",
+                "--remote-control-session-name-prefix",
                 "fig-claude",
                 "--permission-mode",
                 "acceptEdits"
@@ -194,6 +254,10 @@ mod tests {
         named.title = "disk usage".into();
         assert_eq!(agent_args(&named, false)[2..4], ["--name", "disk usage"]);
         assert!(!agent_args(&named, true).contains(&"--name".to_string()));
+        // The chat's own name shows in the Claude app, not the space's.
+        let a = agent_args(&named, false);
+        let rc = a.iter().position(|x| x == "--remote-control").unwrap();
+        assert!(a[rc + 1].starts_with("--"));
     }
 
     #[test]

@@ -192,7 +192,7 @@
   if (map) initMap(map);
 
   function initMap(wrap) {
-    var POS = "bt-map-pos3", VIEW = "bt-map-view3"; // v0.7 layout
+    var POS = "bt-map-pos4", VIEW = "bt-map-view4"; // v0.8 layout
     var NW = 230, SLOT_Y = 42, SLOT_ROW = 18, PAD = 16, FRAME_TITLE = 26;
     var svg, view, nodes, busy = false;
     var tools = document.querySelector(".graph-tools");

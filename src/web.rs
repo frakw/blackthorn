@@ -1221,7 +1221,13 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
             )
         };
         let shown = if s.dir == s.rc_name {
-            format!("The Claude app lists it as <b>{}</b>.", esc(&s.dir))
+            format!(
+                "The Claude app lists it as <b>{}</b>, an environment named after its folder; \
+                 each chat in it shows under the chat's own name. A new name makes a new \
+                 environment: the old one stays in the app's list, offline, until Anthropic \
+                 clears it (Claude Code has no way to remove it).",
+                esc(&s.dir)
+            )
         } else {
             format!(
                 "The Claude app lists it as <b>{}</b> (its folder's name, from before v0.6). \
@@ -1559,7 +1565,9 @@ fn space_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>)
                 Ok(restarted) => back(
                     &format!("/space/{}", url_encode(&new)),
                     Ok(if restarted {
-                        "renamed and restarted with the new Remote Control name".into()
+                        "renamed and restarted with the new Remote Control name; the old one \
+                         stays in the Claude app, offline"
+                            .into()
                     } else {
                         "renamed".into()
                     }),
@@ -1615,7 +1623,9 @@ fn space_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>)
             )
             .map(|restarted| {
                 if restarted {
-                    "Remote Control name changed; the space restarted under it".into()
+                    "Remote Control name changed; the space restarted under it. The old \
+                     name stays in the Claude app, offline"
+                        .into()
                 } else {
                     "Remote Control name changed".into()
                 }
@@ -2243,12 +2253,18 @@ fn settings_page(c: &Ctx, flash: &Flash) -> Reply {
          <h2>Add an address</h2><label>Address <input name=\"address\" autocomplete=\"off\" spellcheck=\"false\"></label>\
          <p class=\"dialog-error t-bad\" hidden></p><div class=\"suggest\"></div>\
          <div class=\"buttons\"><button value=\"add\" class=\"primary\">Add</button><button value=\"cancel\" formnovalidate>Cancel</button></div>\
-         </form></dialog>",
+         </form></dialog>\
+         <section class=\"card\" id=\"backup\"><h2>Backup</h2><p>On the hub: <code>sudo thorn export FILE</code> \
+         saves everything blackthorn keeps (settings, machine keys, accounts, spaces with their Claude logins and \
+         chats, what they ran) to one file; <code>sudo thorn import FILE</code> brings it back, on this hub or a new \
+         one, with the same version of blackthorn ({}).</p><p class=\"hint\">Only from the hub's own terminal: the \
+         file holds every secret here.</p></section>",
         update_card(c),
         notify_card(c),
         csrf(c),
         code_field(),
         esc(&picker.to_string()),
+        crate::backup::version(),
     );
     Reply::Html(200, page(c, "Settings", &b, flash))
 }

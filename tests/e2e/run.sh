@@ -204,10 +204,10 @@ fi
 
 say "agents were started the right way"
 a1=$(hub tail -1 "/var/lib/blackthorn/spaces/$k1/fake-claude.args")
-echo "$a1" | grep -q -- '^remote-control --name t1-claude --spawn same-dir --capacity 8' && ok "t1-claude: server mode" || fail "t1-claude: server mode"
+echo "$a1" | grep -q -- '^remote-control --no-create-session-in-dir --spawn same-dir --capacity 8 --remote-control-session-name-prefix t1-claude' && ok "t1-claude: server mode, no empty chat at start" || fail "t1-claude: server mode"
 k2=$(key_of t2-claude)
 a2=$(hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args")
-echo "$a2" | grep -q -- '--session-id .* --remote-control t2-hub' && ok "t2-claude: single mode, Remote Control name t2-hub" || fail "t2-claude: single mode, Remote Control name t2-hub"
+echo "$a2" | grep -q -- '--session-id .* --remote-control --remote-control-session-name-prefix t2-hub' && ok "t2-claude: single mode, its chat named on its own, t2-hub only as a prefix" || fail "t2-claude: single mode: $a2"
 hub test -f "/var/lib/blackthorn/spaces/$k1/t1-claude/CLAUDE.md" && ok "instructions in CLAUDE.md, in a folder named for the Claude app" || fail "instructions written to CLAUDE.md"
 hub grep -q "\"/var/lib/blackthorn/spaces/$k1/t1-claude\"" "/var/lib/blackthorn/spaces/$k1/.claude.json" && ok "that folder is trusted" || fail "folder trust"
 hub runuser -u "bt-$k1" -- ln -s /etc/shadow "/var/lib/blackthorn/spaces/$k1/t1-claude/.CLAUDE.md.thorn-tmp"
@@ -272,12 +272,15 @@ say "new chats: in a one-conversation space, and not with Remote Control"
 thorn chat new t1-claude | grep -q "window of its own" && ok "with Remote Control, a new chat runs in a window of its own" || fail "chat new in server mode"
 sleep 2
 hub tmux -S "/run/blackthorn/$k1/tmux.sock" list-windows -F '#{window_name}' | grep -q '^chat-' && ok "next to the Remote Control server" || fail "chat window"
-hub grep -q -- "^--session-id [0-9a-f-]* --remote-control t1-claude" "/var/lib/blackthorn/spaces/$k1/fake-claude.args" && ok "on Remote Control too, so it shows in the Claude app" || fail "chat window args: $(hub tail -3 "/var/lib/blackthorn/spaces/$k1/fake-claude.args")"
+hub grep -q -- "^--session-id [0-9a-f-]* --remote-control --remote-control-session-name-prefix t1-claude" "/var/lib/blackthorn/spaces/$k1/fake-claude.args" && ok "on Remote Control too, so it shows in the Claude app (under its own name)" || fail "chat window args: $(hub tail -3 "/var/lib/blackthorn/spaces/$k1/fake-claude.args")"
 old=$(hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args" | grep -o -- '--session-id [0-9a-f-]*' | cut -d' ' -f2)
 [ -n "$old" ] || old=$(hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args" | grep -o -- '--resume [0-9a-f-]*' | cut -d' ' -f2)
 dir2="/var/lib/blackthorn/spaces/$k2/.claude/projects/-var-lib-blackthorn-spaces-$k2-work"
 hub runuser -u "bt-$k2" -- sh -c "mkdir -p '$dir2' && echo '{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"the first chat\"}}' > '$dir2/$old.jsonl'"
 thorn chat new t2-claude | grep -q "new chat" && ok "thorn chat new" || fail "thorn chat new"
+thorn chat new t1-claude --name "web check" >/dev/null
+sleep 2
+hub grep -q -- "^--session-id [0-9a-f-]* --name web check --remote-control --remote-control-session-name-prefix t1-claude" "/var/lib/blackthorn/spaces/$k1/fake-claude.args" && ok "a named chat window: the Claude app shows that name" || fail "named chat window: $(hub tail -2 "/var/lib/blackthorn/spaces/$k1/fake-claude.args")"
 sleep 3
 a=$(hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args")
 case "$a" in "--session-id $old"*) fail "still the old chat: $a";; --session-id*) ok "restarted into a new conversation";; *) fail "chat new: $a";; esac
@@ -329,7 +332,7 @@ web_get /space/t1-claude | grep -q "local only" && ok "the space page says local
 r=$(web_post /space/t1-claude/remote --data-urlencode "csrf=$C" --data-urlencode "on=on")
 case "$r" in *"ok=Remote%20Control%20on"*) ok "turned on again from the web";; *) fail "remote on: $r";; esac
 sleep 3
-hub tail -1 "/var/lib/blackthorn/spaces/$k1/fake-claude.args" | grep -q -- '^remote-control --name t1-claude' && ok "back in server mode" || fail "server mode again"
+hub tail -1 "/var/lib/blackthorn/spaces/$k1/fake-claude.args" | grep -q -- '^remote-control --no-create-session-in-dir' && ok "back in server mode" || fail "server mode again"
 expect_reach 20 t1-claude t1 ok
 
 say "account: password and authenticator from the web"
@@ -363,11 +366,11 @@ expect_reach 150 t1-claude t1 ok
 say "rename keeps the space and restarts with the new Remote Control name"
 thorn rename t1-claude t1-main >/dev/null
 sleep 3
-hub tail -1 "/var/lib/blackthorn/spaces/$k1/fake-claude.args" | grep -q -- '--name t1-main' && ok "t1-main restarted with the new name" || fail "t1-main restarted with the new name"
+hub tail -1 "/var/lib/blackthorn/spaces/$k1/fake-claude.args" | grep -q -- '--remote-control-session-name-prefix t1-main' && ok "t1-main restarted with the new name" || fail "t1-main restarted with the new name"
 hub test -f "/var/lib/blackthorn/spaces/$k1/t1-main/CLAUDE.md" && ! hub test -e "/var/lib/blackthorn/spaces/$k1/t1-claude" && ok "its folder moved along (the Claude app lists it by that name)" || fail "folder after rename"
 thorn rename t1-main t1-main --rc-name ops-box >/dev/null
 sleep 3
-hub test -d "/var/lib/blackthorn/spaces/$k1/ops-box" && hub tail -1 "/var/lib/blackthorn/spaces/$k1/fake-claude.args" | grep -q -- '--name ops-box' && ok "a Remote Control name of its own" || fail "rc-name rename"
+hub test -d "/var/lib/blackthorn/spaces/$k1/ops-box" && hub tail -1 "/var/lib/blackthorn/spaces/$k1/fake-claude.args" | grep -q -- '--remote-control-session-name-prefix ops-box' && ok "a Remote Control name of its own" || fail "rc-name rename"
 expect_reach 20 t1-main t1 ok
 expect_reach 15 t1-main t1 ok
 
@@ -478,6 +481,29 @@ say "remove a space"
 thorn rm t2-claude >/dev/null
 hub id "bt-$k2" >/dev/null 2>&1 && fail "user bt-$k2 still exists" || ok "t2-claude's user removed"
 hub test -d "/var/lib/blackthorn/archive/t2-claude-$k2" && ok "t2-claude's files archived" || fail "t2-claude's files archived"
+
+say "export and import: everything in one file, the same version only"
+kr=$(key_of t1-ro)
+hub runuser -u "bt-$kr" -- sh -c "echo mine > /var/lib/blackthorn/spaces/$kr/marker"
+was=$(hub systemctl is-active "blackthorn-space@$kr.service" || true)
+thorn export /root/bt.tar.gz | grep -q "exported blackthorn" && ok "thorn export" || fail "thorn export"
+[ "$(hub stat -c %a:%U /root/bt.tar.gz)" = 600:root ] && ok "the file is root's alone" || fail "export mode: $(hub stat -c %a:%U /root/bt.tar.gz)"
+thorn export /root/bt.tar.gz >/dev/null 2>&1 && fail "export overwrote a file" || ok "an existing file is not overwritten"
+thorn import /root/bt.tar.gz 2>&1 | grep -q -- "--replace" && ok "a hub with spaces is not replaced without --replace" || fail "import without --replace"
+hub sh -c 'rm -rf /tmp/v && mkdir /tmp/v && cd /tmp/v && tar -xzf /root/bt.tar.gz && sed -i "s/^version = .*/version = \"0.0.1\"/" blackthorn-export.toml && tar -czf /root/old.tar.gz blackthorn-export.toml etc var'
+thorn import /root/old.tar.gz --replace 2>&1 | grep -q "from blackthorn 0.0.1" && ok "an export from another version is refused" || fail "version check"
+thorn rm t1-main --purge >/dev/null
+hub rm -f "/var/lib/blackthorn/spaces/$kr/marker"
+out=$(thorn import /root/bt.tar.gz --replace 2>&1) || fail "import: $out"
+echo "$out" | grep -q "imported blackthorn" && ok "thorn import --replace" || fail "import: $out"
+thorn ls | grep -q "^t1-main " && ok "a space removed after the export is back" || fail "t1-main after import: $(thorn ls)"
+[ "$(hub cat "/var/lib/blackthorn/spaces/$kr/marker")" = mine ] && ok "with the spaces' files" || fail "marker after import"
+[ "$(hub stat -c %U "/var/lib/blackthorn/spaces/$kr/marker")" = "bt-$kr" ] && ok "owned by the space's user again" || fail "owner after import: $(hub stat -c %U "/var/lib/blackthorn/spaces/$kr/marker")"
+[ "$(hub stat -c %U "/var/lib/blackthorn/spaces/$kr/.ssh")" = root ] && ok "and its ~/.ssh still root's" || fail ".ssh owner after import"
+[ "$(hub systemctl is-active "blackthorn-space@$kr.service" || true)" = "$was" ] && ok "t1-ro is $was again" || fail "t1-ro state after import"
+hub sh -c 'ls -d /var/lib/blackthorn.before-import-*' >/dev/null && ok "what was here before is kept aside" || fail "nothing set aside"
+[ "$(hub stat -c %a "$(hub sh -c 'ls -d /var/lib/blackthorn.before-import-* | head -1')")" = 700 ] && ok "readable by root only" || fail "aside mode"
+hub nft list ruleset | grep -q "bt-$kr\|$(hub id -u "bt-$kr")" && ok "the firewall knows the space's new user" || fail "firewall after import"
 thorn status
 
 pass_all=1

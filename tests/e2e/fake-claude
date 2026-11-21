@@ -3,6 +3,11 @@
 # with the code "good-code", and otherwise keeps trying both target hosts,
 # logging which ones it can reach.
 echo "$*" >> "$HOME/fake-claude.args"
+case "$*" in
+  "remote-control --help")
+    echo "  --[no-]create-session-in-dir     Pre-create a session in the current directory"
+    exit 0 ;;
+esac
 case "$1" in
   --version) echo "0.0.0 (fake)"; exit 0 ;;
   auth)
