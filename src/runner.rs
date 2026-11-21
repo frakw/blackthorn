@@ -38,7 +38,8 @@ pub fn run(key: &str) -> Result<()> {
             // An older Claude Code: it makes the empty chat in the folder,
             // so give it the Remote Control name.
             args.retain(|a| a != "--no-create-session-in-dir");
-            args.splice(1..1, ["--name".to_string(), launch.rc_name.clone()]);
+            args.insert(1, "--name".into());
+            args.insert(2, launch.rc_name.clone());
         }
 
         println!("blackthorn: starting space {}", launch.name);
