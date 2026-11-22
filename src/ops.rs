@@ -1465,7 +1465,7 @@ fn close_window(key: &str, id: &str) -> Result<bool> {
         std::thread::sleep(Duration::from_millis(300));
     }
     for _ in 0..40 {
-        if !chat_windows(key).iter().any(|x| *x == w) {
+        if !chat_windows(key).contains(&w) {
             return Ok(true);
         }
         std::thread::sleep(Duration::from_millis(250));
