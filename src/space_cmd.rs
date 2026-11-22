@@ -288,6 +288,10 @@ pub fn chat_ls(space: &str) -> Result<()> {
             c.title,
             if c.main {
                 "  (the space's conversation)"
+            } else if c.window {
+                "  (running, started from the hub)"
+            } else if c.running {
+                "  (running)"
             } else {
                 ""
             }
@@ -331,6 +335,12 @@ pub fn chat_rename(space: &str, id: &str, title: &str) -> Result<()> {
 pub fn chat_rm(space: &str, id: &str) -> Result<()> {
     let id = ops::chat_rm(space, id)?;
     println!("deleted chat {} from the hub", &id[..8]);
+    Ok(())
+}
+
+pub fn chat_stop(space: &str, id: &str) -> Result<()> {
+    let id = ops::chat_stop(space, id)?;
+    println!("stopped chat {}", &id[..8]);
     Ok(())
 }
 

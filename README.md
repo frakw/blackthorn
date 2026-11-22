@@ -5,7 +5,7 @@ coding agents live. They keep running there, you reach them from your phone
 or laptop, and each one can work on exactly one of your machines, over SSH,
 one way only.
 
-Status: **early (v0.8)**. It works and is tested end to end, but expect
+Status: **early (v0.9)**. It works and is tested end to end, but expect
 changes. Read [THREAT_MODEL.md](THREAT_MODEL.md) before trusting it with
 anything important.
 
@@ -169,20 +169,22 @@ The web UI is the everyday way to run blackthorn, on a laptop or a phone:
 
 - **Map**: the Claude app and the models your spaces use (framed as
   Anthropic's cloud, with your devices beside it), your tailnet and LAN
-  (with their coordination server and router), the device you manage the
-  hub from, the hub (blackthorn and its spaces, framed as one machine), and
+  (with the router, the hub's way to the internet), the device you manage
+  the hub from, the hub (blackthorn and its spaces, framed as one machine), and
   the machines the spaces work on, as boxes and wires like a node editor.
   Arrows point the way commands go.
   Drag boxes around, pan and zoom; the layout is remembered in your browser.
-- **Spaces**: each one's chats (new, continue, rename, delete; with Remote
-  Control a new chat runs next to the others and shows in the Claude app),
+- **Spaces**: each one's chats (new, continue, stop, rename, delete; with
+  Remote Control a new chat runs next to the others and shows in the Claude
+  app),
   a live view of its terminal, Claude sign-in, bridges, Remote Control on
   or off, and the name the Claude app lists it by.
 - **Machines**: the key line to install (with a Copy button), checking the
   machine's host keys, blocks, renaming.
 - **Settings**: who may connect, never_manage and the web address, edited
   as lists of addresses with a picker that knows your tailnet's devices and
-  whether they are online; and the blackthorn version, with one-click
+  whether they are online; Tailscale on the hub (install, sign in, its
+  state, its own web interface); and the blackthorn version, with one-click
   updates.
 - **Notifications** (on the Settings page): pushed to your phone through
   [ntfy](https://ntfy.sh) (ntfy.sh or your own server) when a managed
@@ -275,7 +277,7 @@ restores the old settings at any time.
 | `thorn attach SPACE` | Open the space's terminal |
 | `thorn screen SPACE` / `thorn send SPACE TEXT` | Read or type into the terminal without attaching |
 | `thorn rename OLD NEW [--rc-name N]` | Rename; same chats |
-| `thorn chat ls SPACE` / `chat rename SPACE ID NAME` / `chat rm SPACE ID` | A space's Claude chats |
+| `thorn chat ls SPACE` / `chat rename SPACE ID NAME` / `chat stop SPACE ID` / `chat rm SPACE ID` | A space's Claude chats |
 | `thorn chat new SPACE [--name N]` / `chat open SPACE ID` | Start a new chat, or go back to one |
 | `thorn remote SPACE on\|off` | Remote Control on, or off: one local conversation, only from the hub |
 | `thorn rm SPACE [--purge]` | Delete; files are archived unless `--purge` |
@@ -294,7 +296,8 @@ restores the old settings at any time.
 | `thorn firewall show [--planned]` / `firewall apply` | Inspect or reload the rules |
 | `thorn apply` | Rewrite all generated files and reload everything |
 | `thorn update [--check]` | Install the latest release (settings, accounts and spaces stay) |
-| `thorn export FILE` / `thorn import FILE [--replace]` | Save everything to one file; bring it back with the same version |
+| `thorn export FILE [--password]` / `thorn import FILE [--replace]` | Save everything to one file (with a password if you like); bring it back with the same version |
+| `thorn tailscale status` / `install` / `up` / `web on\|off` | Tailscale on the hub |
 
 Commands that change anything must run as root.
 
@@ -382,6 +385,13 @@ SPACE --name`) or a rename, else Claude's title for it, else
 `<Remote Control name>-<random>` until it has one. A space no longer makes
 an empty chat when it starts.
 
+A chat is renamed on the hub only while it is not running: a running Claude
+Code keeps the name it started with, shows that in the app, and writes it
+back when it stops. Rename a running chat in the chat itself (`/rename
+NAME`), or stop it first (*Stop*, or `thorn chat stop`, for one started
+from the hub; ending it in the app for one started there); the new name
+shows in the app the next time it runs.
+
 Changing a Remote Control name moves the folder, so the app gets a new
 environment. The old one stays in its list, offline, until Anthropic clears
 it: Claude Code keeps it on purpose so a restarted space can take its chats
@@ -390,15 +400,19 @@ back, and offers no way to delete it.
 ## Backup and moving to a new hub
 
 ```sh
-sudo thorn export /root/blackthorn.tar.gz          # on the old hub
-sudo thorn import /root/blackthorn.tar.gz          # on the new one, after install and thorn init
+sudo thorn export /root/blackthorn.bt      # on the old hub; asks whether to set a password
+sudo thorn import /root/blackthorn.bt      # on the new one, after install and thorn init; asks for it
 ```
 
 The file holds `/etc/blackthorn`, `/var/lib/blackthorn` and
 `/var/log/blackthorn`: settings, machine keys, web accounts, every space
 with its Claude login and chats, and what the spaces ran. It is written
-readable by root only; it holds every secret on the hub, so keep it like
-one. Only the version of blackthorn that made it imports it (`thorn
+readable by root only; it holds every secret on the hub, so give it a
+password (`--password`; without a terminal, the first line of standard
+input) or keep it like one. With a password the whole file is sealed
+(Argon2id and ChaCha20-Poly1305, in checked pieces): a wrong password or a
+damaged file is refused before anything on the hub changes, and a lost
+password cannot be recovered. Only the version of blackthorn that made it imports it (`thorn
 update` first, or install that version), so nothing is read by code that
 expects something else.
 
@@ -429,6 +443,14 @@ address, set it again with `thorn config set`.
 | `agents.<name>` | | Other agents: `bin`, `args`, `instructions` |
 
 ## With Tailscale or Headscale
+
+The **Settings** page (or `sudo thorn tailscale`) installs Tailscale with
+its own installer, signs the hub in to Tailscale's coordination server (a
+sign-in link shows there), shows its state, and turns on Tailscale's own
+web interface (port 5252 on the hub's tailnet address, limited like the
+web UI by `inbound.admin_from`), with a link to it and to the admin
+console. It keeps the hub's DNS settings (`--accept-dns=false`). For
+Headscale, a tag or other options, run `tailscale up` yourself:
 
 - Join the hub to the tailnet with its own tag, Tailscale SSH off, and
   without accepting routes others advertise:

@@ -156,6 +156,20 @@ pub enum Op {
         code: String,
     },
     TailnetPeers,
+    /// Tailscale on the hub.
+    TailscaleShow,
+    TailscaleInstall {
+        code: String,
+    },
+    /// Signs the hub in to Tailscale.
+    TailscaleUp {
+        code: String,
+    },
+    /// Tailscale's web interface on or off.
+    TailscaleWeb {
+        on: bool,
+        code: String,
+    },
     ChatList {
         name: String,
     },
@@ -235,6 +249,11 @@ pub enum Op {
         name: String,
         id: String,
     },
+    /// Stops a chat the hub started in a window of its own.
+    ChatStop {
+        name: String,
+        id: String,
+    },
     SpaceRemote {
         name: String,
         on: bool,
@@ -282,6 +301,7 @@ impl Op {
                 | Op::HostPubkey { .. }
                 | Op::ConfigShow
                 | Op::TailnetPeers
+                | Op::TailscaleShow
                 | Op::ChatList { .. }
                 | Op::Activity { .. }
                 | Op::UpdateCheck { .. }
@@ -312,7 +332,10 @@ impl Op {
             | Op::PasskeyRm { code, .. }
             | Op::SpaceStartFor { code, .. }
             | Op::SpaceAccess { code, .. }
-            | Op::HostReadonly { code, .. } => Some(code),
+            | Op::HostReadonly { code, .. }
+            | Op::TailscaleInstall { code }
+            | Op::TailscaleUp { code }
+            | Op::TailscaleWeb { code, .. } => Some(code),
             _ => None,
         }
     }
@@ -933,6 +956,10 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
         } => json(ops::host_move(&name, &target, port, &keys, client)?),
         Op::ConfigShow => json(ops::config_show()?),
         Op::TailnetPeers => json(ops::tailnet_peers()),
+        Op::TailscaleShow => json(ops::tailscale_view()),
+        Op::TailscaleInstall { .. } => json(ops::tailscale_install()?),
+        Op::TailscaleUp { .. } => json(ops::tailscale_up()?),
+        Op::TailscaleWeb { on, .. } => json(ops::tailscale_web(on)?),
         Op::ChatList { name } => json(ops::chat_list(&name)?),
         Op::ChatRename {
             name, id, title, ..
@@ -1021,6 +1048,7 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
             json("passkey removed")
         }
         Op::ChatRm { name, id } => json(ops::chat_rm(&name, &id)?),
+        Op::ChatStop { name, id } => json(ops::chat_stop(&name, &id)?),
         Op::SpaceRemote { name, on } => json(ops::space_set_remote(&name, on)?),
         Op::UpdateCheck { refresh } => {
             let cached = {
@@ -1245,6 +1273,13 @@ pub fn all_op_names() -> Vec<String> {
             code: s(),
         },
         Op::TailnetPeers,
+        Op::TailscaleShow,
+        Op::TailscaleInstall { code: s() },
+        Op::TailscaleUp { code: s() },
+        Op::TailscaleWeb {
+            on: true,
+            code: s(),
+        },
         Op::ChatList { name: s() },
         Op::ChatRename {
             name: s(),
@@ -1303,6 +1338,7 @@ pub fn all_op_names() -> Vec<String> {
         },
         Op::PasskeyRm { id: s(), code: s() },
         Op::ChatRm { name: s(), id: s() },
+        Op::ChatStop { name: s(), id: s() },
         Op::SpaceRemote {
             name: s(),
             on: true,
@@ -1354,9 +1390,14 @@ pub fn all_op_names() -> Vec<String> {
             | Op::ConfigShow
             | Op::ConfigSet { .. }
             | Op::TailnetPeers
+            | Op::TailscaleShow
+            | Op::TailscaleInstall { .. }
+            | Op::TailscaleUp { .. }
+            | Op::TailscaleWeb { .. }
             | Op::ChatList { .. }
             | Op::ChatRename { .. }
             | Op::ChatRm { .. }
+            | Op::ChatStop { .. }
             | Op::SpaceRemote { .. }
             | Op::UpdateCheck { .. }
             | Op::Update { .. }

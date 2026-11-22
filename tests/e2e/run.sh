@@ -254,13 +254,21 @@ hub runuser -u "bt-$k1" -- ln -s /etc/shadow "$dir/5b2e1d3f-1111-4222-8333-44445
 thorn chat ls t1-claude | grep -q "check the disks" && ok "thorn chat ls names a chat by its first message" || fail "chat ls"
 thorn chat ls t1-claude | grep -q "5b2e1d3f" && fail "chat ls followed a planted link" || ok "chat ls skips links the space user planted"
 thorn chat rename t1-claude 5b2e1d3f "x" 2>&1 | grep -q "no chat" && ok "and will not write through one" || fail "rename through a link"
+thorn chat rm t1-claude 4a1f 2>&1 | grep -q "running" && ok "a chat in use is not deleted" || fail "chat rm while in use"
+thorn chat rename t1-claude 4a1f "x" 2>&1 | grep -q "/rename" && ok "nor renamed: Claude Code would write its own name back" || fail "rename while in use"
+hub touch -h -d '2 hours ago' "$dir/$cid.jsonl"
+# Claude Code's list of its live processes names the chat: running, however old.
+pid=$(hub pgrep -u "bt-$k1" -f fake-claude | head -1)
+hub runuser -u "bt-$k1" -- sh -c "mkdir -p /var/lib/blackthorn/spaces/$k1/.claude/sessions && echo '{\"pid\":$pid,\"sessionId\":\"$cid\",\"kind\":\"bg\"}' > /var/lib/blackthorn/spaces/$k1/.claude/sessions/$pid.json"
+thorn chat rename t1-claude 4a1f "x" 2>&1 | grep -q "running" && ok "a chat Claude Code lists as live counts as running" || fail "live chat renamed"
+thorn chat ls t1-claude | grep -q "check the disks  (running)" && ok "and is listed as running" || fail "live chat in ls: $(thorn chat ls t1-claude)"
+hub rm -f "/var/lib/blackthorn/spaces/$k1/.claude/sessions/$pid.json"
 r=$(web_post /space/t1-claude/chat-rename --data-urlencode "csrf=$C" --data-urlencode "id=$cid" --data-urlencode "title=disk check" --data-urlencode "code=000000")
 case "$r" in *"fresh%20code"*) ok "renaming needs a fresh code";; *) fail "chat rename without a code: $r";; esac
 r=$(web_post /space/t1-claude/chat-rename --data-urlencode "csrf=$C" --data-urlencode "id=$cid" --data-urlencode "title=disk check" --data-urlencode "code=$(fresh_code $WEB_SECRET)")
 case "$r" in *"ok=chat%20renamed"*) ok "chat renamed from the web";; *) fail "chat rename: $r";; esac
 hub tail -1 "$dir/$cid.jsonl" | grep -q '"customTitle":"disk check"' && ok "named the way Claude Code's /rename does" || fail "custom-title line"
 web_get /space/t1-claude | grep -q "disk check" && ok "the space page lists the chat by its new name" || fail "chats on the space page"
-thorn chat rm t1-claude 4a1f 2>&1 | grep -q "in use" && ok "a chat in use is not deleted" || fail "chat rm while in use"
 hub touch -h -d '2 hours ago' "$dir/$cid.jsonl"
 r=$(web_post /space/t1-claude/chat-rm --data-urlencode "csrf=$C" --data-urlencode "id=$cid")
 case "$r" in *"ok=chat%20deleted"*) ok "an old chat deleted from the web";; *) fail "chat rm: $r";; esac
@@ -281,6 +289,19 @@ thorn chat new t2-claude | grep -q "new chat" && ok "thorn chat new" || fail "th
 thorn chat new t1-claude --name "web check" >/dev/null
 sleep 2
 hub grep -q -- "^--session-id [0-9a-f-]* --name web check --remote-control --remote-control-session-name-prefix t1-claude" "/var/lib/blackthorn/spaces/$k1/fake-claude.args" && ok "a named chat window: the Claude app shows that name" || fail "named chat window: $(hub tail -2 "/var/lib/blackthorn/spaces/$k1/fake-claude.args")"
+wid=$(hub grep -- "--name web check" "/var/lib/blackthorn/spaces/$k1/fake-claude.args" | tail -1 | cut -d' ' -f2)
+hub runuser -u "bt-$k1" -- sh -c "echo '{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"web\"}}' > '$dir/$wid.jsonl'"
+thorn chat ls t1-claude | grep -q "running, started from the hub" && ok "a chat started from the hub is listed as running" || fail "window chat in ls: $(thorn chat ls t1-claude)"
+web_get /space/t1-claude | grep -q "/space/t1-claude/chat-stop" && ok "the space page offers to stop it" || fail "no Stop on the space page"
+thorn chat rename t1-claude "${wid%%-*}" "y" 2>&1 | grep -q "/rename" && ok "it is not renamed while it runs" || fail "window chat renamed while running"
+thorn chat stop t1-claude "${wid%%-*}" | grep -q "stopped chat" && ok "thorn chat stop" || fail "chat stop"
+hub tmux -S "/run/blackthorn/$k1/tmux.sock" list-windows -F '#{window_name}' | grep -q "^chat-${wid%%-*}" && fail "its window is still there" || ok "its window is closed"
+thorn chat rename t1-claude "${wid%%-*}" "web check 2" >/dev/null && ok "stopped, it can be renamed" || fail "rename after stop"
+thorn chat open t1-claude "${wid%%-*}" >/dev/null && ok "and continued at once" || fail "continue after stop"
+sleep 2
+thorn chat rm t1-claude "${wid%%-*}" | grep -q "deleted chat" && ok "a running chat from the hub is stopped and deleted" || fail "rm of a window chat"
+hub tmux -S "/run/blackthorn/$k1/tmux.sock" list-windows -F '#{window_name}' | grep -q "^chat-${wid%%-*}" && fail "its window survived the delete" || ok "its window closed with it"
+hub test -e "$dir/$wid.jsonl" && fail "the window chat's transcript is still there" || ok "and its transcript is gone"
 sleep 3
 a=$(hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args")
 case "$a" in "--session-id $old"*) fail "still the old chat: $a";; --session-id*) ok "restarted into a new conversation";; *) fail "chat new: $a";; esac
@@ -482,6 +503,17 @@ thorn rm t2-claude >/dev/null
 hub id "bt-$k2" >/dev/null 2>&1 && fail "user bt-$k2 still exists" || ok "t2-claude's user removed"
 hub test -d "/var/lib/blackthorn/archive/t2-claude-$k2" && ok "t2-claude's files archived" || fail "t2-claude's files archived"
 
+say "tailscale on the hub"
+if hub sh -c 'command -v tailscale' >/dev/null; then
+  ok "tailscale is installed here; skipping the not-installed checks"
+else
+  thorn tailscale status | grep -q "not installed" && ok "thorn tailscale status: not installed" || fail "tailscale status: $(thorn tailscale status 2>&1)"
+  thorn tailscale web on 2>&1 | grep -q "not installed" && ok "its web interface needs it installed" || fail "tailscale web without tailscale"
+  web_get /settings | grep -q 'action="/tailscale/install"' && ok "the Settings page offers to install it" || fail "no install on the Settings page"
+  r=$(web_post /tailscale/install --data-urlencode "csrf=$C" --data-urlencode "code=000000")
+  case "$r" in *"fresh%20code"*) ok "installing it needs a fresh code";; *) fail "tailscale install without a code: $r";; esac
+fi
+
 say "export and import: everything in one file, the same version only"
 kr=$(key_of t1-ro)
 hub runuser -u "bt-$kr" -- sh -c "echo mine > /var/lib/blackthorn/spaces/$kr/marker"
@@ -504,6 +536,18 @@ thorn ls | grep -q "^t1-main " && ok "a space removed after the export is back" 
 hub sh -c 'ls -d /var/lib/blackthorn.before-import-*' >/dev/null && ok "what was here before is kept aside" || fail "nothing set aside"
 [ "$(hub stat -c %a "$(hub sh -c 'ls -d /var/lib/blackthorn.before-import-* | head -1')")" = 700 ] && ok "readable by root only" || fail "aside mode"
 hub nft list ruleset | grep -q "bt-$kr\|$(hub id -u "bt-$kr")" && ok "the firewall knows the space's new user" || fail "firewall after import"
+
+say "an export with a password"
+printf 'short\n' | thorni export /root/x.bt --password 2>&1 | grep -q "at least 8" && ok "a short password is refused" || fail "short export password"
+printf 'pw-secret-1\n' | thorni export /root/sealed.bt --password | grep -q "with a password" && ok "thorn export --password" || fail "sealed export"
+[ "$(hub head -c 19 /root/sealed.bt)" = blackthorn-sealed-1 ] && ok "the file is sealed" || fail "sealed header"
+hub sh -c 'gzip -t < /root/sealed.bt' 2>/dev/null && fail "the sealed file reads as plain gzip" || ok "nothing in it reads without the password"
+[ "$(hub stat -c %a:%U /root/sealed.bt)" = 600:root ] && ok "and it is root's alone too" || fail "sealed export mode"
+printf 'wrong-password\n' | thorni import /root/sealed.bt --replace 2>&1 | grep -q "wrong password" && ok "a wrong password is refused, before anything changes" || fail "wrong password import"
+thorn ls | grep -q "^t1-main " && ok "the spaces are untouched" || fail "spaces after a refused import"
+out=$(printf 'pw-secret-1\n' | thorni import /root/sealed.bt --replace 2>&1) || fail "sealed import: $out"
+echo "$out" | grep -q "imported blackthorn" && ok "imported with the password" || fail "sealed import: $out"
+[ "$(hub cat "/var/lib/blackthorn/spaces/$kr/marker")" = mine ] && ok "with the spaces' files" || fail "marker after sealed import"
 thorn status
 
 pass_all=1

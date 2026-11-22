@@ -8,7 +8,8 @@
 //! version imports it: the files are taken as they are, so a version that
 //! reads them differently is refused rather than guessed at.
 //!
-//! It holds every private key and Claude login on the hub: keep it like one.
+//! It holds every private key and Claude login on the hub: keep it like one,
+//! or give it a password (see `seal`), which import then asks for.
 
 use crate::config::CLAUDE;
 use crate::ctx::Ctx;
@@ -17,8 +18,10 @@ use crate::{apply, paths, sys, units};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
 
 const MANIFEST: &str = "blackthorn-export.toml";
 const FORMAT: u32 = 1;
@@ -45,8 +48,15 @@ pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Writes the export to `out`. Returns what it holds.
-pub fn export(out: &Path) -> Result<Manifest> {
+/// Writes the export to `out`, sealed with `password` if one is given.
+/// Returns what it holds.
+pub fn export(out: &Path, password: Option<&str>) -> Result<Manifest> {
+    if password.is_some_and(|p| p.chars().count() < crate::seal::MIN_PASSWORD) {
+        bail!(
+            "a password is at least {} characters",
+            crate::seal::MIN_PASSWORD
+        );
+    }
     // The lock keeps the state as it is while it is copied; spaces may
     // still add to their chats.
     let ctx = Ctx::open()?;
@@ -75,50 +85,137 @@ pub fn export(out: &Path) -> Result<Manifest> {
     sys::write_file(&tmp.join(MANIFEST), &toml::to_string(&m)?, 0o600, None)?;
 
     // Made first, so the file is root's alone from the start.
-    {
+    let file = {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(out)
-            .with_context(|| format!("creating {}", out.display()))?;
-    }
+            .with_context(|| format!("creating {}", out.display()))?
+    };
     let mut cmd = Command::new("tar");
-    cmd.args(["--create", "--gzip", "--numeric-owner", "--file"])
-        .arg(out)
+    cmd.args(["--create", "--gzip", "--numeric-owner", "--file", "-"])
         .arg("--warning=no-file-changed");
     for s in SKIP {
         cmd.arg(format!("--exclude={s}"));
     }
     cmd.arg("-C").arg(&tmp).arg(MANIFEST).arg("-C").arg("/");
     cmd.args(&m.dirs);
-    let status = cmd.status().context("running tar")?;
+    let result = write_tar(cmd, file, password);
     let _ = std::fs::remove_dir_all(&tmp);
-    // 1: a file changed while it was read (a chat being written).
-    if !matches!(status.code(), Some(0 | 1)) {
+    let failed = match result {
+        // 1: a file changed while it was read (a chat being written).
+        Ok(status) if matches!(status.code(), Some(0 | 1)) => None,
+        Ok(status) => Some(anyhow::anyhow!("tar failed ({status})")),
+        Err(e) => Some(e),
+    };
+    if let Some(e) = failed {
         let _ = std::fs::remove_file(out);
-        bail!("tar failed ({status})");
+        return Err(e);
     }
     drop(ctx);
     Ok(m)
 }
 
-/// The manifest of an export file.
-pub fn read_manifest(file: &Path) -> Result<Manifest> {
-    let out = Command::new("tar")
-        .args(["--extract", "--gzip", "--to-stdout", "--file"])
-        .arg(file)
-        .arg(MANIFEST)
-        .output()
+/// Runs tar writing to its standard output, into `file`, sealed or not.
+fn write_tar(mut cmd: Command, file: std::fs::File, password: Option<&str>) -> Result<ExitStatus> {
+    let mut child = cmd.stdout(Stdio::piped()).spawn().context("running tar")?;
+    let mut from = child.stdout.take().context("tar output")?;
+    let out = std::io::BufWriter::new(file);
+    let copied = (|| -> Result<()> {
+        let mut out = match password {
+            Some(p) => {
+                let mut s = crate::seal::Sealer::new(out, p)?;
+                std::io::copy(&mut from, &mut s)?;
+                s.finish()?
+            }
+            None => {
+                let mut out = out;
+                std::io::copy(&mut from, &mut out)?;
+                out
+            }
+        };
+        out.flush()?;
+        out.get_ref().sync_all()?;
+        Ok(())
+    })();
+    drop(from);
+    let status = child.wait().context("running tar")?;
+    copied.map(|_| status)
+}
+
+/// The export's contents as tar reads them: opened with the password if it
+/// is sealed.
+fn open_export(file: &Path, password: Option<&str>) -> Result<Box<dyn Read + Send>> {
+    let f = std::fs::File::open(file).with_context(|| format!("opening {}", file.display()))?;
+    if !crate::seal::is_sealed(file)? {
+        return Ok(Box::new(f));
+    }
+    let p = password.context("this export has a password")?;
+    Ok(Box::new(crate::seal::Opener::new(f, p)?))
+}
+
+/// Runs tar reading the export from its standard input, with `args`.
+/// Returns its status and, with `capture`, what it wrote.
+fn read_tar(
+    file: &Path,
+    password: Option<&str>,
+    args: &[&OsStr],
+    capture: bool,
+) -> Result<(ExitStatus, Vec<u8>)> {
+    let mut from = open_export(file, password)?;
+    let mut child = Command::new("tar")
+        .args(["--gzip", "--file", "-"])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(if capture {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
+        .spawn()
         .context("running tar")?;
-    if !out.status.success() {
+    let mut to = child.stdin.take().context("tar input")?;
+    let feeder = std::thread::spawn(move || -> std::io::Result<()> {
+        match std::io::copy(&mut from, &mut to) {
+            // tar stops reading once it has what it wants.
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            r => r.map(|_| ()),
+        }
+    });
+    let out = child.wait_with_output().context("running tar")?;
+    let fed = feeder
+        .join()
+        .map_err(|_| anyhow::anyhow!("reading the export failed"))?;
+    fed.with_context(|| format!("reading {}", file.display()))?;
+    Ok((out.status, out.stdout))
+}
+
+/// Whether an export has a password.
+pub fn sealed(file: &Path) -> Result<bool> {
+    crate::seal::is_sealed(file)
+}
+
+/// The manifest of an export file. With a password, a wrong one fails here.
+pub fn read_manifest(file: &Path, password: Option<&str>) -> Result<Manifest> {
+    let (status, out) = read_tar(
+        file,
+        password,
+        &[
+            OsStr::new("--extract"),
+            OsStr::new("--to-stdout"),
+            OsStr::new(MANIFEST),
+        ],
+        true,
+    )?;
+    if !status.success() {
         bail!(
             "{} is not a blackthorn export (no {MANIFEST} in it)",
             file.display()
         );
     }
-    let m: Manifest = toml::from_str(&String::from_utf8_lossy(&out.stdout))
+    let m: Manifest = toml::from_str(&String::from_utf8_lossy(&out))
         .with_context(|| format!("reading {MANIFEST}"))?;
     check(&m)?;
     Ok(m)
@@ -159,9 +256,9 @@ pub struct Imported {
 /// Replaces this hub's data with an export's. With spaces or machines
 /// here already, `replace` must be set: they are stopped and their users
 /// removed, and their files are kept aside (`Imported::before`).
-pub fn import(file: &Path, replace: bool) -> Result<Imported> {
+pub fn import(file: &Path, replace: bool, password: Option<&str>) -> Result<Imported> {
     sys::require_root()?;
-    let m = read_manifest(file)?;
+    let m = read_manifest(file, password)?;
 
     // What is here now.
     let ctx = Ctx::open()?;
@@ -181,7 +278,7 @@ pub fn import(file: &Path, replace: bool) -> Result<Imported> {
     for u in quiet {
         let _ = sys::systemctl(&["stop", u]);
     }
-    let result = swap(file, &m, &here);
+    let result = swap(file, password, &m, &here);
     for u in quiet {
         let _ = sys::systemctl(&["start", u]);
     }
@@ -225,7 +322,7 @@ pub fn import(file: &Path, replace: bool) -> Result<Imported> {
 
 /// Stops what is here, moves it aside, and unpacks the export in its
 /// place. Returns where the old files went.
-fn swap(file: &Path, m: &Manifest, here: &State) -> Result<Vec<PathBuf>> {
+fn swap(file: &Path, password: Option<&str>, m: &Manifest, here: &State) -> Result<Vec<PathBuf>> {
     for s in here.spaces.values() {
         let _ = sys::systemctl(&["disable", "--now", &paths::space_unit(&s.key)]);
         let _ = sys::systemctl(&["stop", &paths::agent_unit(&s.key)]);
@@ -248,23 +345,22 @@ fn swap(file: &Path, m: &Manifest, here: &State) -> Result<Vec<PathBuf>> {
         sys::run("chmod", &["700", aside.to_str().context("path")?])?;
         before.push(aside);
     }
-    let status = Command::new("tar")
-        .args([
-            "--extract",
-            "--gzip",
-            "--numeric-owner",
-            "--same-permissions",
-            "--file",
-        ])
-        .arg(file)
-        .arg("-C")
-        .arg("/")
-        .args(&m.dirs)
-        .status()
-        .context("running tar")?;
-    if !status.success() {
+    let mut args: Vec<&OsStr> = vec![
+        OsStr::new("--extract"),
+        OsStr::new("--numeric-owner"),
+        OsStr::new("--same-permissions"),
+        OsStr::new("-C"),
+        OsStr::new("/"),
+    ];
+    args.extend(m.dirs.iter().map(|d| OsStr::new(d.as_str())));
+    let unpacked = read_tar(file, password, &args, false);
+    if !unpacked.as_ref().is_ok_and(|(s, _)| s.success()) {
         bail!(
-            "unpacking failed ({status}); what was here before is in {}",
+            "unpacking failed ({}); what was here before is in {}",
+            match &unpacked {
+                Ok((s, _)) => s.to_string(),
+                Err(e) => format!("{e:#}"),
+            },
             before
                 .iter()
                 .map(|p| p.display().to_string())

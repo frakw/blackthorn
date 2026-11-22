@@ -192,7 +192,7 @@
   if (map) initMap(map);
 
   function initMap(wrap) {
-    var POS = "bt-map-pos4", VIEW = "bt-map-view4"; // v0.8 layout
+    var POS = "bt-map-pos5", VIEW = "bt-map-view5"; // v0.9 layout
     var NW = 230, SLOT_Y = 42, SLOT_ROW = 18, PAD = 16, FRAME_TITLE = 26;
     var svg, view, nodes, busy = false;
     var tools = document.querySelector(".graph-tools");
@@ -228,6 +228,11 @@
       var dx = Math.max(Math.abs(x2 - x1) / 2, 50);
       return "M" + x1 + "," + y1 + " C" + (x1 + dx) + "," + y1 + " " + (x2 - dx) + "," + y2 + " " + x2 + "," + y2;
     }
+    // Between two ports on the left sides of their nodes (map::wire_path_left).
+    function curveLeft(x1, y1, x2, y2) {
+      var dx = Math.max(Math.abs(x2 - x1) / 2, 60);
+      return "M" + x1 + "," + y1 + " C" + (Math.min(x1, x2) - dx) + "," + y1 + " " + (x2 - dx) + "," + y2 + " " + x2 + "," + y2;
+    }
 
     function height(n) { return n.g.querySelector(".node-body").height.baseVal.value; }
 
@@ -258,9 +263,10 @@
         var a = nodes[el.getAttribute("data-from")], b = nodes[el.getAttribute("data-to")];
         if (!a || !b) return;
         var fp = +el.getAttribute("data-fp") || 0, tp = +el.getAttribute("data-tp") || 0;
-        var x1 = a.x + a.w, y1 = a.y + SLOT_Y + fp * SLOT_ROW, x2 = b.x, y2 = b.y + SLOT_Y + tp * SLOT_ROW;
+        var left = el.getAttribute("data-fs") === "left";
+        var x1 = left ? a.x : a.x + a.w, y1 = a.y + SLOT_Y + fp * SLOT_ROW, x2 = b.x, y2 = b.y + SLOT_Y + tp * SLOT_ROW;
         if (el.tagName.toLowerCase() === "path") {
-          el.setAttribute("d", curve(x1, y1, x2, y2));
+          el.setAttribute("d", (left ? curveLeft : curve)(x1, y1, x2, y2));
         } else {
           el.setAttribute("x", (x1 + x2) / 2);
           el.setAttribute("y", (y1 + y2) / 2 - 6);

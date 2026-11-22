@@ -1,6 +1,6 @@
 [package]
 name = "blackthorn"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 description = "An isolated hub where AI coding agents keep running and work on your machines over SSH, one way only."
 license = "MIT"
@@ -26,6 +26,7 @@ humantime = "2"
 libc = "0.2"
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "std"] }
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+ring = "0.17"
 rustls = { version = "0.23.20", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2.2.0"
 serde = { version = "1", features = ["derive"] }

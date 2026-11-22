@@ -1,5 +1,6 @@
 //! thorn config show / set: the settings the web UI's Settings page changes.
 //! thorn update: install the latest release.
+//! thorn tailscale: Tailscale on the hub.
 
 use crate::{ops, sys, units};
 use anyhow::Result;
@@ -57,6 +58,86 @@ pub fn update(check: bool) -> Result<()> {
         "updating to {tag} in the background; follow it with: journalctl -u {} -f",
         ops::UPDATE_UNIT
     );
+    Ok(())
+}
+
+pub fn tailscale_status() -> Result<()> {
+    let v = ops::tailscale_view();
+    if let Some(b) = &v.busy {
+        println!(
+            "blackthorn is {b} (journalctl -u {} -f)",
+            ops::TAILSCALE_UNIT
+        );
+    }
+    if !v.installed {
+        println!("Tailscale is not installed: sudo thorn tailscale install");
+        return Ok(());
+    }
+    println!("Tailscale {}", v.version.as_deref().unwrap_or(""));
+    println!(
+        "state: {}",
+        if v.state.is_empty() {
+            "not answering"
+        } else {
+            &v.state
+        }
+    );
+    if let Some(u) = &v.auth_url {
+        println!("sign in at: {u}");
+    }
+    if let Some(n) = &v.name {
+        println!("name: {n}");
+    }
+    if !v.ips.is_empty() {
+        let ips: Vec<String> = v.ips.iter().map(|a| a.to_string()).collect();
+        println!("addresses: {}", ips.join(", "));
+    }
+    if let Some(t) = &v.tailnet {
+        println!(
+            "tailnet: {t} (coordinated by {})",
+            v.control.as_deref().unwrap_or("?")
+        );
+    }
+    if v.state == "Running" {
+        println!("devices: {} ({} online)", v.peers, v.online);
+    }
+    match v.web_url() {
+        Some(u) => println!("web interface: {u}"),
+        None => println!("web interface: off (sudo thorn tailscale web on)"),
+    }
+    if let Some(c) = v.console_url() {
+        println!("admin console: {c}");
+    }
+    Ok(())
+}
+
+pub fn tailscale_install() -> Result<()> {
+    println!(
+        "{}; follow it with: journalctl -u {} -f",
+        ops::tailscale_install()?,
+        ops::TAILSCALE_UNIT
+    );
+    println!("then: sudo thorn tailscale up");
+    Ok(())
+}
+
+/// Starts the sign-in and prints the link once Tailscale has one.
+pub fn tailscale_up() -> Result<()> {
+    ops::tailscale_up()?;
+    for _ in 0..60 {
+        let v = ops::tailscale_view();
+        if v.state == "Running" {
+            println!("the hub is on the tailnet");
+            return Ok(());
+        }
+        if let Some(u) = v.auth_url {
+            println!("sign in at: {u}");
+            println!("(thorn tailscale status shows when it is done)");
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    println!("no sign-in link yet: journalctl -u {}", ops::TAILSCALE_UNIT);
     Ok(())
 }
 

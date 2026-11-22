@@ -1073,6 +1073,10 @@ pub struct Chat {
     /// Control space).
     #[serde(default)]
     pub window: bool,
+    /// Running anywhere: also a chat from the Claude app (see
+    /// `chat_running`).
+    #[serde(default)]
+    pub running: bool,
 }
 
 /// Transcripts: ~/.claude/projects/<dir>/<uuid>.jsonl, real files and
@@ -1214,6 +1218,12 @@ pub fn chat_list(name: &str) -> Result<Vec<Chat>> {
     }
     let main = main_conversation(s);
     let windows = chat_windows(&s.key);
+    let active = sys::unit_state(&paths::space_unit(&s.key)) == "active";
+    let live = if active {
+        live_chats(&s.key)
+    } else {
+        Some(Vec::new())
+    };
     let mut chats: Vec<Chat> = chat_files(&s.key)
         .into_iter()
         .filter_map(|(id, p)| {
@@ -1225,10 +1235,20 @@ pub fn chat_list(name: &str) -> Result<Vec<Chat>> {
                 .ok()?
                 .as_secs();
             let text = head_and_tail(&p, meta.len());
+            let main = main == Some(id.as_str());
+            let window = windows.iter().any(|w| id.starts_with(w.as_str()));
+            let running = active
+                && (main
+                    || window
+                    || match &live {
+                        Some(ids) => ids.contains(&id),
+                        None => recently_used(&p),
+                    });
             Some(Chat {
                 title: chat_title(&text).unwrap_or_else(|| "(no messages yet)".into()),
-                main: main == Some(id.as_str()),
-                window: windows.iter().any(|w| id.starts_with(w.as_str())),
+                main,
+                window,
+                running,
                 id,
                 modified,
                 kb: meta.len().div_ceil(1024),
@@ -1273,8 +1293,78 @@ fn open_transcript(path: &Path, uid: u32) -> Result<std::fs::File> {
     Ok(f)
 }
 
+/// Whether a chat was written to in the last ten minutes.
+fn recently_used(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|m| m.elapsed().ok())
+        .is_some_and(|e| e < Duration::from_secs(600))
+}
+
+/// The chats Claude Code is running in a space, from the list it keeps of
+/// its live processes (~/.claude/sessions/<pid>.json). None: no such list
+/// (an older Claude Code).
+fn live_chats(key: &str) -> Option<Vec<String>> {
+    let dir = paths::space_home(key).join(".claude").join("sessions");
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut ids = Vec::new();
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_suffix(".json"))
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid <= 1 || !Path::new(&format!("/proc/{pid}")).exists() {
+            continue;
+        }
+        if let Some(id) = std::fs::read_to_string(e.path())
+            .ok()
+            .and_then(|t| session_of(&t))
+        {
+            ids.push(id);
+        }
+    }
+    Some(ids)
+}
+
+/// The chat a live-process file names.
+fn session_of(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    v["sessionId"].as_str().map(String::from)
+}
+
+/// Whether a chat is running now: the one a one-chat space runs, one in a
+/// window of its own, or one Claude Code lists as live (a chat from the
+/// Claude app). Without that list, one written to in the last ten minutes
+/// counts as running.
+fn chat_running(s: &Space, id: &str, path: &Path) -> bool {
+    let active = sys::unit_state(&paths::space_unit(&s.key)) == "active";
+    if !active {
+        return false;
+    }
+    if main_conversation(s) == Some(id)
+        || chat_windows(&s.key)
+            .iter()
+            .any(|w| id.starts_with(w.as_str()))
+    {
+        return true;
+    }
+    match live_chats(&s.key) {
+        Some(ids) => ids.iter().any(|i| i == id),
+        None => recently_used(path),
+    }
+}
+
 /// Names a chat the way Claude Code's /rename does: a custom-title line at
-/// the end of its transcript, which Claude Code picks up.
+/// the end of its transcript, which Claude Code reads when the chat starts.
+///
+/// Not while it runs: Claude Code keeps the name it started with, shows
+/// that in the Claude app, and writes it back to the transcript when it
+/// stops, over this one.
 pub fn chat_rename(name: &str, id: &str, title: &str) -> Result<String> {
     use std::io::Write as _;
     sys::require_root()?;
@@ -1285,6 +1375,12 @@ pub fn chat_rename(name: &str, id: &str, title: &str) -> Result<String> {
     let (_, state) = ctx::read_only()?;
     let s = state.space(name)?;
     let (id, path) = find_chat(&s.key, id)?;
+    if chat_running(s, &id, &path) {
+        bail!(
+            "this chat is running, and Claude Code keeps the name it started with (and writes it back \
+             when it stops): rename it in the chat by typing /rename NAME, or stop it first"
+        );
+    }
     let mut f = open_transcript(&path, space_uid(&s.key)?)?;
     let line = serde_json::json!({ "type": "custom-title", "customTitle": title, "sessionId": id });
     f.write_all(format!("{line}\n").as_bytes())?;
@@ -1299,19 +1395,19 @@ pub fn chat_rm(name: &str, id: &str) -> Result<String> {
     let s = state.space(name)?;
     let (id, path) = find_chat(&s.key, id)?;
     if main_conversation(s) == Some(id.as_str()) {
-        bail!("this is the conversation space {name} runs; delete the space instead");
+        bail!(
+            "space {name} runs this chat; start a new chat or continue another one (the space \
+             switches to it), then delete this one"
+        );
     }
     let meta = std::fs::symlink_metadata(&path)?;
     if !meta.is_file() || meta.uid() != space_uid(&s.key)? {
         bail!("{} is not the space's own transcript", path.display());
     }
-    let recent = meta
-        .modified()
-        .ok()
-        .and_then(|m| m.elapsed().ok())
-        .is_some_and(|e| e < Duration::from_secs(600));
-    if recent && sys::unit_state(&paths::space_unit(&s.key)) == "active" {
-        bail!("this chat was in use in the last 10 minutes; stop the space first, or wait");
+    // One the hub started in a window of its own is stopped first.
+    close_window(&s.key, &id)?;
+    if chat_running(s, &id, &path) {
+        bail!("this chat is running in the Claude app; end it there (or stop the space) first");
     }
     std::fs::remove_file(&path)?;
     let extra = path.with_extension("");
@@ -1330,6 +1426,52 @@ pub struct ChatOpened {
     /// It runs in a window of its own (a Remote Control space).
     #[serde(default)]
     pub window: bool,
+}
+
+/// Stops a chat the hub started in a window of its own (a Remote Control
+/// space). It drops out of the Claude app; Continue starts it again.
+pub fn chat_stop(name: &str, id: &str) -> Result<String> {
+    sys::require_root()?;
+    let (_, state) = ctx::read_only()?;
+    let s = state.space(name)?;
+    let (id, _) = find_chat(&s.key, id)?;
+    if main_conversation(s) == Some(id.as_str()) {
+        bail!("space {name} runs this chat: stop the space instead");
+    }
+    if !close_window(&s.key, &id)? {
+        bail!(
+            "this chat was not started from the hub, so it is not stopped here: end it in the Claude app"
+        );
+    }
+    Ok(id)
+}
+
+/// Closes the window a chat runs in, if it has one, and waits (up to ten
+/// seconds) for Claude Code to finish writing. Whether there was one.
+fn close_window(key: &str, id: &str) -> Result<bool> {
+    let Some(w) = chat_windows(key)
+        .into_iter()
+        .find(|w| id.starts_with(w.as_str()))
+    else {
+        return Ok(false);
+    };
+    let sock = paths::tmux_socket(key);
+    let sock = sock.to_str().context("socket path")?;
+    let target = format!("chat-{w}");
+    // Ctrl-C twice is how Claude Code is quit by hand; it then saves the
+    // chat. The window goes when it exits.
+    for _ in 0..2 {
+        let _ = sys::run("tmux", &["-S", sock, "send-keys", "-t", &target, "C-c"]);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    for _ in 0..40 {
+        if !chat_windows(key).iter().any(|x| *x == w) {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    sys::run("tmux", &["-S", sock, "kill-window", "-t", &target])?;
+    Ok(true)
 }
 
 /// The first 8 characters of the chats running in windows of their own.
@@ -1368,13 +1510,8 @@ fn open_window(
         None => (uuid::Uuid::new_v4().to_string(), false),
         Some(i) => {
             let (id, path) = find_chat(&s.key, i)?;
-            let recent = std::fs::symlink_metadata(&path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|m| m.elapsed().ok())
-                .is_some_and(|e| e < Duration::from_secs(600));
-            if recent {
-                bail!("this chat was in use in the last 10 minutes; continue it in the Claude app");
+            if chat_running(s, &id, &path) {
+                bail!("this chat is running already; continue it in the Claude app");
             }
             (id, true)
         }
@@ -1629,6 +1766,215 @@ pub fn update_start() -> Result<String> {
         ],
     )?;
     Ok(tag)
+}
+
+// ---------------------------------------------------------------- tailscale
+
+/// Installs Tailscale, or signs the hub in, started from the hub.
+pub const TAILSCALE_UNIT: &str = "blackthorn-tailscale.service";
+/// Tailscale's own web interface (`tailscale set --webclient`), on the
+/// hub's tailnet addresses.
+pub const TAILSCALE_WEB_PORT: u16 = 5252;
+const TAILSCALE_INSTALLER: &str = "https://tailscale.com/install.sh";
+
+/// Tailscale on the hub, for the web UI.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TailscaleView {
+    pub installed: bool,
+    pub version: Option<String>,
+    /// tailscaled's state: "Running", "NeedsLogin", "Stopped", "Starting",
+    /// "NeedsMachineAuth", "NoState"; empty if it does not answer.
+    pub state: String,
+    /// Where to sign in, while it waits for that.
+    pub auth_url: Option<String>,
+    /// The hub's name on the tailnet.
+    pub name: Option<String>,
+    pub ips: Vec<IpAddr>,
+    pub tailnet: Option<String>,
+    /// "Tailscale", or the host name of your own coordination server.
+    pub control: Option<String>,
+    pub peers: usize,
+    pub online: usize,
+    /// Its web interface is on.
+    pub web_client: bool,
+    /// What blackthorn started for it and is still running.
+    pub busy: Option<String>,
+    /// The last lines that wrote.
+    pub log: Vec<String>,
+}
+
+impl TailscaleView {
+    /// Tailscale's web interface, if it is on: on the hub's first tailnet
+    /// address.
+    pub fn web_url(&self) -> Option<String> {
+        if !self.web_client {
+            return None;
+        }
+        let ip = self.ips.iter().find(|i| i.is_ipv4()).or(self.ips.first())?;
+        Some(match ip {
+            IpAddr::V4(v) => format!("http://{v}:{TAILSCALE_WEB_PORT}/"),
+            IpAddr::V6(v) => format!("http://[{v}]:{TAILSCALE_WEB_PORT}/"),
+        })
+    }
+
+    /// The admin console, with Tailscale's own coordination server.
+    pub fn console_url(&self) -> Option<&'static str> {
+        (self.control.as_deref() == Some("Tailscale"))
+            .then_some("https://login.tailscale.com/admin/machines")
+    }
+}
+
+pub fn tailscale_view() -> TailscaleView {
+    let version = sys::output("tailscale", &["version"])
+        .ok()
+        .and_then(|v| v.lines().next().map(|l| l.trim().to_string()));
+    let mut v = TailscaleView {
+        installed: version.is_some(),
+        version,
+        ..Default::default()
+    };
+    let unit = sys::unit_state(TAILSCALE_UNIT);
+    if matches!(unit.as_str(), "active" | "activating") {
+        v.busy = sys::output(
+            "systemctl",
+            &["show", "--property=Description", "--value", TAILSCALE_UNIT],
+        )
+        .ok()
+        .map(|d| d.trim().trim_start_matches("blackthorn: ").to_string());
+    }
+    v.log = sys::output(
+        "journalctl",
+        &[
+            "--unit",
+            TAILSCALE_UNIT,
+            "--lines",
+            "8",
+            "--no-pager",
+            "--output",
+            "cat",
+            "--since",
+            "-1h",
+        ],
+    )
+    .map(|o| o.lines().map(String::from).collect())
+    .unwrap_or_default();
+    if !v.installed {
+        return v;
+    }
+    if let Ok(out) = sys::output("tailscale", &["status", "--json"]) {
+        read_tailscale_status(&mut v, &out);
+    }
+    if let Ok(prefs) = sys::output("tailscale", &["debug", "prefs"]) {
+        v.control = control_name(&prefs);
+        v.web_client = serde_json::from_str::<serde_json::Value>(&prefs)
+            .ok()
+            .and_then(|p| p["RunWebClient"].as_bool())
+            .unwrap_or(false);
+    }
+    v
+}
+
+/// Fills in what `tailscale status --json` says.
+fn read_tailscale_status(v: &mut TailscaleView, json: &str) {
+    let Ok(j) = serde_json::from_str::<serde_json::Value>(json) else {
+        return;
+    };
+    let text = |x: &serde_json::Value| x.as_str().filter(|s| !s.is_empty()).map(String::from);
+    v.state = text(&j["BackendState"]).unwrap_or_default();
+    v.auth_url = text(&j["AuthURL"]);
+    v.name = text(&j["Self"]["DNSName"]).map(|n| n.trim_end_matches('.').to_string());
+    v.ips = j["Self"]["TailscaleIPs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|i| i.as_str()?.parse().ok())
+        .collect();
+    v.tailnet = text(&j["CurrentTailnet"]["Name"]);
+    if let Some(peers) = j["Peer"].as_object() {
+        v.peers = peers.len();
+        v.online = peers
+            .values()
+            .filter(|p| p["Online"].as_bool() == Some(true))
+            .count();
+    }
+}
+
+/// Runs a script for Tailscale in its own unit, so it outlives the
+/// request and its output can be shown.
+fn tailscale_job(what: &str, script: &str) -> Result<()> {
+    if matches!(
+        sys::unit_state(TAILSCALE_UNIT).as_str(),
+        "active" | "activating"
+    ) {
+        bail!("blackthorn is already working on Tailscale (journalctl -u {TAILSCALE_UNIT})");
+    }
+    // A finished run of the unit is cleared first.
+    let _ = sys::systemctl(&["reset-failed", TAILSCALE_UNIT]);
+    sys::run(
+        "systemd-run",
+        &[
+            "--unit",
+            TAILSCALE_UNIT,
+            "--collect",
+            "--quiet",
+            "--description",
+            &format!("blackthorn: {what}"),
+            "/bin/sh",
+            "-c",
+            script,
+        ],
+    )
+}
+
+/// Installs Tailscale with its own installer (its package repository, for
+/// this system), and starts it.
+pub fn tailscale_install() -> Result<String> {
+    sys::require_root()?;
+    if tailscale_view().installed {
+        bail!("Tailscale is installed already");
+    }
+    tailscale_job(
+        "installing Tailscale",
+        &format!(
+            "set -e; f=$(mktemp); trap 'rm -f \"$f\"' EXIT; \
+             curl -fsSL --proto '=https' -o \"$f\" {TAILSCALE_INSTALLER}; sh \"$f\" </dev/null; \
+             systemctl enable --now tailscaled; echo 'Tailscale is installed: sign in next.'"
+        ),
+    )?;
+    Ok("installing Tailscale".into())
+}
+
+/// Signs the hub in to Tailscale (its own coordination server): the sign-in
+/// link shows on the Settings page. The hub keeps its own DNS settings.
+pub fn tailscale_up() -> Result<String> {
+    sys::require_root()?;
+    let v = tailscale_view();
+    if !v.installed {
+        bail!("Tailscale is not installed");
+    }
+    if v.state == "Running" {
+        bail!("the hub is on a tailnet already");
+    }
+    tailscale_job(
+        "signing in to Tailscale",
+        "tailscale up --accept-dns=false && echo 'Signed in: the hub is on the tailnet.'",
+    )?;
+    Ok("signing in: the sign-in link shows here in a moment".into())
+}
+
+/// Turns Tailscale's web interface on or off. Only the addresses allowed to
+/// manage the hub reach it (inbound.admin_from).
+pub fn tailscale_web(on: bool) -> Result<String> {
+    sys::require_root()?;
+    if !tailscale_view().installed {
+        bail!("Tailscale is not installed");
+    }
+    sys::run("tailscale", &["set", &format!("--webclient={on}")])?;
+    Ok(if on {
+        format!("Tailscale's web interface is on, at port {TAILSCALE_WEB_PORT} of the hub's tailnet address")
+    } else {
+        "Tailscale's web interface is off".into()
+    })
 }
 
 // ---------------------------------------------------------------- tailnet
@@ -2682,6 +3028,48 @@ mod tests {
         let a = parse_ip_addr(out);
         assert_eq!(a.len(), 3);
         assert!(a.contains(&"192.168.10.106".parse().unwrap()));
+    }
+
+    #[test]
+    fn live_chats_and_tailscale_status() {
+        assert_eq!(
+            session_of(r#"{"pid":42,"sessionId":"4a1f0c2e-1111","kind":"bg","cwd":"/w"}"#)
+                .as_deref(),
+            Some("4a1f0c2e-1111")
+        );
+        assert_eq!(session_of("{}"), None);
+        assert_eq!(session_of("not json"), None);
+
+        let mut v = TailscaleView::default();
+        read_tailscale_status(
+            &mut v,
+            r#"{"BackendState":"Running","AuthURL":"","Self":{"DNSName":"hub.tail1.ts.net.",
+               "TailscaleIPs":["100.64.0.10","fd7a:115c:a1e0::a"]},"CurrentTailnet":{"Name":"me@example.com"},
+               "Peer":{"a":{"Online":true},"b":{"Online":false}}}"#,
+        );
+        assert_eq!(v.state, "Running");
+        assert_eq!(v.auth_url, None);
+        assert_eq!(v.name.as_deref(), Some("hub.tail1.ts.net"));
+        assert_eq!(v.ips.len(), 2);
+        assert_eq!((v.peers, v.online), (2, 1));
+        assert_eq!(v.web_url(), None, "off");
+        v.web_client = true;
+        assert_eq!(v.web_url().as_deref(), Some("http://100.64.0.10:5252/"));
+        v.control = Some("Tailscale".into());
+        assert!(v.console_url().is_some());
+        v.control = Some("headscale.example.com".into());
+        assert!(v.console_url().is_none(), "no console for your own server");
+
+        let mut w = TailscaleView::default();
+        read_tailscale_status(
+            &mut w,
+            r#"{"BackendState":"NeedsLogin","AuthURL":"https://login.tailscale.com/a/x"}"#,
+        );
+        assert_eq!(w.state, "NeedsLogin");
+        assert_eq!(
+            w.auth_url.as_deref(),
+            Some("https://login.tailscale.com/a/x")
+        );
     }
 
     #[test]

@@ -253,12 +253,19 @@ fn get<T: DeserializeOwned>(c: &Ctx, op: Op) -> std::result::Result<T, String> {
     }
 }
 
+/// Back to a page with a message. The message goes in the query, before
+/// any #anchor, or the server would never see it.
 fn back(to: &str, r: std::result::Result<String, String>) -> Reply {
-    let sep = if to.contains('?') { '&' } else { '?' };
-    match r {
-        Ok(m) => Reply::Redirect(format!("{to}{sep}ok={}", url_encode(&m)), None),
-        Err(e) => Reply::Redirect(format!("{to}{sep}err={}", url_encode(&e)), None),
-    }
+    let (path, anchor) = match to.split_once('#') {
+        Some((p, a)) => (p, format!("#{a}")),
+        None => (to, String::new()),
+    };
+    let sep = if path.contains('?') { '&' } else { '?' };
+    let (k, m) = match r {
+        Ok(m) => ("ok", m),
+        Err(e) => ("err", e),
+    };
+    Reply::Redirect(format!("{path}{sep}{k}={}{anchor}", url_encode(&m)), None)
 }
 
 fn f<'a>(form: &'a HashMap<String, String>, k: &str) -> &'a str {
@@ -408,6 +415,17 @@ fn route(
             Ok(tag) => updating_page(&c, &tag),
             Err(e) => back("/settings#update", Err(e)),
         },
+        ("POST", ["tailscale", action]) => {
+            let code = f(form, "code").to_string();
+            let op = match *action {
+                "install" => Op::TailscaleInstall { code },
+                "up" => Op::TailscaleUp { code },
+                "web-on" => Op::TailscaleWeb { on: true, code },
+                "web-off" => Op::TailscaleWeb { on: false, code },
+                _ => return back("/settings#tailscale", Err("unknown action".into())),
+            };
+            back("/settings#tailscale", get::<String>(&c, op))
+        }
         ("POST", ["update", "check"]) => {
             let r = get::<ops::UpdateInfo>(&c, Op::UpdateCheck { refresh: true });
             back(
@@ -1281,44 +1299,65 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
     for ch in &chats {
         let id = esc(&ch.id);
         let hidden = format!("<input type=\"hidden\" name=\"id\" value=\"{id}\">");
-        let side = if ch.main || ch.window {
-            "<span class=\"badge\">running now</span>".to_string()
+        let running = ch.running || ch.main || ch.window;
+        let delete = format!(
+            "<form method=\"post\" action=\"/space/{n}/chat-rm\" class=\"inline\" data-confirm=\"{}\">{}\
+             {hidden}<button class=\"link danger-text\">Delete</button></form>",
+            if ch.window {
+                format!("Stop and delete the chat {}?", esc(&ch.title))
+            } else {
+                format!("Delete the chat {}?", esc(&ch.title))
+            },
+            csrf(c)
+        );
+        let side = if ch.window {
+            // Started from the hub: stopped from here too.
+            format!(
+                "<span class=\"badge\">running now</span><form method=\"post\" action=\"/space/{n}/chat-stop\" \
+                 class=\"inline\" data-confirm=\"Stop this chat? It leaves the Claude app; Continue brings it back.\">\
+                 {}{hidden}<button class=\"link\">Stop</button></form>{delete}",
+                csrf(c)
+            )
+        } else if running {
+            let how = if ch.main {
+                "the space runs this chat: start or continue another one to switch"
+            } else {
+                "running in the Claude app: end it there to rename or delete it here"
+            };
+            format!("<span class=\"badge\" title=\"{how}\">running now</span>")
         } else {
             let confirm = if one {
                 "Continue this chat? The space restarts into it."
             } else {
                 "Continue this chat? It runs next to the others and shows in the Claude app."
             };
-            let open = {
-                format!(
-                    "<form method=\"post\" action=\"/space/{n}/chat-open\" class=\"inline\" \
-                     data-confirm=\"{confirm}\">{}{hidden}<button class=\"link\">Continue</button></form>",
-                    csrf(c)
-                )
-            };
             format!(
-                "{open}<form method=\"post\" action=\"/space/{n}/chat-rm\" class=\"inline\" data-confirm=\"Delete the chat {}?\">{}\
-                 {hidden}<button class=\"link danger-text\">Delete</button></form>",
-                esc(&ch.title),
+                "<form method=\"post\" action=\"/space/{n}/chat-open\" class=\"inline\" \
+                 data-confirm=\"{confirm}\">{}{hidden}<button class=\"link\">Continue</button></form>{delete}",
                 csrf(c)
             )
         };
-        rows.push_str(&format!(
-            "<li class=\"chat\"><div class=\"chat-main\"><span class=\"chat-title\">{}</span>\
-             <span class=\"item-meta\">{} · {} KB · <code>{}</code></span></div>\
-             <div class=\"chat-actions\">{}{side}</div></li>",
-            esc(&ch.title),
-            ago(now.saturating_sub(ch.modified)),
-            ch.kb,
-            esc(&ch.id[..8.min(ch.id.len())]),
+        // While it runs, Claude Code keeps the name it started with.
+        let rename = if running {
+            String::new()
+        } else {
             rename_dialog(
                 c,
                 &format!("/space/{n}/chat-rename"),
                 "chat",
                 "title",
                 &ch.title,
-                &hidden
-            ),
+                &hidden,
+            )
+        };
+        rows.push_str(&format!(
+            "<li class=\"chat\"><div class=\"chat-main\"><span class=\"chat-title\">{}</span>\
+             <span class=\"item-meta\">{} · {} KB · <code>{}</code></span></div>\
+             <div class=\"chat-actions\">{rename}{side}</div></li>",
+            esc(&ch.title),
+            ago(now.saturating_sub(ch.modified)),
+            ch.kb,
+            esc(&ch.id[..8.min(ch.id.len())]),
         ));
     }
     let (confirm, how) = if one {
@@ -1352,7 +1391,9 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
     );
     format!(
         "<section class=\"card\" id=\"chats\"><div class=\"page-head\"><h2>Chats</h2>{new_chat}</div>\
-         <p class=\"hint\">{how} Newest first. A new name also shows in Claude Code; deleting removes the hub's copy.</p>{}</section>",
+         <p class=\"hint\">{how} Newest first. A chat is renamed here while it is not running (a running one keeps \
+         the name it started with: type <code>/rename NAME</code> in it); the new name shows in the Claude app the next \
+         time it runs. Deleting removes the hub's copy.</p>{}</section>",
         if rows.is_empty() {
             "<p>No chats yet.</p>".to_string()
         } else {
@@ -1705,6 +1746,17 @@ fn space_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>)
                 },
             )
             .map(|_| "chat deleted".into()),
+        ),
+        "chat-stop" => back(
+            &format!("{here}#chats"),
+            get::<String>(
+                c,
+                Op::ChatStop {
+                    name: name.into(),
+                    id: f(form, "id").into(),
+                },
+            )
+            .map(|_| "chat stopped".into()),
         ),
         _ => back(&here, Err("unknown action".into())),
     }
@@ -2244,8 +2296,9 @@ fn settings_page(c: &Ctx, flash: &Flash) -> Reply {
             peers.len()
         )
     };
+    let ts = get::<ops::TailscaleView>(c, Op::TailscaleShow).unwrap_or_default();
     let b = format!(
-        "<h1>Settings</h1>{}{}<section class=\"card\"><h2>Network and access</h2><p class=\"hint\">Saved to \
+        "<h1>Settings</h1>{}{}{}<section class=\"card\"><h2>Network and access</h2><p class=\"hint\">Saved to \
          <code>/etc/blackthorn/config.toml</code> and applied at once.{you} A change that would shut you out is \
          refused.</p>{peers_note}<form method=\"post\" action=\"/settings\" class=\"stack settings\">{}{fields}{}\
          <div><button class=\"primary\">Save</button></div></form></section>\
@@ -2260,13 +2313,159 @@ fn settings_page(c: &Ctx, flash: &Flash) -> Reply {
          one, with the same version of blackthorn ({}).</p><p class=\"hint\">Only from the hub's own terminal: the \
          file holds every secret here.</p></section>",
         update_card(c),
+        tailscale_card(c, &ts),
         notify_card(c),
         csrf(c),
         code_field(),
         esc(&picker.to_string()),
         crate::backup::version(),
     );
-    Reply::Html(200, page(c, "Settings", &b, flash))
+    // Watched while an install or sign-in runs.
+    let head = if ts.busy.is_some() {
+        "<meta http-equiv=\"refresh\" content=\"5;url=/settings#tailscale\">"
+    } else {
+        ""
+    };
+    Reply::Html(200, page_with(c, "Settings", &b, flash, head))
+}
+
+fn tailscale_card(c: &Ctx, v: &ops::TailscaleView) -> String {
+    let link = |url: &str, text: &str| {
+        format!(
+            "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>",
+            esc(url),
+            esc(text)
+        )
+    };
+    let action = |path: &str, label: &str, title: &str, hint: &str| {
+        pop_dialog(
+            c,
+            &format!("/tailscale/{path}"),
+            label,
+            "primary",
+            title,
+            &format!("<p class=\"hint\">{hint}</p>{}", code_field()),
+            label,
+        )
+    };
+    let mut body = String::new();
+    if let Some(b) = &v.busy {
+        body.push_str(&format!(
+            "<p><span class=\"badge\">{}</span> This page refreshes by itself.</p>",
+            esc(b)
+        ));
+    }
+    if !v.installed {
+        body.push_str("<p>Tailscale is not installed on this hub.</p>");
+        if v.busy.is_none() {
+            body.push_str(&action(
+                "install",
+                "Install Tailscale",
+                "Install Tailscale",
+                "Runs Tailscale's own installer (https://tailscale.com/install.sh), which adds its package \
+                 repository for this system and installs it. Then sign in.",
+            ));
+        }
+    } else {
+        let state = match v.state.as_str() {
+            "Running" => "<span class=\"t-ok\">on the tailnet</span>".to_string(),
+            "NeedsLogin" => "<span class=\"t-bad\">needs to sign in</span>".to_string(),
+            "NeedsMachineAuth" => {
+                "<span class=\"t-bad\">waiting for an admin to approve it</span>".to_string()
+            }
+            "Stopped" => "<span class=\"t-bad\">stopped</span>".to_string(),
+            "" => "<span class=\"t-bad\">not answering (is tailscaled running?)</span>".to_string(),
+            s => esc(s),
+        };
+        let mut rows = vec![
+            ("Version", esc(v.version.as_deref().unwrap_or("?"))),
+            ("State", state),
+        ];
+        if let Some(n) = &v.name {
+            rows.push(("Name", format!("<code>{}</code>", esc(n))));
+        }
+        if !v.ips.is_empty() {
+            let ips: Vec<String> = v.ips.iter().map(|a| format!("<code>{a}</code>")).collect();
+            rows.push(("Addresses", ips.join(" ")));
+        }
+        if let Some(t) = &v.tailnet {
+            rows.push((
+                "Tailnet",
+                format!(
+                    "{} · coordinated by {}",
+                    esc(t),
+                    esc(v.control.as_deref().unwrap_or("?"))
+                ),
+            ));
+        }
+        if v.state == "Running" {
+            rows.push(("Devices", format!("{} ({} online)", v.peers, v.online)));
+        }
+        body.push_str("<dl class=\"facts\">");
+        for (k, val) in rows {
+            body.push_str(&format!("<dt>{k}</dt><dd>{val}</dd>"));
+        }
+        body.push_str("</dl>");
+        if let Some(u) = &v.auth_url {
+            body.push_str(&format!(
+                "<p>Sign the hub in: {} (log in with your Tailscale account; this page shows it once it is done).</p>",
+                link(u, "open the sign-in page")
+            ));
+        } else if v.state != "Running" && v.busy.is_none() {
+            body.push_str(&action(
+                "up",
+                "Sign in to Tailscale",
+                "Sign the hub in to Tailscale",
+                "Joins the hub to your tailnet on Tailscale's own coordination server: a sign-in link shows \
+                 here. The hub keeps its own DNS settings.",
+            ));
+        }
+        if v.state == "Running" {
+            let mut links = Vec::new();
+            match v.web_url() {
+                Some(u) => {
+                    links.push(link(&u, "Tailscale's web interface"));
+                    body.push_str(
+                        "<p>Tailscale's web interface is on, for the devices allowed to manage the hub \
+                         (<code>inbound.admin_from</code>).</p>",
+                    );
+                    body.push_str(&action(
+                        "web-off",
+                        "Turn it off",
+                        "Turn off Tailscale's web interface",
+                        "Port 5252 on the hub's tailnet address stops answering.",
+                    ));
+                }
+                None => {
+                    body.push_str(
+                        "<p>Tailscale's own web interface (this device's Tailscale settings: exit node, subnet \
+                         routes, sign out) is off.</p>",
+                    );
+                    body.push_str(&action(
+                        "web-on",
+                        "Turn on its web interface",
+                        "Turn on Tailscale's web interface",
+                        "It answers on port 5252 of the hub's tailnet address, to the devices allowed to manage \
+                         the hub; changing settings there asks you to sign in to Tailscale again.",
+                    ));
+                }
+            }
+            if let Some(u) = v.console_url() {
+                links.push(link(u, "Tailscale admin console"));
+            }
+            if !links.is_empty() {
+                body.push_str(&format!("<p>{}</p>", links.join(" · ")));
+            }
+        }
+    }
+    if !v.log.is_empty() && (v.busy.is_some() || v.state != "Running") {
+        body.push_str(&format!(
+            "<details{}><summary>Last output</summary><pre class=\"wrap\">{}</pre></details>",
+            if v.busy.is_some() { " open" } else { "" },
+            esc(&v.log.join("\n"))
+        ));
+    }
+    format!("<section class=\"card\" id=\"tailscale\"><h2>Tailscale</h2>{body}</section>")
 }
 
 fn notify_card(c: &Ctx) -> String {
@@ -2627,6 +2826,20 @@ fn bridges_page(c: &Ctx, flash: &Flash) -> Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn messages_go_before_the_anchor() {
+        let at = |r: Reply| match r {
+            Reply::Redirect(to, _) => to,
+            _ => panic!("not a redirect"),
+        };
+        assert_eq!(
+            at(back("/space/a#chats", Ok("chat stopped".into()))),
+            "/space/a?ok=chat%20stopped#chats"
+        );
+        assert_eq!(at(back("/settings", Err("no".into()))), "/settings?err=no");
+        assert_eq!(at(back("/x?y=1#z", Ok("k".into()))), "/x?y=1&ok=k#z");
+    }
 
     #[test]
     fn forms() {

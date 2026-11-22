@@ -44,8 +44,9 @@ pub fn denied_inbound(cfg: &Config, state: &State) -> Vec<IpAddr> {
     v
 }
 
+/// SSH, the web UI, and Tailscale's web interface (if it is on).
 pub fn admin_ports(cfg: &Config) -> Vec<u16> {
-    let mut ports = vec![cfg.inbound.ssh_port];
+    let mut ports = vec![cfg.inbound.ssh_port, crate::ops::TAILSCALE_WEB_PORT];
     ports.extend(cfg.web.listen.iter().map(|a| a.port()));
     ports.sort();
     ports.dedup();

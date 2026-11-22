@@ -20,6 +20,7 @@ mod paths;
 mod remote;
 mod render;
 mod runner;
+mod seal;
 mod space_cmd;
 mod state;
 mod sys;
@@ -184,10 +185,18 @@ enum Cmd {
     Bridge(BridgeCmd),
     /// Save everything blackthorn keeps (settings, machine keys, accounts,
     /// spaces with their Claude logins and chats, logs) to one file. It
-    /// holds every secret on the hub: keep it like one.
+    /// holds every secret on the hub: give it a password, or keep it like
+    /// one. On a terminal it asks whether to.
     Export {
-        /// Where to write it (a .tar.gz).
+        /// Where to write it.
         file: std::path::PathBuf,
+        /// Protect it with a password (asked for; without a terminal, read
+        /// from the first line of standard input).
+        #[arg(long, conflicts_with = "no_password")]
+        password: bool,
+        /// No password, without asking.
+        #[arg(long)]
+        no_password: bool,
     },
     /// Bring back an export from this same version of blackthorn, on this
     /// hub or a new one (after `thorn init`). What is here is set aside.
@@ -208,6 +217,9 @@ enum Cmd {
     /// failing or needing login, blocks and bridges ending, new releases.
     #[command(subcommand)]
     Notify(NotifyCmd),
+    /// Tailscale on the hub: install it, sign in, its web interface.
+    #[command(subcommand)]
+    Tailscale(TailscaleCmd),
     /// Show or change the settings the web UI can change too.
     #[command(subcommand)]
     Config(ConfigCmd),
@@ -269,8 +281,11 @@ enum ChatCmd {
         id: String,
         title: String,
     },
-    /// Delete a chat's transcript from the hub.
+    /// Delete a chat's transcript from the hub (one started from the hub is
+    /// stopped first).
     Rm { space: String, id: String },
+    /// Stop a chat started from the hub in a Remote Control space.
+    Stop { space: String, id: String },
     /// Start a new chat. A one-conversation space (single mode, Remote
     /// Control off) restarts into it; a Remote Control space runs it in a
     /// window of its own, shown in the Claude app.
@@ -282,6 +297,21 @@ enum ChatCmd {
     },
     /// Go back to an earlier chat, the same way.
     Open { space: String, id: String },
+}
+
+#[derive(Subcommand)]
+enum TailscaleCmd {
+    /// Whether it is installed, signed in, and on which tailnet.
+    Status,
+    /// Install it with Tailscale's own installer.
+    Install,
+    /// Sign the hub in to Tailscale (prints the sign-in link).
+    Up,
+    /// Turn Tailscale's web interface (port 5252 on the tailnet) on or off.
+    Web {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -543,23 +573,55 @@ fn run(cli: Cli) -> Result<()> {
             ChatCmd::Ls { space } => s::chat_ls(&space),
             ChatCmd::Rename { space, id, title } => s::chat_rename(&space, &id, &title),
             ChatCmd::Rm { space, id } => s::chat_rm(&space, &id),
+            ChatCmd::Stop { space, id } => s::chat_stop(&space, &id),
             ChatCmd::New { space, name } => s::chat_open(&space, None, name.as_deref()),
             ChatCmd::Open { space, id } => s::chat_open(&space, Some(&id), None),
         },
-        Cmd::Export { file } => {
-            let m = backup::export(&file)?;
+        Cmd::Export {
+            file,
+            password,
+            no_password,
+        } => {
+            use std::io::IsTerminal;
+            let ask = !password && !no_password && std::io::stdin().is_terminal();
+            let password = if password
+                || (ask && seal::ask_yes("Protect the export with a password? [Y/n] ", true)?)
+            {
+                let p = seal::read_password("Password: ")?;
+                if std::io::stdin().is_terminal() && seal::read_password("Again: ")? != p {
+                    anyhow::bail!("the passwords differ");
+                }
+                Some(p)
+            } else {
+                None
+            };
+            let m = backup::export(&file, password.as_deref())?;
             println!(
-                "exported blackthorn {} ({} space(s)) to {}",
+                "exported blackthorn {} ({} space(s)) to {}{}",
                 m.version,
                 m.owners.len(),
-                file.display()
+                file.display(),
+                if password.is_some() {
+                    ", with a password"
+                } else {
+                    ""
+                }
             );
-            println!("it holds every key and Claude login on this hub; keep it like one");
+            if password.is_some() {
+                println!("it cannot be imported without the password: there is no way back if it is lost");
+            } else {
+                println!("it holds every key and Claude login on this hub; keep it like one");
+            }
             println!("import it with the same version: sudo thorn import FILE");
             Ok(())
         }
         Cmd::Import { file, replace } => {
-            let r = backup::import(&file, replace)?;
+            let password = if backup::sealed(&file)? {
+                Some(seal::read_password("The export's password: ")?)
+            } else {
+                None
+            };
+            let r = backup::import(&file, replace, password.as_deref())?;
             println!(
                 "imported blackthorn {} from {}: {} space(s), {} machine(s)",
                 r.manifest.version, r.manifest.hostname, r.spaces, r.hosts
@@ -573,6 +635,15 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Update { check } => config_cmd::update(check),
+        Cmd::Tailscale(t) => match t {
+            TailscaleCmd::Status => config_cmd::tailscale_status(),
+            TailscaleCmd::Install => config_cmd::tailscale_install(),
+            TailscaleCmd::Up => config_cmd::tailscale_up(),
+            TailscaleCmd::Web { state } => {
+                println!("{}", ops::tailscale_web(state == "on")?);
+                Ok(())
+            }
+        },
         Cmd::Notify(n) => match n {
             NotifyCmd::Show => notify::cmd_show(),
             NotifyCmd::Set { url, token } => notify::cmd_set(url, token),
@@ -766,9 +837,14 @@ mod tests {
             ("config_show", &["config", "show"]),
             ("config_set", &["config", "set"]),
             ("tailnet_peers", &["config", "show"]),
+            ("tailscale_show", &["tailscale", "status"]),
+            ("tailscale_install", &["tailscale", "install"]),
+            ("tailscale_up", &["tailscale", "up"]),
+            ("tailscale_web", &["tailscale", "web"]),
             ("chat_list", &["chat", "ls"]),
             ("chat_rename", &["chat", "rename"]),
             ("chat_rm", &["chat", "rm"]),
+            ("chat_stop", &["chat", "stop"]),
             ("space_remote", &["remote"]),
             ("update_check", &["update"]),
             ("update", &["update"]),
