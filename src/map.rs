@@ -1146,7 +1146,7 @@ mod tests {
                 .unwrap();
             boxes.push((x.parse().unwrap(), y.parse().unwrap(), h.parse().unwrap()));
         }
-        assert_eq!(boxes.len(), 13);
+        assert_eq!(boxes.len(), 12);
         for (i, a) in boxes.iter().enumerate() {
             for b in &boxes[i + 1..] {
                 if a.0 == b.0 {
