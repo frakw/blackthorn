@@ -258,7 +258,7 @@ thorn chat rm t1-claude 4a1f 2>&1 | grep -q "running" && ok "a chat in use is no
 thorn chat rename t1-claude 4a1f "x" 2>&1 | grep -q "/rename" && ok "nor renamed: Claude Code would write its own name back" || fail "rename while in use"
 hub touch -h -d '2 hours ago' "$dir/$cid.jsonl"
 # Claude Code's list of its live processes names the chat: running, however old.
-pid=$(hub pgrep -u "bt-$k1" -f fake-claude | head -1)
+pid=$(hub pgrep -o -u "bt-$k1")
 hub runuser -u "bt-$k1" -- sh -c "mkdir -p /var/lib/blackthorn/spaces/$k1/.claude/sessions && echo '{\"pid\":$pid,\"sessionId\":\"$cid\",\"kind\":\"bg\"}' > /var/lib/blackthorn/spaces/$k1/.claude/sessions/$pid.json"
 thorn chat rename t1-claude 4a1f "x" 2>&1 | grep -q "running" && ok "a chat Claude Code lists as live counts as running" || fail "live chat renamed"
 thorn chat ls t1-claude | grep -q "check the disks  (running)" && ok "and is listed as running" || fail "live chat in ls: $(thorn chat ls t1-claude)"
