@@ -43,6 +43,10 @@ pub struct Item {
     /// The language of a tool's text, to colour it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub lang: String,
+    /// The account that sent a message from the hub (the chat page, or
+    /// "hub:<user>" for thorn chat send).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
 }
 
 /// What the chat's terminal shows.
@@ -83,6 +87,9 @@ pub struct Feed {
     pub model_setting: String,
     #[serde(default)]
     pub effort: String,
+    /// How far the account asking may go with the space (set by the API).
+    #[serde(default)]
+    pub level: Option<crate::state::Level>,
 }
 
 /// The models and effort levels the chat page offers (Claude Code's
@@ -154,7 +161,7 @@ pub fn feed(name: &str, id: &str, from: Option<u64>, before: Option<u64>) -> Res
     let mut f = open_own(&path, crate::ops::space_uid(&s.key)?)?;
     let len = f.metadata()?.len();
     if let Some(before) = before {
-        return earlier(&mut f, before.min(len));
+        return earlier(&mut f, before.min(len), &s.key, &id);
     }
     let (start, reset) = match from {
         Some(o) if o <= len && len - o <= WINDOW => (o, false),
@@ -179,7 +186,8 @@ pub fn feed(name: &str, id: &str, from: Option<u64>, before: Option<u64>) -> Res
     let whole = text.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
     let offset = len - (text.len() - whole) as u64;
     let lines = String::from_utf8_lossy(&text[..whole]);
-    let items = parse(&lines);
+    let mut items = parse(&lines);
+    senders(&mut items, &s.key, &id);
     let model = last_model(&lines);
     let typing = target(s, &id).is_some();
     let screen = screen(s, &id, &path);
@@ -204,9 +212,23 @@ pub fn feed(name: &str, id: &str, from: Option<u64>, before: Option<u64>) -> Res
     })
 }
 
+/// Marks the messages sent from the hub with who sent them, matching
+/// them in order with what the space's log recorded.
+fn senders(items: &mut [Item], key: &str, id: &str) {
+    if !items.iter().any(|i| i.kind == "user") {
+        return;
+    }
+    let mut sent = crate::activity::sent_to(key, id);
+    for it in items.iter_mut().filter(|i| i.kind == "user") {
+        if let Some(at) = sent.iter().position(|(_, m)| m.trim() == it.text.trim()) {
+            it.by = Some(sent.remove(at).0);
+        }
+    }
+}
+
 /// The messages before `before` (where an earlier read started, so at a
 /// line's start): a window's worth, from a whole line.
-fn earlier(f: &mut std::fs::File, before: u64) -> Result<Feed> {
+fn earlier(f: &mut std::fs::File, before: u64, key: &str, id: &str) -> Result<Feed> {
     let mut start = before.saturating_sub(WINDOW);
     f.seek(SeekFrom::Start(start))?;
     let mut buf = Vec::new();
@@ -220,8 +242,10 @@ fn earlier(f: &mut std::fs::File, before: u64) -> Result<Feed> {
         text = &text[skip..];
         start += skip as u64;
     }
+    let mut items = parse(&String::from_utf8_lossy(text));
+    senders(&mut items, key, id);
     Ok(Feed {
-        items: parse(&String::from_utf8_lossy(text)),
+        items,
         cut: start > 0,
         start,
         ..Feed::default()
@@ -357,6 +381,7 @@ fn user_note(t: &str) -> Option<Item> {
         summary: String::new(),
         error: false,
         lang: String::new(),
+        by: None,
     })
 }
 
@@ -369,6 +394,7 @@ fn note(text: String) -> Item {
         summary: String::new(),
         error: false,
         lang: String::new(),
+        by: None,
     }
 }
 
@@ -398,6 +424,7 @@ pub fn parse(text: &str) -> Vec<Item> {
                                 summary: String::new(),
                                 error: false,
                                 lang: String::new(),
+                                by: None,
                             }),
                             Some("tool_result") => out.push(Item {
                                 kind: "result".into(),
@@ -407,6 +434,7 @@ pub fn parse(text: &str) -> Vec<Item> {
                                 summary: String::new(),
                                 error: p["is_error"].as_bool() == Some(true),
                                 lang: String::new(),
+                                by: None,
                             }),
                             _ => {}
                         }
@@ -428,6 +456,7 @@ pub fn parse(text: &str) -> Vec<Item> {
                                     summary: String::new(),
                                     error: false,
                                     lang: String::new(),
+                                    by: None,
                                 });
                             }
                         }
@@ -450,6 +479,7 @@ pub fn parse(text: &str) -> Vec<Item> {
                                 id: p["id"].as_str().map(String::from),
                                 error: false,
                                 lang,
+                                by: None,
                             });
                         }
                         _ => {}
@@ -600,8 +630,8 @@ fn typing_target(name: &str, id: &str) -> Result<(Space, String, std::path::Path
     Ok((s, t, path))
 }
 
-/// Types a message into the chat and sends it.
-pub fn send(name: &str, id: &str, text: &str) -> Result<()> {
+/// Types a message into the chat and sends it; `by` is recorded with it.
+pub fn send(name: &str, id: &str, text: &str, by: &str) -> Result<()> {
     let text = text.trim_end();
     if text.trim().is_empty() {
         bail!("nothing to send");
@@ -640,6 +670,7 @@ pub fn send(name: &str, id: &str, text: &str) -> Result<()> {
     tmux(&s, &["paste-buffer", "-p", "-d", "-b", &buffer, "-t", &t])?;
     std::thread::sleep(std::time::Duration::from_millis(300));
     tmux(&s, &["send-keys", "-t", &t, "Enter"])?;
+    crate::activity::record(&s.key, id_of(&path), by, text, "")?;
     Ok(())
 }
 
@@ -649,32 +680,37 @@ fn id_of(path: &Path) -> &str {
 
 /// Keys the chat page may press: Escape (stop), and a choice's number
 /// while Claude Code asks.
-pub fn key(name: &str, id: &str, key: &str) -> Result<()> {
+pub fn key(name: &str, id: &str, key: &str, by: &str) -> Result<()> {
     let (s, t, path) = typing_target(name, id)?;
-    match key {
-        "Escape" => {}
+    let what = match key {
+        "Escape" => "stopped Claude".to_string(),
         k if k.len() == 1 && k.chars().all(|c| c.is_ascii_digit()) => {
             let now = screen(&s, id_of(&path), &path);
-            if !now.choices.iter().any(|(n, _)| n == k) {
+            let Some((_, label)) = now.choices.iter().find(|(n, _)| n == k) else {
                 bail!("Claude is not asking that any more; look again");
-            }
+            };
+            format!(
+                "answered {:?} with {k}. {label}",
+                now.question.lines().last().unwrap_or("")
+            )
         }
         _ => bail!("the chat page does not press {key:?}"),
-    }
+    };
     tmux(&s, &["send-keys", "-t", &t, key])?;
+    crate::activity::record(&s.key, id_of(&path), by, "", &what)?;
     Ok(())
 }
 
 /// A file for the chat: saved, as the space's user, in .uploads in the
 /// chat's folder. Its path there, to mention as @path.
-pub fn upload(name: &str, id: &str, filename: &str, data: &[u8]) -> Result<String> {
+pub fn upload(name: &str, id: &str, filename: &str, data: &[u8], by: &str) -> Result<String> {
     sys::require_root()?;
     if data.len() > MAX_UPLOAD {
         bail!("files up to {} MB", MAX_UPLOAD >> 20);
     }
     let (_, state) = ctx::read_only()?;
     let s = state.space(name)?;
-    locate(s, id)?;
+    let (chat, _) = locate(s, id)?;
     let clean: String = filename
         .rsplit(['/', '\\'])
         .next()
@@ -718,6 +754,7 @@ pub fn upload(name: &str, id: &str, filename: &str, data: &[u8]) -> Result<Strin
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
+    crate::activity::record(&s.key, &chat, by, "", &format!("added the file {rel}"))?;
     Ok(rel)
 }
 

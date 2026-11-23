@@ -139,6 +139,8 @@ struct Ctx {
     session: String,
     /// This browser may type into chats.
     chat: bool,
+    /// A hub admin (machines, settings, every space).
+    admin: bool,
 }
 
 enum Reply {
@@ -338,6 +340,7 @@ fn route(
         passkey: false,
         session: String::new(),
         chat: false,
+        admin: false,
     };
     if c.token.is_none() {
         return Reply::Redirect("/login".into(), None);
@@ -349,6 +352,7 @@ fn route(
             c.passkey = v["passkey"].as_bool().unwrap_or(false);
             c.session = v["session"].as_str().unwrap_or("").to_string();
             c.chat = v["chat"].as_bool().unwrap_or(false);
+            c.admin = v["admin"].as_bool().unwrap_or(false);
         }
         Err(_) => return Reply::Redirect("/login".into(), Some(clear_cookie())),
     }
@@ -600,6 +604,7 @@ fn page_with(c: &Ctx, title: &str, body: &str, flash: &Flash, head: &str) -> Str
         let here = section(&c.path);
         let links: String = MENU
             .iter()
+            .filter(|(href, _)| c.admin || matches!(*href, "/" | "/spaces"))
             .map(|(href, label)| {
                 format!(
                     "<a href=\"{href}\"{}>{label}</a>",
@@ -748,6 +753,7 @@ fn login_page(err: Option<&str>) -> Reply {
         passkey: false,
         session: String::new(),
         chat: false,
+        admin: false,
     };
     let passkey = if https() {
         "<div class=\"passkey-login\" hidden><button type=\"button\" class=\"primary\" data-passkey-login>Log in with a passkey</button>\
@@ -1067,7 +1073,9 @@ fn spaces_page(c: &Ctx, flash: &Flash) -> Reply {
         "<h1>Spaces</h1><p class=\"hint\">A space is one machine worked on by one AI agent: its own user, keys, \
          firewall rules and chats.</p>",
     );
-    if o.hosts.is_empty() {
+    if !c.admin {
+        b.push_str("<p class=\"hint\">These are the spaces you own or that are shared with you. A hub admin makes new ones.</p>");
+    } else if o.hosts.is_empty() {
         b.push_str("<p>Add a machine first, under <a href=\"/hosts\">Machines</a>.</p>");
     } else {
         let hosts: String = o
@@ -1120,13 +1128,20 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
     };
     let n = url_encode(&s.name);
     let claude = s.agent == crate::config::CLAUDE;
+    use crate::state::Level;
+    let lvl = s.level.unwrap_or(Level::Owner);
+    let (can_use, can_manage) = (lvl >= Level::Use, lvl >= Level::Manage);
     let mut b = format!(
         "<div class=\"page-head\"><h1><span class=\"dot {}\"></span>{}</h1><div class=\"buttons\">{}{}</div></div>\
-         <p class=\"item-meta\">on <a href=\"/host/{}\">{}</a> as {} · {} · {}{} {}{}</p>",
+         <p class=\"item-meta\">on <a href=\"/host/{}\">{}</a> as {} · {} · {}{} {}{}{}</p>",
         map::state_class(&s.state),
         esc(&s.name),
-        space_controls(c, s),
-        rename_dialog(c, &format!("/space/{n}/rename"), "space", "new", &s.name, "", ""),
+        if can_use { space_controls(c, s) } else { String::new() },
+        if can_manage {
+            rename_dialog(c, &format!("/space/{n}/rename"), "space", "new", &s.name, "", "")
+        } else {
+            String::new()
+        },
         url_encode(&s.host),
         esc(&s.host),
         esc(&s.login),
@@ -1135,6 +1150,14 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
         s.memory_mb.map(|m| format!(" · {m} MB")).unwrap_or_default(),
         access_badge(s),
         reach_badge(s),
+        if lvl < Level::Owner {
+            format!(
+                " <span class=\"badge\" title=\"owned by {}\">you may {lvl}</span>",
+                esc(s.owner.as_deref().unwrap_or("the hub admins"))
+            )
+        } else {
+            String::new()
+        },
     );
     if s.access == crate::state::Access::Admin && s.unattended {
         b.push_str(
@@ -1152,7 +1175,7 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
         ));
     }
 
-    if s.state == "needs login" {
+    if s.state == "needs login" && can_manage {
         b.push_str(&format!(
             "<section class=\"card attention\" id=\"login\"><h2>Sign in to Claude</h2><p>Each space signs in once. \
              Start, open the link on any device, then paste the code it shows.</p>{}</section>",
@@ -1188,12 +1211,21 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
     b.push_str(&format!(
         "<section class=\"card\"><h2>Terminal</h2><p class=\"hint\">What the space's terminal shows, refreshed every \
          few seconds. {where_chats}</p>\
-         <pre class=\"screen\" id=\"screen\" data-src=\"/space/{n}/screen\">…</pre>\
-         <form method=\"post\" action=\"/space/{n}/send\" class=\"send typing\">{}<input name=\"text\" \
-         placeholder=\"type a line, Enter sends it\" autocomplete=\"off\"><button>Send</button></form>\
-         <div class=\"buttons keys\">{keys}</div></section>",
-        csrf(c)
+         <pre class=\"screen\" id=\"screen\" data-src=\"/space/{n}/screen\">…</pre>{}</section>",
+        if can_use {
+            format!(
+                "<form method=\"post\" action=\"/space/{n}/send\" class=\"send typing\">{}<input name=\"text\" \
+                 placeholder=\"type a line, Enter sends it\" autocomplete=\"off\"><button>Send</button></form>\
+                 <div class=\"buttons keys\">{keys}</div>",
+                csrf(c)
+            )
+        } else {
+            String::new()
+        }
     ));
+    if !can_manage {
+        return Reply::Html(200, page(c, &s.name, &b, flash));
+    }
 
     // Bridges.
     let outgoing: Vec<&BridgeView> = o.bridges.iter().filter(|x| x.from == s.name).collect();
@@ -1302,6 +1334,7 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
             rename_dialog(c, &format!("/space/{n}/rc-name"), "in the Claude app", "rc_name", &s.rc_name, "", "")
         ));
     }
+    b.push_str(&sharing_card(c, s, lvl));
     b.push_str(&format!(
         "<section class=\"card danger\"><h2>Delete</h2><p>Stops the space and removes its user. Its files and \
          conversations are archived on the hub unless you purge them.</p><form method=\"post\" action=\"/space/{n}/rm\" \
@@ -1312,6 +1345,66 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
         code_field()
     ));
     Reply::Html(200, page(c, &s.name, &b, flash))
+}
+
+/// Who else may do what with the space; give it away (its owner).
+fn sharing_card(c: &Ctx, s: &SpaceView, lvl: crate::state::Level) -> String {
+    use crate::state::Level;
+    let n = url_encode(&s.name);
+    let accounts = get::<Vec<String>>(c, Op::AccountNames).unwrap_or_default();
+    let others: Vec<&String> = accounts
+        .iter()
+        .filter(|a| s.owner.as_deref() != Some(a.as_str()))
+        .collect();
+    let list: String = s
+        .shares
+        .iter()
+        .map(|(a, l)| format!("<li><b>{}</b> may {l}</li>", esc(a)))
+        .collect();
+    let options = |v: &[&String]| -> String {
+        v.iter()
+            .map(|a| format!("<option>{}</option>", esc(a)))
+            .collect()
+    };
+    let mut out = format!(
+        "<section class=\"card\" id=\"sharing\"><h2>Sharing</h2><p>Owner: <b>{}</b>.</p>\
+         <p class=\"hint\"><b>View</b>: read its chats, terminal and state. <b>Use</b>: also type into its chats, \
+         answer Claude, start and stop chats and the space. <b>Manage</b>: also change its settings, access and \
+         bridges, share it, delete it. Hub admins may do everything. Every message sent from the hub is recorded \
+         with the account that sent it.</p><ul>{}</ul>",
+        esc(s.owner.as_deref().unwrap_or("the hub admins")),
+        if list.is_empty() {
+            "<li>Not shared.</li>".to_string()
+        } else {
+            list
+        }
+    );
+    if !others.is_empty() {
+        out.push_str(&format!(
+            "<form method=\"post\" action=\"/space/{n}/share\" class=\"grid\">{}\
+             <label>Account <select name=\"account\">{}</select></label>\
+             <label>May <select name=\"level\"><option value=\"view\">view</option><option value=\"use\">use</option>\
+             <option value=\"manage\">manage</option><option value=\"none\">nothing (stop sharing)</option></select></label>\
+             {}<button>Share</button></form>",
+            csrf(c),
+            options(&others),
+            code_field()
+        ));
+    }
+    if lvl == Level::Owner {
+        out.push_str(&format!(
+            "<details class=\"sub\"><summary>Give it to another account</summary>\
+             <form method=\"post\" action=\"/space/{n}/owner\" class=\"grid\" data-confirm=\"Give {} away? You may still manage it.\">{}\
+             <label>To <select name=\"account\">{}<option value=\"\">the hub admins only</option></select></label>\
+             {}<button>Give</button></form></details>",
+            esc(&s.name),
+            csrf(c),
+            options(&others),
+            code_field()
+        ));
+    }
+    out.push_str("</section>");
+    out
 }
 
 fn chats_card(c: &Ctx, s: &SpaceView) -> String {
@@ -1335,12 +1428,18 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
     // in the Claude app.
     let one = s.mode == crate::state::Mode::Single || !s.remote_control;
     let now = crate::state::now();
+    let lvl = s.level.unwrap_or(crate::state::Level::Owner);
+    let can_use = lvl >= crate::state::Level::Use;
+    let can_manage = lvl >= crate::state::Level::Manage;
     let mut rows = String::new();
     for ch in &chats {
         let id = esc(&ch.id);
         let hidden = format!("<input type=\"hidden\" name=\"id\" value=\"{id}\">");
         let running = ch.running || ch.main || ch.window;
-        let delete = format!(
+        let delete = if !can_manage {
+            String::new()
+        } else {
+            format!(
             "<form method=\"post\" action=\"/space/{n}/chat-rm\" class=\"inline\" data-confirm=\"{}\">{}\
              {hidden}<button class=\"link danger-text\">Delete</button></form>",
             if ch.window {
@@ -1349,8 +1448,15 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
                 format!("Delete the chat {}?", esc(&ch.title))
             },
             csrf(c)
-        );
-        let side = if ch.window {
+        )
+        };
+        let side = if !can_use {
+            if running {
+                "<span class=\"badge\">running now</span>".to_string()
+            } else {
+                String::new()
+            }
+        } else if ch.window {
             // Started from the hub: stopped from here too.
             format!(
                 "<span class=\"badge\">running now</span><form method=\"post\" action=\"/space/{n}/chat-stop\" \
@@ -1403,7 +1509,10 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
             ),
         )
     };
-    let new_chat = pop_dialog(
+    let new_chat = if !can_use {
+        String::new()
+    } else {
+        pop_dialog(
         c,
         &format!("/space/{n}/chat-new"),
         "+ New chat",
@@ -1417,7 +1526,8 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
             esc(&confirm)
         ),
         "Start chat",
-    );
+    )
+    };
     format!(
         "<section class=\"card\" id=\"chats\"><div class=\"page-head\"><h2>Chats</h2>{new_chat}</div>\
          <p class=\"hint\">{how} Newest first, under Claude's name for each (rename one by typing \
@@ -1443,7 +1553,11 @@ fn chat_items_html(items: &[crate::chat::Item]) -> String {
     for it in items {
         match it.kind.as_str() {
             "user" => out.push_str(&format!(
-                "<div class=\"msg user\"><div class=\"bubble\">{}</div></div>",
+                "<div class=\"msg user\">{}<div class=\"bubble\">{}</div></div>",
+                it.by
+                    .as_ref()
+                    .map(|b| format!("<span class=\"by\">{}</span>", esc(b)))
+                    .unwrap_or_default(),
                 esc(&it.text)
             )),
             "assistant" => out.push_str(&format!(
@@ -1542,6 +1656,8 @@ fn model_button(model: &str, setting: &str, effort: &str) -> String {
 
 /// What the chat's terminal is doing, with what can be done about it.
 fn chat_state_html(c: &Ctx, n: &str, id: &str, feed: &crate::chat::Feed) -> String {
+    // Pressing keys needs this browser unlocked, and leave to use the space.
+    let may = c.chat && may_use(feed);
     let key = |k: &str, label: &str, class: &str| {
         format!(
             "<form method=\"post\" action=\"/space/{n}/chat/{id}/key\" class=\"inline chat-key\">{}\
@@ -1555,14 +1671,14 @@ fn chat_state_html(c: &Ctx, n: &str, id: &str, feed: &crate::chat::Feed) -> Stri
     match sc.state.as_str() {
         "busy" => format!(
             "<div class=\"chat-state busy\"><span class=\"dot\"></span>Claude is working{}</div>",
-            if c.chat && feed.typing {
+            if may && feed.typing {
                 key("Escape", "Stop", "")
             } else {
                 String::new()
             }
         ),
         "asking" => {
-            let buttons: String = if c.chat {
+            let buttons: String = if may {
                 sc.choices
                     .iter()
                     .map(|(k, label)| key(k, &format!("{k}. {label}"), if k == "1" { "primary" } else { "" }))
@@ -1574,7 +1690,7 @@ fn chat_state_html(c: &Ctx, n: &str, id: &str, feed: &crate::chat::Feed) -> Stri
                 "<div class=\"chat-state asking\"><b>Claude is asking</b><pre class=\"code\">{}</pre>\
                  <div class=\"choices\">{buttons}</div>{}</div>",
                 esc(&sc.question),
-                if c.chat {
+                if may {
                     "<p class=\"hint\">Read it, then pick. Messages wait until it is answered.</p>"
                 } else {
                     ""
@@ -1591,6 +1707,11 @@ fn chat_state_html(c: &Ctx, n: &str, id: &str, feed: &crate::chat::Feed) -> Stri
             .to_string(),
         _ => String::new(),
     }
+}
+
+/// The account may type into the space's chats.
+fn may_use(feed: &crate::chat::Feed) -> bool {
+    feed.level.map_or(true, |l| l >= crate::state::Level::Use)
 }
 
 fn chat_page(c: &Ctx, name: &str, id: &str, flash: &Flash) -> Reply {
@@ -1655,6 +1776,8 @@ fn chat_page(c: &Ctx, name: &str, id: &str, flash: &Flash) -> Reply {
         .collect();
     let composer = if !feed.typing {
         String::new()
+    } else if !may_use(&feed) {
+        "<p class=\"hint\">You may read this chat; typing into it needs <b>use</b> of the space.</p>".to_string()
     } else if !c.chat {
         format!(
             "<form method=\"post\" action=\"/space/{n}/chat/{id}/unlock\" class=\"card stack chat-unlock\">{}\
@@ -1918,6 +2041,20 @@ fn activity_card(c: &Ctx, s: &SpaceView) -> String {
     let rows: String = entries
         .iter()
         .map(|e| {
+            if !e.by.is_empty() {
+                return format!(
+                    "<li class=\"act by\"><span class=\"item-meta\">{} · chat <code>{}</code> · <b>{}</b> {}</span>{}</li>",
+                    ago(now.saturating_sub(e.t)),
+                    esc(&e.chat),
+                    esc(&e.by),
+                    if e.msg.is_empty() { "" } else { "sent" },
+                    if e.msg.is_empty() {
+                        format!("<span>{}</span>", esc(&e.note))
+                    } else {
+                        format!("<pre class=\"cmd\">{}</pre>", esc(&e.msg))
+                    }
+                );
+            }
             if !e.note.is_empty() {
                 return format!(
                     "<li class=\"act note\"><span class=\"item-meta\">{} · chat {}</span><span class=\"t-bad\">{}</span></li>",
@@ -2113,6 +2250,35 @@ fn space_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>)
                     "Remote Control name changed".into()
                 }
             }),
+        ),
+        "share" => back(
+            &format!("{here}#sharing"),
+            get::<String>(
+                c,
+                Op::SpaceShare {
+                    name: name.into(),
+                    account: f(form, "account").into(),
+                    level: match f(form, "level") {
+                        "none" => None,
+                        l => match l.parse() {
+                            Ok(l) => Some(l),
+                            Err(e) => return back(&here, Err(format!("{e}"))),
+                        },
+                    },
+                    code: f(form, "code").into(),
+                },
+            ),
+        ),
+        "owner" => back(
+            &format!("{here}#sharing"),
+            get::<String>(
+                c,
+                Op::SpaceOwner {
+                    name: name.into(),
+                    account: opt(form, "account"),
+                    code: f(form, "code").into(),
+                },
+            ),
         ),
         "chat-new" | "chat-open" => {
             let r = get::<ops::ChatOpened>(

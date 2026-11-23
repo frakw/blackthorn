@@ -79,6 +79,44 @@ pub struct Host {
     pub readonly: Option<String>,
 }
 
+/// What an account may do with a space. Hub admins may do everything.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum Level {
+    /// Read its chats, terminal and state.
+    View,
+    /// Also type into its chats, answer Claude, start and stop chats and
+    /// the space.
+    Use,
+    /// Also change its settings, access and bridges, share it, delete it.
+    Manage,
+    /// Its owner (or a hub admin): also give it to another account.
+    Owner,
+}
+
+impl std::fmt::Display for Level {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Level::View => "view",
+            Level::Use => "use",
+            Level::Manage => "manage",
+            Level::Owner => "owner",
+        })
+    }
+}
+
+impl std::str::FromStr for Level {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(match s {
+            "view" => Level::View,
+            "use" => Level::Use,
+            "manage" => Level::Manage,
+            _ => anyhow::bail!("a share is view, use or manage, not {s:?}"),
+        })
+    }
+}
+
 /// What a space may do on its machine.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -170,6 +208,23 @@ pub struct Space {
     /// spaces without Remote Control).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The web account that owns it; None: only hub admins (spaces made
+    /// on the hub's command line, or before v0.11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Other accounts it is shared with, and how far.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shares: BTreeMap<String, Level>,
+}
+
+impl Space {
+    /// How far `user` may go with this space (`admin`: a hub admin).
+    pub fn level(&self, user: &str, admin: bool) -> Option<Level> {
+        if admin || self.owner.as_deref() == Some(user) {
+            return Some(Level::Owner);
+        }
+        self.shares.get(user).copied()
+    }
 }
 
 fn is_admin(a: &Access) -> bool {
@@ -495,6 +550,8 @@ mod tests {
             access: Access::Admin,
             until: None,
             title: None,
+            owner: None,
+            shares: BTreeMap::new(),
         }
     }
 

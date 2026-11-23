@@ -180,6 +180,25 @@ enum Cmd {
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
+    /// Share a space with another web account: view (read its chats and
+    /// terminal), use (also type into chats, start and stop), manage (also
+    /// change and delete it), or none (stop sharing). Hub admins see every
+    /// space anyway.
+    Share {
+        name: String,
+        account: String,
+        #[arg(value_parser = ["view", "use", "manage", "none"])]
+        level: String,
+    },
+    /// Give a space to another web account (the old owner may still manage
+    /// it). "--hub" gives it to the hub admins only.
+    Owner {
+        name: String,
+        #[arg(required_unless_present = "hub")]
+        account: Option<String>,
+        #[arg(long)]
+        hub: bool,
+    },
     /// A space's Claude chats: list, name, delete.
     #[command(subcommand)]
     Chat(ChatCmd),
@@ -454,8 +473,18 @@ enum WebUserCmd {
     /// Add an account: password plus authenticator app.
     Add {
         name: String,
+        /// A hub admin (machines, settings, every space); otherwise it sees
+        /// only the spaces shared with it (thorn share).
+        #[arg(long)]
+        admin: bool,
         #[arg(long, hide = true)]
         totp_secret: Option<String>,
+    },
+    /// Make an account a hub admin, or not.
+    Admin {
+        name: String,
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
     },
     /// Remove an account.
     Rm { name: String },
@@ -574,6 +603,14 @@ fn run(cli: Cli) -> Result<()> {
             no_enter,
         } => s::send(&name, text.as_deref(), key.as_deref(), no_enter),
         Cmd::Remote { name, state } => s::remote(&name, state == "on"),
+        Cmd::Share {
+            name,
+            account,
+            level,
+        } => s::share(&name, &account, &level),
+        Cmd::Owner { name, account, hub } => {
+            s::owner(&name, if hub { None } else { account.as_deref() })
+        }
         Cmd::Chat(c) => match c {
             ChatCmd::Ls { space } => s::chat_ls(&space),
             ChatCmd::Rm { space, id } => s::chat_rm(&space, &id),
@@ -723,7 +760,12 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }),
             WebCmd::User(u) => match u {
-                WebUserCmd::Add { name, totp_secret } => web_cmd::user_add(&name, totp_secret),
+                WebUserCmd::Add {
+                    name,
+                    admin,
+                    totp_secret,
+                } => web_cmd::user_add(&name, totp_secret, admin),
+                WebUserCmd::Admin { name, state } => web_cmd::user_admin(&name, state == "on"),
                 WebUserCmd::Rm { name } => web_cmd::user_rm(&name),
                 WebUserCmd::Rename { old, new } => web_cmd::user_rename(&old, &new),
                 WebUserCmd::PasskeyRm { name, passkey } => {
@@ -850,6 +892,8 @@ mod tests {
             ("chat_rm", &["chat", "rm"]),
             ("chat_stop", &["chat", "stop"]),
             ("chat_send", &["chat", "send"]),
+            ("space_share", &["share"]),
+            ("space_owner", &["owner"]),
             ("space_remote", &["remote"]),
             ("update_check", &["update"]),
             ("update", &["update"]),
@@ -879,6 +923,7 @@ mod tests {
             "passkey_begin",
             "passkey_login",
             "passkey_add",
+            "account_names",
             "session_list",
             "session_end",
             "session_end_others",

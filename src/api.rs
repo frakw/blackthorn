@@ -73,6 +73,21 @@ pub enum Op {
         password: String,
         code: String,
     },
+    /// Shares a space with an account, or (level None) stops.
+    SpaceShare {
+        name: String,
+        account: String,
+        level: Option<crate::state::Level>,
+        code: String,
+    },
+    /// Gives a space to another account (None: the hub admins).
+    SpaceOwner {
+        name: String,
+        account: Option<String>,
+        code: String,
+    },
+    /// The web accounts' names, to share with.
+    AccountNames,
     /// A chat's transcript from an offset (None: its latest part), and
     /// what its terminal shows.
     ChatFeed {
@@ -344,6 +359,7 @@ impl Op {
                 | Op::Whoami
                 | Op::Overview
                 | Op::SessionList
+                | Op::AccountNames
                 | Op::ChatFeed { .. }
                 | Op::ChatCommands { .. }
                 | Op::SpaceScreen { .. }
@@ -391,7 +407,9 @@ impl Op {
             | Op::HostReadonly { code, .. }
             | Op::TailscaleInstall { code }
             | Op::TailscaleUp { code }
-            | Op::TailscaleWeb { code, .. } => Some(code),
+            | Op::TailscaleWeb { code, .. }
+            | Op::SpaceShare { code, .. }
+            | Op::SpaceOwner { code, .. } => Some(code),
             _ => None,
         }
     }
@@ -763,13 +781,141 @@ fn dispatch(req: Request, server: &Mutex<Server>) -> Out {
         s.save(now, false);
         user
     };
+    let admin = match Users::load(Path::new(paths::WEB_USERS_FILE))
+        .ok()
+        .and_then(|u| u.users.get(&user).map(|x| x.admin))
+    {
+        Some(a) => a,
+        None => return (Err(anyhow::anyhow!("this account is gone")), Some(user)),
+    };
+    if let Err(e) = authorize(&req.op, &user, admin) {
+        return (Err(e), Some(user));
+    }
     if let Some(code) = req.op.step_up_code() {
         if let Err(e) = check_step_up(server, &user, code, now) {
             return (Err(e), Some(user));
         }
     }
-    let r = run_op(req, server, &user, now);
+    let r = run_op(req, server, &user, admin, now);
     (r, Some(user))
+}
+
+/// What an operation needs of the account asking.
+enum Need {
+    /// Any logged-in account (its own things, or filtered).
+    Login,
+    /// A hub admin: machines, settings, the hub.
+    Admin,
+    /// This far with each of these spaces.
+    Spaces(Vec<String>, crate::state::Level),
+}
+
+fn need(op: &Op) -> Need {
+    use crate::state::Level::{Manage, Owner, Use, View};
+    let one = |n: &String, l| Need::Spaces(vec![n.clone()], l);
+    match op {
+        Op::WebConfig
+        | Op::Login { .. }
+        | Op::Logout
+        | Op::Whoami
+        | Op::Overview
+        | Op::SessionList
+        | Op::SessionEnd { .. }
+        | Op::SessionEndOthers
+        | Op::ChatUnlock { .. }
+        | Op::AccountNames
+        | Op::Account
+        | Op::AccountPassword { .. }
+        | Op::AccountTotpBegin { .. }
+        | Op::AccountTotpFinish { .. }
+        | Op::AccountRename { .. }
+        | Op::PasskeyBegin { .. }
+        | Op::PasskeyLogin { .. }
+        | Op::PasskeyAdd { .. }
+        | Op::PasskeyRm { .. } => Need::Login,
+        Op::SpaceNew { .. }
+        | Op::HostScan { .. }
+        | Op::HostAdd { .. }
+        | Op::HostRm { .. }
+        | Op::HostBlock { .. }
+        | Op::HostUnblock { .. }
+        | Op::HostPubkey { .. }
+        | Op::HostCheck { .. }
+        | Op::HostRescan { .. }
+        | Op::HostRescanConfirm { .. }
+        | Op::HostMoveScan { .. }
+        | Op::HostMove { .. }
+        | Op::HostRename { .. }
+        | Op::HostReadonly { .. }
+        | Op::ConfigShow
+        | Op::ConfigSet { .. }
+        | Op::TailnetPeers
+        | Op::TailscaleShow
+        | Op::TailscaleInstall { .. }
+        | Op::TailscaleUp { .. }
+        | Op::TailscaleWeb { .. }
+        | Op::NotifyShow
+        | Op::NotifySet { .. }
+        | Op::NotifyTest
+        | Op::UpdateCheck { .. }
+        | Op::Update { .. } => Need::Admin,
+        Op::ChatFeed { name, .. }
+        | Op::ChatCommands { name }
+        | Op::SpaceScreen { name }
+        | Op::ChatList { name }
+        | Op::Activity { name, .. } => one(name, View),
+        Op::ChatSend { name, .. }
+        | Op::ChatKey { name, .. }
+        | Op::ChatUpload { name, .. }
+        | Op::ChatOpen { name, .. }
+        | Op::ChatStop { name, .. }
+        | Op::SpaceSend { name, .. } => one(name, Use),
+        Op::SpaceControl { names, .. } => Need::Spaces(names.clone(), Use),
+        Op::SpaceRm { name, .. }
+        | Op::LoginStart { name }
+        | Op::LoginFinish { name, .. }
+        | Op::LoginCancel { name }
+        | Op::SpaceStartFor { name, .. }
+        | Op::SpaceAccess { name, .. }
+        | Op::SpaceRemote { name, .. }
+        | Op::ChatRm { name, .. }
+        | Op::SpaceShare { name, .. } => one(name, Manage),
+        Op::SpaceRename { old, .. } => one(old, Manage),
+        Op::BridgeAdd { from, to, .. } | Op::BridgeRm { from, to } => {
+            Need::Spaces(vec![from.clone(), to.clone()], Manage)
+        }
+        Op::SpaceOwner { name, .. } => one(name, Owner),
+    }
+}
+
+/// Refuses what the account may not do. Hub admins may do everything.
+fn authorize(op: &Op, user: &str, admin: bool) -> Result<()> {
+    if admin {
+        return Ok(());
+    }
+    match need(op) {
+        Need::Login => Ok(()),
+        Need::Admin => bail!("only a hub admin may do that"),
+        Need::Spaces(names, want) => {
+            let (_, state) = ctx::read_only()?;
+            for n in &names {
+                let has = state.spaces.get(n).and_then(|s| s.level(user, false));
+                match has {
+                    None => bail!("no space named {n}"),
+                    Some(l) if l < want => bail!(
+                        "you may {} {n}; that needs {want}",
+                        match l {
+                            crate::state::Level::View => "only view",
+                            crate::state::Level::Use => "only use",
+                            _ => "only manage",
+                        }
+                    ),
+                    Some(_) => {}
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 fn login(
@@ -1132,7 +1278,13 @@ fn check_code(user: &str, code: &str, now: u64) -> Result<()> {
     }
 }
 
-fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<serde_json::Value> {
+fn run_op(
+    req: Request,
+    server: &Mutex<Server>,
+    user: &str,
+    admin: bool,
+    now: u64,
+) -> Result<serde_json::Value> {
     let client = req.client;
     match req.op {
         Op::WebConfig | Op::Login { .. } => unreachable!("handled before"),
@@ -1149,10 +1301,15 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
             id,
             from,
             before,
-        } => json(crate::chat::feed(&name, &id, from, before)?),
+        } => {
+            let mut f = crate::chat::feed(&name, &id, from, before)?;
+            let (_, st) = ctx::read_only()?;
+            f.level = st.space(&name)?.level(user, admin);
+            json(f)
+        }
         Op::ChatCommands { name } => json(crate::chat::commands(&name)?),
-        Op::ChatSend { name, id, text } => json(crate::chat::send(&name, &id, &text)?),
-        Op::ChatKey { name, id, key } => json(crate::chat::key(&name, &id, &key)?),
+        Op::ChatSend { name, id, text } => json(crate::chat::send(&name, &id, &text, user)?),
+        Op::ChatKey { name, id, key } => json(crate::chat::key(&name, &id, &key, user)?),
         Op::ChatUpload {
             name,
             id,
@@ -1163,7 +1320,7 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(data.trim())
                 .context("the file did not arrive whole")?;
-            json(crate::chat::upload(&name, &id, &filename, &bytes)?)
+            json(crate::chat::upload(&name, &id, &filename, &bytes, user)?)
         }
         Op::SessionList => {
             let mut s = server.lock().expect("lock");
@@ -1232,6 +1389,7 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
                     .is_ok_and(|u| u.users.get(user).is_some_and(|x| !x.passkeys.is_empty()));
             json(serde_json::json!({
                 "user": user, "csrf": csrf, "passkey": passkey, "session": session, "chat": chat,
+                "admin": admin,
             }))
         }
         Op::Overview => {
@@ -1243,6 +1401,7 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
                     .map(|(_, v)| v)
             };
             let mut o = ops::overview(false)?;
+            see_only_yours(&mut o, user, admin)?;
             o.hub.claude_version = match cached {
                 Some(v) => v,
                 None => {
@@ -1254,7 +1413,23 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
             };
             json(o)
         }
-        Op::SpaceNew { space } => json(ops::space_new(space)?),
+        Op::SpaceNew { mut space } => {
+            space.owner = Some(user.to_string());
+            json(ops::space_new(space)?)
+        }
+        Op::SpaceShare {
+            name,
+            account,
+            level,
+            ..
+        } => json(ops::space_share(&name, &account, level)?),
+        Op::SpaceOwner { name, account, .. } => json(ops::space_owner(&name, account.as_deref())?),
+        Op::AccountNames => json(
+            Users::load(Path::new(paths::WEB_USERS_FILE))?
+                .users
+                .into_keys()
+                .collect::<Vec<_>>(),
+        ),
         Op::SpaceRm { name, purge, .. } => json(ops::space_rm(&name, purge)?),
         Op::SpaceRename {
             old, new, rc_name, ..
@@ -1275,12 +1450,21 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
             text,
             key,
             enter,
-        } => json(ops::space_send(
-            &name,
-            text.as_deref(),
-            key.as_deref(),
-            enter,
-        )?),
+        } => {
+            ops::space_send(&name, text.as_deref(), key.as_deref(), enter)?;
+            // Typed on the space's terminal: recorded like a chat message.
+            if let Ok((_, st)) = ctx::read_only() {
+                if let Ok(sp) = st.space(&name) {
+                    let what = match (&text, &key) {
+                        (Some(t), _) if !t.is_empty() => t.clone(),
+                        (_, Some(k)) => format!("[{k}]"),
+                        _ => "[Enter]".into(),
+                    };
+                    let _ = crate::activity::record(&sp.key, "terminal", user, &what, "");
+                }
+            }
+            json(())
+        }
         Op::LoginStart { name } => json(ops::login_start(&name)?),
         Op::LoginFinish { name, code } => json(ops::login_finish(&name, &code)?),
         Op::LoginCancel { name } => {
@@ -1540,6 +1724,41 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
     }
 }
 
+/// What an account that is not a hub admin sees of the hub: the spaces
+/// it may see (and how far), their machines, bridges between them.
+fn see_only_yours(o: &mut ops::Overview, user: &str, admin: bool) -> Result<()> {
+    let (_, state) = ctx::read_only()?;
+    for s in &mut o.spaces {
+        s.level = state.spaces.get(&s.name).and_then(|x| x.level(user, admin));
+    }
+    if admin {
+        return Ok(());
+    }
+    o.spaces.retain(|s| s.level.is_some());
+    for s in &mut o.spaces {
+        // Who else it is shared with is for those who manage it.
+        if s.level < Some(crate::state::Level::Manage) {
+            s.shares.clear();
+        }
+    }
+    let seen: std::collections::BTreeSet<String> =
+        o.spaces.iter().map(|s| s.name.clone()).collect();
+    let machines: std::collections::BTreeSet<String> = o
+        .spaces
+        .iter()
+        .flat_map(|s| std::iter::once(s.host.clone()).chain(s.reachable.iter().cloned()))
+        .collect();
+    o.hosts.retain(|h| machines.contains(&h.name));
+    for h in &mut o.hosts {
+        h.spaces.retain(|s| seen.contains(s));
+    }
+    o.bridges
+        .retain(|b| seen.contains(&b.from) || seen.contains(&b.to));
+    o.hub.admin_from.clear();
+    o.hub.denied_inbound.clear();
+    Ok(())
+}
+
 /// After a password or authenticator change: every login of `user` but
 /// this one ends.
 fn end_other_sessions(
@@ -1575,6 +1794,18 @@ pub fn all_op_names() -> Vec<String> {
         Op::Whoami,
         Op::Overview,
         Op::SessionList,
+        Op::SpaceShare {
+            name: s(),
+            account: s(),
+            level: None,
+            code: s(),
+        },
+        Op::SpaceOwner {
+            name: s(),
+            account: None,
+            code: s(),
+        },
+        Op::AccountNames,
         Op::SessionEnd { id: s() },
         Op::SessionEndOthers,
         Op::ChatUnlock {
@@ -1772,6 +2003,9 @@ pub fn all_op_names() -> Vec<String> {
             | Op::Whoami
             | Op::Overview
             | Op::SessionList
+            | Op::SpaceShare { .. }
+            | Op::SpaceOwner { .. }
+            | Op::AccountNames
             | Op::SessionEnd { .. }
             | Op::SessionEndOthers
             | Op::ChatUnlock { .. }

@@ -351,7 +351,7 @@ pub fn svg(o: &Overview) -> String {
             title: p.api.into(),
             dot: None,
             href: None,
-            ins: vec!["spaces"],
+            ins: vec!["API"],
             outs: vec![],
             icons: None,
             rows: used
@@ -556,7 +556,11 @@ pub fn svg(o: &Overview) -> String {
                     }
                 }
                 if let Some((_, api)) = api_of.iter().find(|(q, _)| *q == p.id) {
-                    wires.push(wire(&id, n.port_out("API"), api, 0, "wire uses"));
+                    // Uses the API: dotted, no arrow.
+                    wires.push(Wire {
+                        arrow: false,
+                        ..wire(&id, n.port_out("API"), api, 0, "wire uses")
+                    });
                 }
             }
             let class = if h.blocked {
@@ -650,6 +654,16 @@ pub fn svg(o: &Overview) -> String {
     let mut ly = band_bottom + if tailnet { OUTER } else { PAD } + BAND_GAP + FRAME_TITLE + PAD;
     if net.router.is_some() || !lan_hosts.is_empty() || manage_on_lan {
         let mut lan_members = Vec::new();
+        // On the LAN, the management device goes first; the router (in the
+        // same column, its internet side toward the hub) below it.
+        let mut router_y = ly;
+        if manage_on_lan {
+            if let Some(m) = nodes.iter_mut().find(|n| n.id == "manage") {
+                m.y = ly;
+                router_y = ly + m.h() + GAP_Y;
+            }
+            lan_members.push("manage".to_string());
+        }
         if let Some(r) = net.router {
             nodes.push(Node {
                 id: "router".into(),
@@ -657,28 +671,22 @@ pub fn svg(o: &Overview) -> String {
                 title: "Router".into(),
                 dot: None,
                 href: None,
-                ins: vec!["hub"],
-                outs: vec![],
+                ins: vec![],
+                outs: vec!["internet"],
                 icons: None,
                 rows: vec![
                     (Tone::Dim, format!("{r} · the hub's gateway")),
                     (Tone::Dim, "its way to the internet".into()),
                 ],
-                x: COLS[1],
-                y: ly,
+                x: COLS[0],
+                y: router_y,
             });
             lan_members.push("router".to_string());
+            // Its internet side to the hub's: dotted, no arrow.
             wires.push(Wire {
                 arrow: false,
-                from_left: true,
-                ..wire("hub", 1, "router", 0, "wire uses")
+                ..wire("router", 0, "hub", 1, "wire uses")
             });
-        }
-        if manage_on_lan {
-            if let Some(m) = nodes.iter_mut().find(|n| n.id == "manage") {
-                m.y = ly;
-            }
-            lan_members.push("manage".to_string());
         }
         for n in lan_hosts {
             let h = n.h();
@@ -1023,11 +1031,11 @@ mod tests {
         assert!(!s.contains("Tailnet coordination"));
         // management device->hub, devices->app, hub->3 spaces, app->2 spaces
         // with Remote Control, 3 spaces->API, 3 spaces->their machines,
-        // 1 bridge, hub->router.
+        // 1 bridge, router->hub.
         assert_eq!(s.matches("<path class=\"wire").count(), 15);
-        // The hub's way out leaves from its left side, dotted, no arrow.
+        // The router's internet side to the hub's, dotted, no arrow.
         assert!(s.contains(
-            "class=\"wire uses\" data-from=\"hub\" data-fp=\"1\" data-to=\"router\" data-tp=\"0\" data-fs=\"left\"  d="
+            "class=\"wire uses\" data-from=\"router\" data-fp=\"0\" data-to=\"hub\" data-tp=\"1\"  d="
         ));
         // Arrows go the way commands go: the Claude app to a space.
         assert!(s.contains(
@@ -1046,6 +1054,8 @@ mod tests {
             "class=\"wire bridge\" data-from=\"space:fig-claude\" data-fp=\"1\" data-to=\"host:nas\""
         ));
         assert!(s.contains("class=\"wire uses\" data-from=\"space:fig-claude\" data-fp=\"0\" data-to=\"api:anthropic\""));
+        // No arrow into the API.
+        assert!(s.contains("data-to=\"api:anthropic\" data-tp=\"0\"  d="));
         assert!(
             !s.contains("data-from=\"app:anthropic\" data-fp=\"0\" data-to=\"space:fig-aider\""),
             "Remote Control off: no wire from the app"
@@ -1095,7 +1105,7 @@ mod tests {
         o.hub.net.control = None;
         let s = svg(&o);
         assert!(s.contains(
-            "class=\"frame kind-lan\" data-pad=\"16\" data-members=\"router manage host:nas\""
+            "class=\"frame kind-lan\" data-pad=\"16\" data-members=\"manage router host:nas\""
         ));
     }
 

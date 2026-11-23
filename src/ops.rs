@@ -6,7 +6,8 @@
 use crate::config::{Config, CLAUDE};
 use crate::ctx::{self, Ctx};
 use crate::state::{
-    now, validate_name, validate_rc_name, Access, Block, Bridge, Host, Mode, Os, Space, State,
+    now, validate_name, validate_rc_name, Access, Block, Bridge, Host, Level, Mode, Os, Space,
+    State,
 };
 use crate::{apply, keys, paths, render, sys, units};
 use anyhow::{anyhow, bail, Context, Result};
@@ -95,6 +96,14 @@ pub struct SpaceView {
     /// admin access.
     #[serde(default)]
     pub unattended: bool,
+    /// Its owner (None: hub admins), and who else may do what with it.
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub shares: Vec<(String, Level)>,
+    /// How far the account asking may go with it (set by the API).
+    #[serde(default)]
+    pub level: Option<Level>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +198,9 @@ pub fn overview(with_version: bool) -> Result<Overview> {
                 limited: state.limited(s),
                 until: s.until.filter(|u| *u > t),
                 unattended: unattended(&cfg.claude_args) || unattended(&s.args),
+                owner: s.owner.clone(),
+                shares: s.shares.iter().map(|(a, l)| (a.clone(), *l)).collect(),
+                level: None,
             }
         })
         .collect();
@@ -465,6 +477,110 @@ pub struct NewSpace {
     /// Default: read-only if the machine has a read-only login, else admin.
     #[serde(default)]
     pub access: Option<Access>,
+    /// The web account that made it (set by the API, not the form).
+    #[serde(skip)]
+    pub owner: Option<String>,
+}
+
+// ---------------------------------------------------------------- sharing
+
+/// Whether a web account exists.
+fn account_exists(name: &str) -> Result<bool> {
+    Ok(
+        crate::webauth::Users::load(Path::new(paths::WEB_USERS_FILE))?
+            .users
+            .contains_key(name),
+    )
+}
+
+/// Shares a space with an account (view, use or manage), or (None) stops
+/// sharing it. Not with its owner.
+pub fn space_share(name: &str, account: &str, level: Option<Level>) -> Result<String> {
+    sys::require_root()?;
+    let mut ctx = Ctx::open()?;
+    let s = ctx
+        .state
+        .spaces
+        .get_mut(name)
+        .with_context(|| format!("no space named {name}"))?;
+    if s.owner.as_deref() == Some(account) {
+        bail!("{account} owns {name}");
+    }
+    match level {
+        Some(Level::Owner) => bail!("give a space to an account with thorn owner"),
+        Some(l) => {
+            if !account_exists(account)? {
+                bail!("no account named {account} (thorn web user ls lists them)");
+            }
+            s.shares.insert(account.to_string(), l);
+        }
+        None => {
+            if s.shares.remove(account).is_none() {
+                bail!("{name} is not shared with {account}");
+            }
+        }
+    }
+    ctx.commit()?;
+    Ok(match level {
+        Some(l) => format!("{name} is shared with {account}: {l}"),
+        None => format!("{name} is no longer shared with {account}"),
+    })
+}
+
+/// Gives a space to another account. The one that owned it may still
+/// manage it; None: only hub admins.
+pub fn space_owner(name: &str, account: Option<&str>) -> Result<String> {
+    sys::require_root()?;
+    if let Some(a) = account {
+        if !account_exists(a)? {
+            bail!("no account named {a} (thorn web user ls lists them)");
+        }
+    }
+    let mut ctx = Ctx::open()?;
+    let s = ctx
+        .state
+        .spaces
+        .get_mut(name)
+        .with_context(|| format!("no space named {name}"))?;
+    let old = s.owner.take();
+    if let Some(o) = old.filter(|o| Some(o.as_str()) != account) {
+        s.shares.insert(o, Level::Manage);
+    }
+    s.owner = account.map(String::from);
+    if let Some(a) = account {
+        s.shares.remove(a);
+    }
+    ctx.commit()?;
+    Ok(match account {
+        Some(a) => format!("{name} now belongs to {a}"),
+        None => format!("{name} now belongs to the hub admins"),
+    })
+}
+
+/// An account is gone: it owns and shares nothing any more.
+pub fn forget_account(account: &str) -> Result<()> {
+    let mut ctx = Ctx::open()?;
+    for s in ctx.state.spaces.values_mut() {
+        if s.owner.as_deref() == Some(account) {
+            s.owner = None;
+        }
+        s.shares.remove(account);
+    }
+    ctx.commit()
+}
+
+/// An account has a new name: so do its spaces and shares.
+pub fn rename_in_shares(old: &str, new: &str) -> Result<()> {
+    let mut ctx = Ctx::open()?;
+    for s in ctx.state.spaces.values_mut() {
+        if s.owner.as_deref() == Some(old) {
+            s.owner = Some(new.to_string());
+        }
+        if let Some(l) = s.shares.remove(old) {
+            s.shares.insert(new.to_string(), l);
+        }
+    }
+    ctx.commit()
 }
 
 pub fn logged_in(s: &Space) -> bool {
@@ -568,6 +684,8 @@ pub fn space_new(o: NewSpace) -> Result<String> {
         access,
         until: None,
         title: None,
+        owner: o.owner.clone(),
+        shares: Default::default(),
     };
     let limited = ctx.state.limited(&space);
     let start_now = logged_in(&space) && !limited;

@@ -332,6 +332,8 @@ mod tests {
                     access: crate::state::Access::Admin,
                     until: None,
                     title: None,
+                    owner: None,
+                    shares: Default::default(),
                 },
             );
         }

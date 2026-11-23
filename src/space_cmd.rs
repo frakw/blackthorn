@@ -317,7 +317,16 @@ pub fn log(space: &str, n: usize) -> Result<()> {
     }
     for e in v.iter().rev() {
         let when = ops::rfc3339(e.t);
-        if e.note.is_empty() {
+        if !e.msg.is_empty() {
+            println!(
+                "{when}  {}  {} sent: {}",
+                e.chat,
+                e.by,
+                e.msg.replace('\n', "\n    ")
+            );
+        } else if !e.by.is_empty() {
+            println!("{when}  {}  {}: {}", e.chat, e.by, e.note);
+        } else if e.note.is_empty() {
             println!("{when}  {}  {}", e.chat, e.cmd.replace('\n', "\n    "));
         } else {
             println!("{when}  {}  NOTE: {}", e.chat, e.note);
@@ -332,8 +341,26 @@ pub fn chat_rm(space: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn share(space: &str, account: &str, level: &str) -> Result<()> {
+    let level = match level {
+        "none" => None,
+        l => Some(l.parse()?),
+    };
+    println!("{}", ops::space_share(space, account, level)?);
+    Ok(())
+}
+
+pub fn owner(space: &str, account: Option<&str>) -> Result<()> {
+    println!("{}", ops::space_owner(space, account)?);
+    Ok(())
+}
+
 pub fn chat_send(space: &str, id: &str, text: &str) -> Result<()> {
-    crate::chat::send(space, id, text)?;
+    let by = format!(
+        "hub:{}",
+        std::env::var("SUDO_USER").unwrap_or_else(|_| "root".into())
+    );
+    crate::chat::send(space, id, text, &by)?;
     println!("sent");
     Ok(())
 }

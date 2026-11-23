@@ -5,7 +5,7 @@ coding agents live. They keep running there, you reach them from your phone
 or laptop, and each one can work on exactly one of your machines, over SSH,
 one way only.
 
-Status: **early (v0.10)**. It works and is tested end to end, but expect
+Status: **early (v0.11)**. It works and is tested end to end, but expect
 changes. Read [THREAT_MODEL.md](THREAT_MODEL.md) before trusting it with
 anything important.
 
@@ -279,6 +279,7 @@ restores the old settings at any time.
 | `thorn attach SPACE` | Open the space's terminal |
 | `thorn screen SPACE` / `thorn send SPACE TEXT` | Read or type into the terminal without attaching |
 | `thorn rename OLD NEW [--rc-name N]` | Rename; same chats |
+| `thorn share SPACE ACCOUNT view\|use\|manage\|none` / `thorn owner SPACE ACCOUNT` | Share a space; give it away |
 | `thorn chat ls SPACE` / `chat new SPACE [--name N]` / `chat send SPACE ID TEXT` / `chat stop SPACE ID` / `chat rm SPACE ID` | A space's Claude chats |
 | `thorn chat new SPACE [--name N]` / `chat open SPACE ID` | Start a new chat, or go back to one |
 | `thorn remote SPACE on\|off` | Remote Control on, or off: one local conversation, only from the hub |
@@ -289,7 +290,7 @@ restores the old settings at any time.
 | `thorn host readonly NAME [--user U] [--print \| --verify]` | Give a Linux machine a read-only login, and log blackthorn's commands there |
 | `thorn host set-address NAME USER@IP [--port P]` | Move a machine to a new address (e.g. LAN to tailnet); its spaces stay |
 | `thorn host block NAME [--for 30m] [--reason R]` / `host unblock` | Cut a machine off from every space |
-| `thorn web enable\|disable` / `web user add\|rm\|ls\|rename\|passwd\|totp-reset` | The web UI and its accounts |
+| `thorn web enable\|disable` / `web user add [--admin]\|admin\|rm\|ls\|rename\|passwd\|totp-reset` | The web UI and its accounts |
 | `thorn web https [--cert C --key K --name N \| --tailscale \| --off]` | HTTPS for the web UI (needed for passkeys) |
 | `thorn web user passkey-rm NAME PASSKEY` | Remove a lost passkey |
 | `thorn notify set [URL] [--token]` / `notify show\|test\|off` | Notifications to an ntfy topic (no URL: a new random topic on ntfy.sh) |
@@ -424,6 +425,31 @@ Typing works for chats the hub runs: those started or continued from the
 hub, and a one-chat space's chat. A chat started in the Claude app can be
 read along; end it there and continue it from the hub to type. `thorn chat
 send SPACE ID TEXT` does the same from the hub.
+
+### Sharing spaces
+
+Each space has an owner: the web account that made it (spaces made on the
+hub's command line belong to the hub admins). Its owner, or anyone who may
+manage it, shares it with other accounts, from its page or `thorn share
+SPACE ACCOUNT view|use|manage|none`:
+
+- **view**: read its chats, terminal and state;
+- **use**: also type into its chats, answer Claude, start and stop chats
+  and the space;
+- **manage**: also change its settings, access and bridges, share it and
+  delete it.
+
+Its owner may also give it to another account (`thorn owner SPACE
+ACCOUNT`); the old owner may still manage it. Hub admins (the first
+account, and those made with `thorn web user add NAME --admin` or `thorn
+web user admin NAME on`) may do everything, and alone see machines,
+bridges and settings. Other accounts see only the spaces they own or that
+are shared with them.
+
+Every message typed into a chat from the hub (the chat page, the
+terminal, `thorn chat send`), every answer pressed and every file added is
+recorded in the space's log with the account that did it (`thorn log`, the
+Activity card), and the chat page shows who sent each.
 
 ## Backup and moving to a new hub
 

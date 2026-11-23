@@ -37,6 +37,15 @@ pub struct User {
     /// for a TOTP code where one is asked again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub passkeys: Vec<crate::webauthn::Passkey>,
+    /// A hub admin: machines, settings, every space. Others see only the
+    /// spaces they own or that are shared with them. Accounts from before
+    /// v0.11 are admins.
+    #[serde(default = "yes")]
+    pub admin: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Users {

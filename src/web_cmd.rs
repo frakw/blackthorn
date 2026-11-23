@@ -56,7 +56,11 @@ pub fn user_ls() -> Result<()> {
         println!("no web accounts; add one with: sudo thorn web user add <name>");
     }
     for (name, u) in &users.users {
-        println!("{name}  ({} recovery codes left)", u.recovery.len());
+        println!(
+            "{name}{}  ({} recovery codes left)",
+            if u.admin { "  hub admin" } else { "" },
+            u.recovery.len()
+        );
         for p in &u.passkeys {
             println!("  passkey {:<24} {}", p.name, p.id);
         }
@@ -229,22 +233,53 @@ pub fn first_account() -> Result<()> {
     let mut input = Input::new();
     let name = input.line(&format!("account name [{suggested}]: "))?;
     let name = if name.is_empty() { suggested } else { name };
-    add_account(&name, None, &mut input)
+    add_account(&name, None, true, &mut input)
 }
 
-pub fn user_add(name: &str, totp_secret: Option<String>) -> Result<()> {
-    add_account(name, totp_secret, &mut Input::new())
+pub fn user_add(name: &str, totp_secret: Option<String>, admin: bool) -> Result<()> {
+    add_account(name, totp_secret, admin, &mut Input::new())
+}
+
+/// Makes an account a hub admin, or not.
+pub fn user_admin(name: &str, on: bool) -> Result<()> {
+    sys::require_root()?;
+    let mut users = Users::load(users_path())?;
+    let u = users
+        .users
+        .get_mut(name)
+        .with_context(|| format!("no account named {name}"))?;
+    u.admin = on;
+    if !users.users.values().any(|u| u.admin) {
+        bail!("that would leave no hub admin");
+    }
+    users.save(users_path())?;
+    println!(
+        "{name} is {}",
+        if on {
+            "a hub admin: machines, settings and every space"
+        } else {
+            "no longer a hub admin: only the spaces it owns or that are shared with it"
+        }
+    );
+    Ok(())
 }
 
 /// Takes the one `Input` (and so the one stdin lock) the caller already
 /// holds: a second lock on stdin would wait forever.
-fn add_account(name: &str, totp_secret: Option<String>, input: &mut Input) -> Result<()> {
+fn add_account(
+    name: &str,
+    totp_secret: Option<String>,
+    admin: bool,
+    input: &mut Input,
+) -> Result<()> {
     sys::require_root()?;
     crate::state::validate_name("account", name)?;
     let mut users = Users::load(users_path())?;
     if users.users.contains_key(name) {
         bail!("there is already an account named {name}");
     }
+    // The first account runs the hub.
+    let admin = admin || users.users.is_empty();
     let password = input.new_password()?;
     let (secret, recovery, step) = enroll_totp(name, totp_secret, input)?;
     users.users.insert(
@@ -255,6 +290,7 @@ fn add_account(name: &str, totp_secret: Option<String>, input: &mut Input) -> Re
             recovery: hash_codes(&recovery)?,
             last_step: step,
             passkeys: Vec::new(),
+            admin,
         },
     );
     users.save(users_path())?;
@@ -273,7 +309,11 @@ pub fn user_rm(name: &str) -> Result<()> {
     if users.users.remove(name).is_none() {
         bail!("no account named {name}");
     }
+    if !users.users.is_empty() && !users.users.values().any(|u| u.admin) {
+        bail!("that would leave no hub admin");
+    }
     users.save(users_path())?;
+    crate::ops::forget_account(name)?;
     let _ = sys::systemctl(&["try-restart", units::API]);
     println!("account {name} removed (and logged out)");
     Ok(())
@@ -291,7 +331,8 @@ pub fn rename_account(old: &str, new: &str) -> Result<()> {
         .remove(old)
         .with_context(|| format!("no account named {old}"))?;
     users.users.insert(new.to_string(), u);
-    users.save(users_path())
+    users.save(users_path())?;
+    crate::ops::rename_in_shares(old, new)
 }
 
 pub fn user_rename(old: &str, new: &str) -> Result<()> {

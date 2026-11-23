@@ -339,6 +339,52 @@ chat_post send --data-urlencode "text=/model sonnet" | grep -q '"ok":"sent"' && 
 web_get /account | grep -q "may type into chats" && ok "the unlock is listed with the logins" || fail "unlock not on the account page"
 web_get "/space/t1-claude/chat/0000aaaa/feed" | grep -q '"error"' && ok "an unknown chat is an error" || fail "unknown chat feed"
 thorn chat stop t1-claude "${nid%%-*}" >/dev/null
+web_get "/space/t1-claude/chat/$nid/feed?from=0" | grep -q 'class=\"by\">frakw<' && ok "a message from the web shows who sent it" || fail "no sender: $(web_get "/space/t1-claude/chat/$nid/feed?from=0" | head -c 400)"
+thorn log t1-claude | grep -q "frakw sent: check the" && ok "and the space's log records it" || fail "log: $(thorn log t1-claude | tail -5)"
+thorn log t1-claude | grep -q 'frakw: answered' && ok "with the answers pressed" || fail "answer not logged"
+
+say "sharing a space with another account"
+thorn web user ls | grep -q "^frakw  hub admin" && ok "the first account is a hub admin" || fail "first admin: $(thorn web user ls)"
+PAT_SECRET=KRSXG5CTMVRXEZLUKRSXG5CTMVRXEZLU
+printf '%s\n%s\n' "$PASSWORD" "$(hub /usr/local/bin/thorn _totp $PAT_SECRET)" \
+  | thorni web user add pat --totp-secret "$PAT_SECRET" | grep -q "account pat added" && ok "a second account" || fail "second account"
+thorn web user ls | grep -q "^pat  hub admin" && fail "a new account is a hub admin" || ok "not a hub admin"
+pat_get() { admin curl -s -b /tmp/jar3 -c /tmp/jar3 "http://$HUB:7180$1"; }
+pat_post() { local path=$1; shift; admin curl -s -S -o /dev/null -w "%{redirect_url}" -b /tmp/jar3 -c /tmp/jar3 "$@" "http://$HUB:7180$path"; }
+admin rm -f /tmp/jar3
+pat_post /login --data-urlencode "user=pat" --data-urlencode "password=$PASSWORD" --data-urlencode "code=$(fresh_code $PAT_SECRET)" >/dev/null
+PC=$(pat_get / | grep -o 'name="csrf" value="[0-9a-f]*"' | head -1 | cut -d'"' -f4)
+[ -n "$PC" ] && ok "it logs in" || fail "pat login"
+pat_get /spaces | grep -q "t1-claude" && fail "it sees a space not shared with it" || ok "and sees no space"
+pat_get /map.svg | grep -q "t2-claude" && fail "the map shows it other spaces" || ok "nor on the map"
+pat_get /settings | grep -q "only a hub admin" && ok "settings are for hub admins" || fail "settings for pat: $(pat_get /settings | head -c 300)"
+pat_get / | grep -q 'href="/hosts"' && fail "the menu offers Machines" || ok "and the menu leaves them out"
+thorn share t1-claude pat view | grep -q "shared with pat: view" && ok "thorn share ... view" || fail "share view"
+pat_get /spaces | grep -q "t1-claude" && ok "now it sees that space" || fail "shared space not listed"
+pat_get "/space/t1-claude/chat/$nid/feed?from=0" | grep -q 'check the' && ok "and reads its chats" || fail "view chat"
+pat_get "/space/t1-claude/chat/$nid" | grep -q 'needs <b>use</b>' && ok "without a message box" || fail "composer for a viewer"
+r=$(pat_post /space/t1-claude/restart --data-urlencode "csrf=$PC")
+case "$r" in *"that%20needs%20use"*) ok "it may not restart the space";; *) fail "viewer restart: $r";; esac
+thorn share t1-claude pat use >/dev/null
+r=$(pat_post /space/t1-claude/chat-new --data-urlencode "csrf=$PC" --data-urlencode "title=pat chat")
+case "$r" in *"/chat/"*) ok "with use, it starts a chat";; *) fail "pat chat-new: $r";; esac
+pid=$(echo "$r" | sed 's#.*/chat/\([0-9a-f-]*\).*#\1#')
+sleep 2
+pat_post "/space/t1-claude/chat/$pid/unlock" --data-urlencode "csrf=$PC" --data-urlencode "password=$PASSWORD" --data-urlencode "code=$(fresh_code $PAT_SECRET)" >/dev/null
+admin curl -s -b /tmp/jar3 -c /tmp/jar3 --data-urlencode "csrf=$PC" --data-urlencode "js=1" --data-urlencode "text=hello from pat" "http://$HUB:7180/space/t1-claude/chat/$pid/send" | grep -q '"ok":"sent"' && ok "and types into it" || fail "pat send"
+sleep 2
+thorn log t1-claude | grep -q "pat sent: hello from pat" && ok "recorded as sent by pat" || fail "pat's message not recorded: $(thorn log t1-claude | tail -3)"
+r=$(pat_post /space/t1-claude/rm --data-urlencode "csrf=$PC" --data-urlencode "code=$(fresh_code $PAT_SECRET)")
+case "$r" in *"that%20needs%20manage"*) ok "it may not delete the space";; *) fail "user rm: $r";; esac
+thorn chat stop t1-claude "${pid%%-*}" >/dev/null
+r=$(web_post /space/t1-claude/share --data-urlencode "csrf=$C" --data-urlencode "account=pat" --data-urlencode "level=none" --data-urlencode "code=$(fresh_code $WEB_SECRET)")
+case "$r" in *"no%20longer%20shared"*) ok "sharing stopped from the web";; *) fail "web unshare: $r";; esac
+pat_get /spaces | grep -q "t1-claude" && fail "still listed after unsharing" || ok "and the space is gone from its list"
+thorn owner t1-claude pat | grep -q "belongs to pat" && ok "thorn owner" || fail "owner"
+pat_get /space/t1-claude | grep -q 'id="sharing"' && ok "the owner manages it, sharing included" || fail "owner page"
+thorn owner t1-claude --hub >/dev/null
+thorn web user rm pat >/dev/null
+hub grep -q '"pat"\|pat = \|owner = "pat"' /var/lib/blackthorn/state.toml && fail "the removed account still has shares" || ok "a removed account keeps no shares"
 big=6b1e0c2e-1111-4222-8333-444455556666
 hub runuser -u "bt-$k1" -- sh -c "echo '{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"first of many\"}}' > '$dir/$big.jsonl'; yes '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"$(printf '%01000d' 0)\"}]}}' | head -n 6000 >> '$dir/$big.jsonl'"
 page=$(web_get "/space/t1-claude/chat/$big")

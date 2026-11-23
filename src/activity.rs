@@ -18,7 +18,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 /// One command a space ran.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Entry {
     /// Unix seconds, from the transcript.
     pub t: u64,
@@ -30,6 +30,13 @@ pub struct Entry {
     /// Something about the record itself, such as a transcript that shrank.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
+    /// Who did it from the hub: a web account, or "hub:<user>" for the
+    /// hub's command line. With `msg`: a message they typed into the chat;
+    /// with `note`: a key they pressed, a file they added.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub by: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub msg: String,
 }
 
 impl Entry {
@@ -99,6 +106,7 @@ fn copy_all(state: &State) -> Result<()> {
                             note: "transcript got shorter: something edited or replaced it; \
                                    commands it held before are in this log"
                                 .into(),
+                            ..Default::default()
                         });
                     }
                     new.extend(commands(&text, &chat));
@@ -184,7 +192,7 @@ pub fn commands(text: &str, chat: &str) -> Vec<Entry> {
                 t,
                 chat: chat.to_string(),
                 cmd,
-                note: String::new(),
+                ..Default::default()
             });
         }
     }
@@ -211,6 +219,41 @@ fn append(key: &str, entries: &[Entry]) -> Result<()> {
     }
     f.write_all(text.as_bytes())?;
     Ok(())
+}
+
+/// Records what someone did in a chat from the hub: a message they sent
+/// (`msg`), or something else (`note`). The chat is the first 8
+/// characters of its id.
+pub fn record(key: &str, chat: &str, by: &str, msg: &str, note: &str) -> Result<()> {
+    append(
+        key,
+        &[Entry {
+            t: now(),
+            chat: chat[..8.min(chat.len())].to_string(),
+            by: by.to_string(),
+            msg: msg.chars().take(20_000).collect(),
+            note: note.to_string(),
+            ..Default::default()
+        }],
+    )
+}
+
+/// The messages sent to a chat from the hub, oldest first: (who, text).
+pub fn sent_to(key: &str, chat: &str) -> Vec<(String, String)> {
+    let chat = &chat[..8.min(chat.len())];
+    let Ok(mut f) = std::fs::File::open(paths::activity_file(key)) else {
+        return Vec::new();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = f.seek(SeekFrom::Start(len.saturating_sub(4 << 20)));
+    let mut buf = String::new();
+    let _ = f.read_to_string(&mut buf);
+    buf.lines()
+        .filter(|l| l.contains("\"msg\""))
+        .filter_map(|l| serde_json::from_str::<Entry>(l).ok())
+        .filter(|e| e.chat == chat && !e.msg.is_empty())
+        .map(|e| (e.by, e.msg))
+        .collect()
 }
 
 /// The latest `limit` commands of a space, newest first.
@@ -267,7 +310,7 @@ mod tests {
             t: 0,
             chat: "x".into(),
             cmd: "ssh -o BatchMode=yes nas uptime".into(),
-            note: String::new(),
+            ..Default::default()
         };
         assert_eq!(e.host(), Some("nas"));
     }
