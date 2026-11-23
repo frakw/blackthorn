@@ -633,7 +633,8 @@ fn button(c: &Ctx, action: &str, label: &str, class: &str, extra: &str) -> Strin
 /// A Rename button that pops up a small form asking for the new name and
 /// a code. Plain HTML (an open <details> drawn as a dialog; clicking the
 /// dimmed backdrop closes it), so it works without the script too.
-/// `field` is the form field the new name goes in; `hidden` adds fields.
+/// `field` is the form field the new name goes in; `hidden` adds fields;
+/// `note` (HTML) goes under the name.
 fn rename_dialog(
     c: &Ctx,
     action: &str,
@@ -641,12 +642,13 @@ fn rename_dialog(
     field: &str,
     current: &str,
     hidden: &str,
+    note: &str,
 ) -> String {
     format!(
         "<details class=\"pop\"><summary class=\"btn\">Rename</summary>\
          <form method=\"post\" action=\"{}\" class=\"stack pop-body\" role=\"dialog\" aria-label=\"Rename {}\">{}{hidden}\
          <h2>Rename {}</h2><label>New name <input name=\"{field}\" value=\"{}\" required maxlength=\"100\" \
-         autocomplete=\"off\" spellcheck=\"false\"></label>{}\
+         autocomplete=\"off\" spellcheck=\"false\"></label>{note}{}\
          <div class=\"buttons\"><button class=\"primary\">Save</button>\
          <button type=\"button\" class=\"link\" data-close hidden>Cancel</button></div></form></details>",
         esc(action),
@@ -1086,7 +1088,7 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
         map::state_class(&s.state),
         esc(&s.name),
         space_controls(c, s),
-        rename_dialog(c, &format!("/space/{n}/rename"), "space", "new", &s.name, ""),
+        rename_dialog(c, &format!("/space/{n}/rename"), "space", "new", &s.name, "", ""),
         url_encode(&s.host),
         esc(&s.host),
         esc(&s.login),
@@ -1259,7 +1261,7 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
              <input type=\"hidden\" name=\"on\" value=\"{on}\"><button class=\"{class}\">{label}</button></form>{}</div></section>",
             esc(label),
             csrf(c),
-            rename_dialog(c, &format!("/space/{n}/rc-name"), "in the Claude app", "rc_name", &s.rc_name, "")
+            rename_dialog(c, &format!("/space/{n}/rc-name"), "in the Claude app", "rc_name", &s.rc_name, "", "")
         ));
     }
     b.push_str(&format!(
@@ -1322,7 +1324,7 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
             let how = if ch.main {
                 "the space runs this chat: start or continue another one to switch"
             } else {
-                "running in the Claude app: end it there to rename or delete it here"
+                "running in the Claude app: end it there to delete it here"
             };
             format!("<span class=\"badge\" title=\"{how}\">running now</span>")
         } else {
@@ -1337,24 +1339,31 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
                 csrf(c)
             )
         };
-        // While it runs, Claude Code keeps the name it started with.
-        let rename = if running {
-            String::new()
-        } else {
-            rename_dialog(
-                c,
-                &format!("/space/{n}/chat-rename"),
-                "chat",
-                "title",
-                &ch.title,
-                &hidden,
-            )
-        };
+        let rename = rename_dialog(
+            c,
+            &format!("/space/{n}/chat-rename"),
+            "chat",
+            "title",
+            &ch.title,
+            &hidden,
+            &format!(
+                "<p class=\"hint\">This name is the hub's own, for this list only. Claude Code and the Claude app keep \
+                 theirs{}.</p>",
+                match &ch.claude_title {
+                    Some(t) => format!(" (now <b>{}</b>)", esc(t)),
+                    None => String::new(),
+                }
+            ),
+        );
         rows.push_str(&format!(
             "<li class=\"chat\"><div class=\"chat-main\"><span class=\"chat-title\">{}</span>\
-             <span class=\"item-meta\">{} · {} KB · <code>{}</code></span></div>\
+             <span class=\"item-meta\">{}{} · {} KB · <code>{}</code></span></div>\
              <div class=\"chat-actions\">{rename}{side}</div></li>",
             esc(&ch.title),
+            match &ch.claude_title {
+                Some(t) => format!("in Claude: {} · ", esc(t)),
+                None => String::new(),
+            },
             ago(now.saturating_sub(ch.modified)),
             ch.kb,
             esc(&ch.id[..8.min(ch.id.len())]),
@@ -1384,16 +1393,18 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
         "New chat",
         &format!(
             "<p class=\"hint\">{}</p><label>Name <input name=\"title\" maxlength=\"100\" autocomplete=\"off\" \
-             placeholder=\"optional: Claude names it otherwise\" autofocus></label>",
+             placeholder=\"optional: Claude names it otherwise\" autofocus></label>\
+             <p class=\"hint\">Claude Code and the Claude app call it by the start of its id and this name \
+             (<code>9cf982e0 name</code>), so it is easy to find there. Renaming it later changes only the hub's \
+             name.</p>",
             esc(&confirm)
         ),
         "Start chat",
     );
     format!(
         "<section class=\"card\" id=\"chats\"><div class=\"page-head\"><h2>Chats</h2>{new_chat}</div>\
-         <p class=\"hint\">{how} Newest first. A chat is renamed here while it is not running (a running one keeps \
-         the name it started with: type <code>/rename NAME</code> in it); the new name shows in the Claude app the next \
-         time it runs. Deleting removes the hub's copy.</p>{}</section>",
+         <p class=\"hint\">{how} Newest first. Names given here are the hub's own: the Claude app keeps its \
+         name for a chat (the id's start and the name it was started with). Deleting removes the hub's copy.</p>{}</section>",
         if rows.is_empty() {
             "<p>No chats yet.</p>".to_string()
         } else {
@@ -1910,7 +1921,7 @@ fn host_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
          <p class=\"item-meta\">{}@{} port {} · {} · spaces: {spaces}</p><p class=\"{}\">{}</p>",
         if h.blocked { "bad" } else { "ok" },
         esc(&h.name),
-        rename_dialog(c, &format!("/host/{n}/rename"), "machine", "new", &h.name, ""),
+        rename_dialog(c, &format!("/host/{n}/rename"), "machine", "new", &h.name, "", ""),
         esc(&h.user),
         h.address,
         h.port,
@@ -2592,7 +2603,7 @@ fn account_page(c: &Ctx, flash: &Flash) -> Reply {
          <p class=\"hint\">Accounts are added and removed on the hub itself: <code>sudo thorn web user add &lt;name&gt;</code>, \
          <code>sudo thorn web user rm &lt;name&gt;</code>.</p>",
         esc(&c.user),
-        rename_dialog(c, "/account/rename", "account", "new", &c.user, ""),
+        rename_dialog(c, "/account/rename", "account", "new", &c.user, "", ""),
         csrf(c),
         code_field(),
         csrf(c),

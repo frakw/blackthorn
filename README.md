@@ -379,18 +379,17 @@ rewrite them; the copy is root's, and a chat that shrinks is noted.
 ### Names in the Claude app
 
 The Claude app lists each Remote Control space as an *environment* named
-after its folder, which is its Remote Control name. Each chat in it shows
-under the chat's own name: the one given with *New chat* (or `thorn chat new
-SPACE --name`) or a rename, else Claude's title for it, else
-`<Remote Control name>-<random>` until it has one. A space no longer makes
-an empty chat when it starts.
+after its folder, which is its Remote Control name. A chat started with a
+name (*New chat*, or `thorn chat new SPACE --name NAME`) is called
+`<first 8 characters of its id> NAME` there, e.g. `9cf982e0 web check`, so
+it is easy to match with the hub's list. Otherwise it shows under Claude's
+title for it, else `<Remote Control name>-<random>` until it has one.
 
-A chat is renamed on the hub only while it is not running: a running Claude
-Code keeps the name it started with, shows that in the app, and writes it
-back when it stops. Rename a running chat in the chat itself (`/rename
-NAME`), or stop it first (*Stop*, or `thorn chat stop`, for one started
-from the hub; ending it in the app for one started there); the new name
-shows in the app the next time it runs.
+Renaming a chat on the hub (*Rename*, `thorn chat rename`) changes only the
+hub's name for it, running or not; the hub's list shows Claude's name next
+to it. The hub does not rename chats in Claude Code: a running Claude Code
+keeps its name in memory and writes it back when it stops. To rename it in
+the app too, type `/rename NAME` in the chat.
 
 Changing a Remote Control name moves the folder, so the app gets a new
 environment. The old one stays in its list, offline, until Anthropic clears

@@ -255,19 +255,19 @@ thorn chat ls t1-claude | grep -q "check the disks" && ok "thorn chat ls names a
 thorn chat ls t1-claude | grep -q "5b2e1d3f" && fail "chat ls followed a planted link" || ok "chat ls skips links the space user planted"
 thorn chat rename t1-claude 5b2e1d3f "x" 2>&1 | grep -q "no chat" && ok "and will not write through one" || fail "rename through a link"
 thorn chat rm t1-claude 4a1f 2>&1 | grep -q "running" && ok "a chat in use is not deleted" || fail "chat rm while in use"
-thorn chat rename t1-claude 4a1f "x" 2>&1 | grep -q "/rename" && ok "nor renamed: Claude Code would write its own name back" || fail "rename while in use"
+thorn chat rename t1-claude 4a1f "x" | grep -q "on the hub" && ok "but renamed on the hub while in use" || fail "rename while in use"
+hub grep -q customTitle "$dir/$cid.jsonl" && fail "the hub wrote a name into the transcript" || ok "without touching the transcript"
 hub touch -h -d '2 hours ago' "$dir/$cid.jsonl"
 # Claude Code's list of its live processes names the chat: running, however old.
 pid=$(hub pgrep -o -u "bt-$k1")
 hub runuser -u "bt-$k1" -- sh -c "mkdir -p /var/lib/blackthorn/spaces/$k1/.claude/sessions && echo '{\"pid\":$pid,\"sessionId\":\"$cid\",\"kind\":\"bg\"}' > /var/lib/blackthorn/spaces/$k1/.claude/sessions/$pid.json"
-thorn chat rename t1-claude 4a1f "x" 2>&1 | grep -q "running" && ok "a chat Claude Code lists as live counts as running" || fail "live chat renamed"
-thorn chat ls t1-claude | grep -q "check the disks  (running)" && ok "and is listed as running" || fail "live chat in ls: $(thorn chat ls t1-claude)"
+thorn chat ls t1-claude | grep -q "x  \[in Claude: check the disks\]  (running)" && ok "a chat Claude Code lists as live is running, under both names" || fail "live chat in ls: $(thorn chat ls t1-claude)"
 hub rm -f "/var/lib/blackthorn/spaces/$k1/.claude/sessions/$pid.json"
 r=$(web_post /space/t1-claude/chat-rename --data-urlencode "csrf=$C" --data-urlencode "id=$cid" --data-urlencode "title=disk check" --data-urlencode "code=000000")
 case "$r" in *"fresh%20code"*) ok "renaming needs a fresh code";; *) fail "chat rename without a code: $r";; esac
 r=$(web_post /space/t1-claude/chat-rename --data-urlencode "csrf=$C" --data-urlencode "id=$cid" --data-urlencode "title=disk check" --data-urlencode "code=$(fresh_code $WEB_SECRET)")
 case "$r" in *"ok=chat%20renamed"*) ok "chat renamed from the web";; *) fail "chat rename: $r";; esac
-hub tail -1 "$dir/$cid.jsonl" | grep -q '"customTitle":"disk check"' && ok "named the way Claude Code's /rename does" || fail "custom-title line"
+thorn chat ls t1-claude | grep -q "disk check  \[in Claude: check the disks\]" && ok "the hub's name, and Claude's" || fail "names in ls: $(thorn chat ls t1-claude)"
 web_get /space/t1-claude | grep -q "disk check" && ok "the space page lists the chat by its new name" || fail "chats on the space page"
 hub touch -h -d '2 hours ago' "$dir/$cid.jsonl"
 r=$(web_post /space/t1-claude/chat-rm --data-urlencode "csrf=$C" --data-urlencode "id=$cid")
@@ -288,12 +288,14 @@ hub runuser -u "bt-$k2" -- sh -c "mkdir -p '$dir2' && echo '{\"type\":\"user\",\
 thorn chat new t2-claude | grep -q "new chat" && ok "thorn chat new" || fail "thorn chat new"
 thorn chat new t1-claude --name "web check" >/dev/null
 sleep 2
-hub grep -q -- "^--session-id [0-9a-f-]* --name web check --remote-control --remote-control-session-name-prefix t1-claude" "/var/lib/blackthorn/spaces/$k1/fake-claude.args" && ok "a named chat window: the Claude app shows that name" || fail "named chat window: $(hub tail -2 "/var/lib/blackthorn/spaces/$k1/fake-claude.args")"
-wid=$(hub grep -- "--name web check" "/var/lib/blackthorn/spaces/$k1/fake-claude.args" | tail -1 | cut -d' ' -f2)
+hub grep -Eq -- "^--session-id [0-9a-f-]+ --name [0-9a-f]{8} web check --remote-control --remote-control-session-name-prefix t1-claude" "/var/lib/blackthorn/spaces/$k1/fake-claude.args" && ok "a named chat window: Claude gets the id's start and the name" || fail "named chat window: $(hub tail -2 "/var/lib/blackthorn/spaces/$k1/fake-claude.args")"
+wid=$(hub grep -- " web check --remote-control" "/var/lib/blackthorn/spaces/$k1/fake-claude.args" | tail -1 | cut -d' ' -f2)
+hub grep -q -- "--name ${wid%%-*} web check" "/var/lib/blackthorn/spaces/$k1/fake-claude.args" && ok "the start of its own id" || fail "id in the name"
+thorn chat ls t1-claude | grep -q "${wid%%-*}.*web check" && ok "the hub lists it by the name given" || fail "hub name of a new chat: $(thorn chat ls t1-claude)"
 hub runuser -u "bt-$k1" -- sh -c "echo '{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"web\"}}' > '$dir/$wid.jsonl'"
 thorn chat ls t1-claude | grep -q "running, started from the hub" && ok "a chat started from the hub is listed as running" || fail "window chat in ls: $(thorn chat ls t1-claude)"
 web_get /space/t1-claude | grep -q "/space/t1-claude/chat-stop" && ok "the space page offers to stop it" || fail "no Stop on the space page"
-thorn chat rename t1-claude "${wid%%-*}" "y" 2>&1 | grep -q "/rename" && ok "it is not renamed while it runs" || fail "window chat renamed while running"
+thorn chat rename t1-claude "${wid%%-*}" "y" | grep -q "on the hub" && ok "renamed on the hub while it runs" || fail "window chat rename while running"
 thorn chat stop t1-claude "${wid%%-*}" | grep -q "stopped chat" && ok "thorn chat stop" || fail "chat stop"
 hub tmux -S "/run/blackthorn/$k1/tmux.sock" list-windows -F '#{window_name}' | grep -q "^chat-${wid%%-*}" && fail "its window is still there" || ok "its window is closed"
 thorn chat rename t1-claude "${wid%%-*}" "web check 2" >/dev/null && ok "stopped, it can be renamed" || fail "rename after stop"

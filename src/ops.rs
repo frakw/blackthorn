@@ -568,6 +568,7 @@ pub fn space_new(o: NewSpace) -> Result<String> {
         access,
         until: None,
         title: None,
+        chat_names: Default::default(),
     };
     let limited = ctx.state.limited(&space);
     let start_now = logged_in(&space) && !limited;
@@ -1063,7 +1064,11 @@ fn send_keys(sock: &Path, text: Option<&str>, key: Option<&str>, enter: bool) ->
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chat {
     pub id: String,
+    /// The hub's name for it, else Claude Code's.
     pub title: String,
+    /// Claude Code's name for it, when the hub calls it something else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_title: Option<String>,
     /// Unix seconds of the last write.
     pub modified: u64,
     pub kb: u64,
@@ -1244,8 +1249,15 @@ pub fn chat_list(name: &str) -> Result<Vec<Chat>> {
                         Some(ids) => ids.contains(&id),
                         None => recently_used(&p),
                     });
+            let own = chat_title(&text);
+            let hub = s.chat_names.get(&id).cloned();
+            let claude_title = hub
+                .as_ref()
+                .and(own.clone())
+                .filter(|t| Some(t) != hub.as_ref());
             Some(Chat {
-                title: chat_title(&text).unwrap_or_else(|| "(no messages yet)".into()),
+                title: hub.or(own).unwrap_or_else(|| "(no messages yet)".into()),
+                claude_title,
                 main,
                 window,
                 running,
@@ -1275,22 +1287,6 @@ fn find_chat(key: &str, id: &str) -> Result<(String, PathBuf)> {
         1 => Ok(found.remove(0)),
         _ => bail!("{id} matches several chats; give more of its id"),
     }
-}
-
-/// Opens a transcript to append to, refusing links and files the space
-/// user does not own.
-fn open_transcript(path: &Path, uid: u32) -> Result<std::fs::File> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let f = std::fs::OpenOptions::new()
-        .append(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    let m = f.metadata()?;
-    if !m.is_file() || m.uid() != uid {
-        bail!("{} is not the space's own transcript", path.display());
-    }
-    Ok(f)
 }
 
 /// Whether a chat was written to in the last ten minutes.
@@ -1359,32 +1355,34 @@ fn chat_running(s: &Space, id: &str, path: &Path) -> bool {
     }
 }
 
-/// Names a chat the way Claude Code's /rename does: a custom-title line at
-/// the end of its transcript, which Claude Code reads when the chat starts.
-///
-/// Not while it runs: Claude Code keeps the name it started with, shows
-/// that in the Claude app, and writes it back to the transcript when it
-/// stops, over this one.
+/// Names a chat on the hub only. Claude Code, and so the Claude app,
+/// keep their own name for it: one the hub gave it when it started there
+/// ("<first 8 of its id> <name>"), else one given in the chat, else
+/// Claude's title. Running or not.
 pub fn chat_rename(name: &str, id: &str, title: &str) -> Result<String> {
-    use std::io::Write as _;
     sys::require_root()?;
+    let title = check_chat_name(title)?;
+    let mut ctx = Ctx::open()?;
+    let key = ctx.state.space(name)?.key.clone();
+    let (id, _) = find_chat(&key, id)?;
+    let sp = ctx.state.spaces.get_mut(name).expect("checked");
+    sp.chat_names.insert(id.clone(), title.to_string());
+    ctx.commit()?;
+    Ok(id)
+}
+
+fn check_chat_name(title: &str) -> Result<&str> {
     let title = title.trim();
     if title.is_empty() || title.chars().count() > 100 || title.chars().any(char::is_control) {
         bail!("a chat name is 1 to 100 characters on one line");
     }
-    let (_, state) = ctx::read_only()?;
-    let s = state.space(name)?;
-    let (id, path) = find_chat(&s.key, id)?;
-    if chat_running(s, &id, &path) {
-        bail!(
-            "this chat is running, and Claude Code keeps the name it started with (and writes it back \
-             when it stops): rename it in the chat by typing /rename NAME, or stop it first"
-        );
-    }
-    let mut f = open_transcript(&path, space_uid(&s.key)?)?;
-    let line = serde_json::json!({ "type": "custom-title", "customTitle": title, "sessionId": id });
-    f.write_all(format!("{line}\n").as_bytes())?;
-    Ok(id)
+    Ok(title)
+}
+
+/// The name Claude Code is given for a new chat the hub starts: its id's
+/// start, so it can be told apart in the Claude app, and the name.
+fn claude_name(id: &str, title: &str) -> String {
+    format!("{} {title}", &id[..8])
 }
 
 /// Deletes a chat's transcript (and its subagent files) from the hub.
@@ -1414,7 +1412,19 @@ pub fn chat_rm(name: &str, id: &str) -> Result<String> {
     if std::fs::symlink_metadata(&extra).is_ok_and(|m| m.is_dir()) {
         std::fs::remove_dir_all(&extra)?;
     }
+    forget_name(name, &id)?;
     Ok(id)
+}
+
+/// Drops the hub's name for a chat that is gone.
+fn forget_name(name: &str, id: &str) -> Result<()> {
+    let mut ctx = Ctx::open()?;
+    if let Some(sp) = ctx.state.spaces.get_mut(name) {
+        if sp.chat_names.remove(id).is_some() {
+            ctx.commit()?;
+        }
+    }
+    Ok(())
 }
 
 /// What `chat_open` did.
@@ -1549,7 +1559,8 @@ fn open_window(
         if resume { "--resume" } else { "--session-id" },
         &id,
     ];
-    if let (false, Some(t)) = (resume, title) {
+    let named = title.filter(|_| !resume).map(|t| claude_name(&id, t));
+    if let Some(t) = &named {
         args.extend(["--name", t]);
     }
     // Without a name after it, so the Claude app shows the chat's own name
@@ -1558,6 +1569,13 @@ fn open_window(
     args.extend(prefix.iter().map(String::as_str));
     args.extend(l.args.iter().map(String::as_str));
     sys::run("tmux", &args)?;
+    if let (Some(t), false) = (title, resume) {
+        let mut ctx = Ctx::open()?;
+        if let Some(sp) = ctx.state.spaces.get_mut(name) {
+            sp.chat_names.insert(id.clone(), t.to_string());
+            ctx.commit()?;
+        }
+    }
     Ok(ChatOpened {
         id,
         restarted: false,
@@ -1572,9 +1590,7 @@ fn open_window(
 pub fn chat_open(name: &str, id: Option<&str>, title: Option<&str>) -> Result<ChatOpened> {
     let title = title.map(str::trim).filter(|t| !t.is_empty());
     if let Some(t) = title {
-        if t.chars().count() > 100 || t.chars().any(char::is_control) {
-            bail!("a chat name is 1 to 100 characters on one line");
-        }
+        check_chat_name(t)?;
     }
     let title = title.filter(|_| id.is_none());
     let mut ctx = Ctx::open()?;
@@ -1603,7 +1619,10 @@ pub fn chat_open(name: &str, id: Option<&str>, title: Option<&str>) -> Result<Ch
     }
     let sp = ctx.state.spaces.get_mut(name).expect("checked");
     sp.conversation = id.clone();
-    sp.title = title.map(String::from);
+    sp.title = title.map(|t| claude_name(&id, t));
+    if let Some(t) = title {
+        sp.chat_names.insert(id.clone(), t.to_string());
+    }
     ctx.commit()?;
     drop(ctx);
     let unit = paths::space_unit(&s.key);
@@ -3154,6 +3173,16 @@ mod tests {
             "https://claude.com/cai/oauth/authorize?code=true&state=x"
         );
         assert!(find_login_url("nothing").is_none());
+    }
+
+    #[test]
+    fn claude_gets_the_id_and_the_name() {
+        assert_eq!(
+            claude_name("9cf982e0-1111-4222-8333-444455556666", "test-chat-111"),
+            "9cf982e0 test-chat-111"
+        );
+        assert!(check_chat_name(" \n").is_err());
+        assert_eq!(check_chat_name(" web check ").unwrap(), "web check");
     }
 
     #[test]

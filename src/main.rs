@@ -275,7 +275,8 @@ enum BridgeCmd {
 enum ChatCmd {
     /// List a space's chats, newest first.
     Ls { space: String },
-    /// Name a chat (the first characters of its id are enough).
+    /// Name a chat on the hub (the first characters of its id are enough).
+    /// The Claude app keeps its own name for it.
     Rename {
         space: String,
         id: String,
@@ -291,7 +292,8 @@ enum ChatCmd {
     /// window of its own, shown in the Claude app.
     New {
         space: String,
-        /// Its name (default: Claude names it).
+        /// Its name (default: Claude names it). Claude Code gets the id's
+        /// start and the name: `9cf982e0 NAME`.
         #[arg(long)]
         name: Option<String>,
     },

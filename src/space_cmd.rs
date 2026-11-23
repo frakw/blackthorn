@@ -282,10 +282,14 @@ pub fn chat_ls(space: &str) -> Result<()> {
     let now = crate::state::now();
     for c in chats {
         println!(
-            "{}  {:>8} ago  {}{}",
+            "{}  {:>8} ago  {}{}{}",
             &c.id[..8],
             ago(now.saturating_sub(c.modified)),
             c.title,
+            c.claude_title
+                .as_ref()
+                .map(|t| format!("  [in Claude: {t}]"))
+                .unwrap_or_default(),
             if c.main {
                 "  (the space's conversation)"
             } else if c.window {
@@ -328,7 +332,10 @@ pub fn log(space: &str, n: usize) -> Result<()> {
 
 pub fn chat_rename(space: &str, id: &str, title: &str) -> Result<()> {
     let id = ops::chat_rename(space, id, title)?;
-    println!("chat {} is now called {title:?}", &id[..8]);
+    println!(
+        "chat {} is now called {title:?} on the hub (the Claude app keeps its own name)",
+        &id[..8]
+    );
     Ok(())
 }
 
