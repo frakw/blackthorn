@@ -339,7 +339,7 @@ chat_post send --data-urlencode "text=/model sonnet" | grep -q '"ok":"sent"' && 
 web_get /account | grep -q "may type into chats" && ok "the unlock is listed with the logins" || fail "unlock not on the account page"
 web_get "/space/t1-claude/chat/0000aaaa/feed" | grep -q '"error"' && ok "an unknown chat is an error" || fail "unknown chat feed"
 thorn chat stop t1-claude "${nid%%-*}" >/dev/null
-web_get "/space/t1-claude/chat/$nid/feed?from=0" | grep -q 'class=\"by\">frakw<' && ok "a message from the web shows who sent it" || fail "no sender: $(web_get "/space/t1-claude/chat/$nid/feed?from=0" | head -c 400)"
+web_get "/space/t1-claude/chat/$nid/feed?from=0" | grep -qF 'class=\"by\">frakw<' && ok "a message from the web shows who sent it" || fail "no sender: $(web_get "/space/t1-claude/chat/$nid/feed?from=0" | head -c 400)"
 thorn log t1-claude | grep -q "frakw sent: check the" && ok "and the space's log records it" || fail "log: $(thorn log t1-claude | tail -5)"
 thorn log t1-claude | grep -q 'frakw: answered' && ok "with the answers pressed" || fail "answer not logged"
 
