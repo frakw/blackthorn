@@ -209,6 +209,7 @@ pub fn feed(name: &str, id: &str, from: Option<u64>, before: Option<u64>) -> Res
         model,
         model_setting,
         effort,
+        level: None,
     })
 }
 

@@ -969,6 +969,9 @@ mod tests {
             limited: n == "fig-aider",
             until: None,
             unattended: false,
+            owner: None,
+            shares: Vec::new(),
+            level: None,
         };
         Overview {
             hub: HubView {

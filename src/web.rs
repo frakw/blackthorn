@@ -395,6 +395,7 @@ fn route(
                     "admin" => Some(crate::state::Access::Admin),
                     _ => None,
                 },
+                owner: None,
             };
             match get::<String>(&c, Op::SpaceNew { space }) {
                 Ok(n) => back(

@@ -581,6 +581,7 @@ fn run(cli: Cli) -> Result<()> {
             rc_name,
             args,
             access: access.as_deref().map(parse_access),
+            owner: None,
         }),
         Cmd::Login { name } => s::login(&name),
         Cmd::Rm { name, purge } => s::rm(&name, purge),
