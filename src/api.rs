@@ -23,7 +23,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const IDLE: u64 = 30 * 60;
 const MAX_FAILURES: u32 = 5;
 const LOCKOUT: u64 = 15 * 60;
 /// Files for chats come this way too (in base64).
@@ -80,6 +79,9 @@ pub enum Op {
         name: String,
         id: String,
         from: Option<u64>,
+        /// Instead: the messages before this offset (Load earlier).
+        #[serde(default)]
+        before: Option<u64>,
     },
     /// The slash commands a space's chats know.
     ChatCommands {
@@ -459,8 +461,9 @@ struct Server {
     unlocks: HashMap<String, Session>,
     /// When the sessions were last written to disk.
     saved: u64,
-    /// web.session_hours in seconds, and when it was read.
-    lifetime: Option<(u64, u64)>,
+    /// When the settings were read: web.session_hours in seconds, and how
+    /// long a login may go unused (None: as long as it lasts).
+    lifetime: Option<(u64, u64, Option<u64>)>,
     /// Failed logins per account and per client address.
     failures: HashMap<String, (u32, u64)>,
     /// `claude --version` is slow; cache it.
@@ -523,26 +526,34 @@ impl Server {
 
     /// How long a login (and a chat unlock) lasts.
     fn lifetime(&mut self, now: u64) -> u64 {
+        self.limits(now).0
+    }
+
+    /// How long a login lasts, and may go unused.
+    fn limits(&mut self, now: u64) -> (u64, Option<u64>) {
         match self.lifetime {
-            Some((at, secs)) if now < at + 60 => secs,
+            Some((at, secs, idle)) if now < at + 60 => (secs, idle),
             _ => {
-                let hours = crate::config::Config::load(Path::new(paths::CONFIG_FILE))
-                    .map(|c| c.web.session_hours)
-                    .unwrap_or(24)
-                    .clamp(1, 720);
-                let secs = u64::from(hours) * 3600;
-                self.lifetime = Some((now, secs));
-                secs
+                let web = crate::config::Config::load(Path::new(paths::CONFIG_FILE))
+                    .map(|c| c.web)
+                    .unwrap_or_default();
+                let secs = u64::from(web.session_hours.clamp(1, 720)) * 3600;
+                let idle = web
+                    .idle_logout
+                    .then(|| u64::from(web.idle_minutes.clamp(1, 1440)) * 60);
+                self.lifetime = Some((now, secs, idle));
+                (secs, idle)
             }
         }
     }
 
     /// Drops what has expired; writes the change.
     fn expire(&mut self, now: u64) {
-        let life = self.lifetime(now);
+        let (life, idle) = self.limits(now);
         let before = self.sessions.len() + self.unlocks.len();
         self.sessions.retain(|_, x| {
-            now.saturating_sub(x.last_seen) < IDLE && now.saturating_sub(x.created) < life
+            idle.map_or(true, |i| now.saturating_sub(x.last_seen) < i)
+                && now.saturating_sub(x.created) < life
         });
         self.unlocks
             .retain(|_, x| now.saturating_sub(x.created) < life);
@@ -853,15 +864,14 @@ fn session_list(
     chat: Option<&str>,
     now: u64,
 ) -> Vec<SessionView> {
-    let life = s.lifetime(now);
+    let (life, idle) = s.limits(now);
     let mine = token.map(token_key);
     let chat = chat.map(token_key);
     let view = |k: &String, x: &Session, is_chat: bool| {
         let (browser, os, device) = webauth::describe_agent(&x.agent);
-        let idle_end = if is_chat {
-            u64::MAX
-        } else {
-            x.last_seen + IDLE
+        let idle_end = match idle {
+            Some(i) if !is_chat => x.last_seen + i,
+            _ => u64::MAX,
         };
         SessionView {
             id: x.id.clone(),
@@ -1134,7 +1144,12 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
             }
             json(())
         }
-        Op::ChatFeed { name, id, from } => json(crate::chat::feed(&name, &id, from)?),
+        Op::ChatFeed {
+            name,
+            id,
+            from,
+            before,
+        } => json(crate::chat::feed(&name, &id, from, before)?),
         Op::ChatCommands { name } => json(crate::chat::commands(&name)?),
         Op::ChatSend { name, id, text } => json(crate::chat::send(&name, &id, &text)?),
         Op::ChatKey { name, id, key } => json(crate::chat::key(&name, &id, &key)?),
@@ -1570,6 +1585,7 @@ pub fn all_op_names() -> Vec<String> {
             name: s(),
             id: s(),
             from: None,
+            before: None,
         },
         Op::ChatCommands { name: s() },
         Op::ChatSend {

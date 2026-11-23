@@ -86,6 +86,11 @@ pub fn plan(cfg: &Config, state: &State, now: u64) -> Plan {
             deny_from: denied_inbound(cfg, state),
             admin_from: cfg.inbound.admin_from.clone(),
             admin_ports: admin_ports(cfg),
+            closed_ports: if crate::ops::tailscale_web_client() {
+                Vec::new()
+            } else {
+                vec![crate::ops::TAILSCALE_WEB_PORT]
+            },
         },
     }
 }

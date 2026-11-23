@@ -45,6 +45,9 @@ pub struct InboundPlan {
     /// If not empty, the only sources allowed on `admin_ports`.
     pub admin_from: Vec<IpAddr>,
     pub admin_ports: Vec<u16>,
+    /// Ports nothing may open (Tailscale's web interface, while it is off:
+    /// `tailscale set --webclient=false` does not always close it).
+    pub closed_ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +171,10 @@ fn render_input(out: &mut String, p: &InboundPlan) {
             set(d6)
         );
     }
+    if !p.closed_ports.is_empty() {
+        out.push_str("\t\t# Closed: turned off.\n");
+        let _ = writeln!(out, "\t\ttcp dport {} counter drop", set(&p.closed_ports));
+    }
     if !p.admin_from.is_empty() && !p.admin_ports.is_empty() {
         let ports = set(&p.admin_ports);
         let (a4, a6) = split(&p.admin_from);
@@ -258,6 +265,7 @@ mod tests {
                 deny_from: vec!["100.80.0.3".parse().unwrap(), "fd7a::5".parse().unwrap()],
                 admin_from: vec!["100.64.0.2".parse().unwrap()],
                 admin_ports: vec![22, 7180],
+                closed_ports: vec![5252],
             },
         }
     }
@@ -280,6 +288,12 @@ mod tests {
         assert!(input.contains("ip6 saddr { fd7a::5 } add @tried6 { ip6 saddr } counter drop"));
         assert!(input.contains("tcp dport { 22, 7180 } ip saddr { 100.64.0.2 } accept"));
         assert!(input.contains("tcp dport { 22, 7180 } counter drop"));
+        assert!(input.contains("tcp dport { 5252 } counter drop"));
+        assert!(
+            input.find("{ 5252 }").unwrap()
+                < input.find("tcp dport { 22, 7180 } ip saddr").unwrap(),
+            "closed before the admin ports are let through"
+        );
         // Drops of managed machines come before any accept of admin ports.
         assert!(input.find("100.80.0.3").unwrap() < input.find("100.64.0.2").unwrap());
         // No admin list: admin ports are left open.

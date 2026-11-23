@@ -1836,12 +1836,22 @@ pub fn tailscale_view() -> TailscaleView {
     }
     if let Ok(prefs) = sys::output("tailscale", &["debug", "prefs"]) {
         v.control = control_name(&prefs);
-        v.web_client = serde_json::from_str::<serde_json::Value>(&prefs)
-            .ok()
-            .and_then(|p| p["RunWebClient"].as_bool())
-            .unwrap_or(false);
+        v.web_client = web_client_on(&prefs);
     }
     v
+}
+
+fn web_client_on(prefs: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(prefs)
+        .ok()
+        .and_then(|p| p["RunWebClient"].as_bool())
+        .unwrap_or(false)
+}
+
+/// Whether Tailscale's web interface is on (false without Tailscale). The
+/// firewall closes its port otherwise.
+pub fn tailscale_web_client() -> bool {
+    sys::output("tailscale", &["debug", "prefs"]).is_ok_and(|p| web_client_on(&p))
 }
 
 /// Fills in what `tailscale status --json` says.
@@ -1940,6 +1950,9 @@ pub fn tailscale_web(on: bool) -> Result<String> {
         bail!("Tailscale is not installed");
     }
     sys::run("tailscale", &["set", &format!("--webclient={on}")])?;
+    // Its port opens and closes with it, in the hub's firewall too.
+    let (cfg, state) = ctx::read_only()?;
+    crate::apply::firewall_rules(&cfg, &state, crate::state::now(), true)?;
     Ok(if on {
         format!("Tailscale's web interface is on, at port {TAILSCALE_WEB_PORT} of the hub's tailnet address")
     } else {
@@ -2689,7 +2702,15 @@ pub const SETTINGS: &[(&str, &str)] = &[
     ),
     (
         "web.session_hours",
-        "How long a web login lasts, in hours (1 to 720); it also ends after 30 idle minutes.",
+        "How long a web login lasts, in hours (1 to 720), and a browser's unlock to type into chats.",
+    ),
+    (
+        "web.idle_logout",
+        "Log out of the web UI after a while without use (true or false).",
+    ),
+    (
+        "web.idle_minutes",
+        "How long without use, with web.idle_logout, in minutes (1 to 1440).",
     ),
     (
         "ssh_from",
@@ -2734,10 +2755,20 @@ fn setting_value(cfg: &Config, key: &str) -> String {
         "inbound.deny_from" => list(&cfg.inbound.deny_from),
         "web.listen" => list(&cfg.web.listen),
         "web.session_hours" => cfg.web.session_hours.to_string(),
+        "web.idle_logout" => cfg.web.idle_logout.to_string(),
+        "web.idle_minutes" => cfg.web.idle_minutes.to_string(),
         "ssh_from" => list(&cfg.ssh_from),
         "egress.https_anywhere" => cfg.egress.https_anywhere.to_string(),
         _ => String::new(),
     }
+}
+
+fn parse_bool(key: &str, value: &str) -> Result<bool> {
+    Ok(match value {
+        "true" | "yes" | "on" => true,
+        "false" | "no" | "off" => false,
+        _ => bail!("{key} is true or false, not {value:?}"),
+    })
 }
 
 /// Addresses separated by commas or spaces; empty is an empty list.
@@ -2803,6 +2834,18 @@ pub fn config_set(
                 cfg.web.listen = parse_list::<SocketAddr>(key, value)?;
                 doc["web"]["listen"] = toml_list(&cfg.web.listen);
             }
+            "web.idle_logout" => {
+                cfg.web.idle_logout = parse_bool(key, value)?;
+                doc["web"]["idle_logout"] = toml_edit::value(cfg.web.idle_logout);
+            }
+            "web.idle_minutes" => {
+                cfg.web.idle_minutes = value
+                    .parse()
+                    .ok()
+                    .filter(|m| (1..=1440).contains(m))
+                    .with_context(|| format!("{key} is a number of minutes, 1 to 1440"))?;
+                doc["web"]["idle_minutes"] = toml_edit::value(i64::from(cfg.web.idle_minutes));
+            }
             "web.session_hours" => {
                 cfg.web.session_hours = value
                     .parse()
@@ -2816,11 +2859,7 @@ pub fn config_set(
                 doc["ssh_from"] = toml_list(&cfg.ssh_from);
             }
             "egress.https_anywhere" => {
-                cfg.egress.https_anywhere = match value {
-                    "true" | "yes" | "on" => true,
-                    "false" | "no" | "off" => false,
-                    _ => bail!("{key} is true or false, not {value:?}"),
-                };
+                cfg.egress.https_anywhere = parse_bool(key, value)?;
                 doc["egress"]["https_anywhere"] = toml_edit::value(cfg.egress.https_anywhere);
             }
             _ => bail!("unknown setting {key:?}; `thorn config show` lists them"),

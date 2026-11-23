@@ -710,6 +710,35 @@ document.querySelectorAll("time[data-local]").forEach(function (t) {
   wireKeys();
   timer = window.setTimeout(poll, 1500);
 
+  // Earlier messages, a part at a time, above the ones shown; the page
+  // stays where it was.
+  var older = document.getElementById("chat-older");
+  if (older) {
+    older.addEventListener("click", function () {
+      older.disabled = true;
+      older.textContent = "Loading…";
+      fetch(feedUrl + "?before=" + encodeURIComponent(older.getAttribute("data-start")), { credentials: "same-origin" })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          if (j.error) throw new Error(j.error);
+          var h = document.body.scrollHeight;
+          older.parentNode.insertAdjacentHTML("afterend", j.html);
+          window.scrollBy(0, document.body.scrollHeight - h);
+          if (j.cut) {
+            older.setAttribute("data-start", j.start);
+            older.disabled = false;
+            older.textContent = "Load earlier messages";
+          } else {
+            older.parentNode.remove();
+          }
+        })
+        .catch(function (err) {
+          older.disabled = false;
+          older.textContent = "Load earlier messages (" + err.message + ")";
+        });
+    });
+  }
+
   var form = document.getElementById("composer");
   if (!form) return;
   var text = document.getElementById("chat-text");

@@ -78,9 +78,12 @@ pub struct Web {
     /// Tailscale's own coordination server with HTTPS on, not Headscale).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub tls_tailscale: bool,
-    /// How long a web login lasts, in hours, however busy; it also ends
-    /// after 30 idle minutes. A chat unlocked for typing stays so as long.
+    /// How long a web login lasts, in hours, however busy. A chat unlocked
+    /// for typing stays so as long.
     pub session_hours: u32,
+    /// A web login also ends after `idle_minutes` without use.
+    pub idle_logout: bool,
+    pub idle_minutes: u32,
 }
 
 impl Default for Web {
@@ -92,6 +95,8 @@ impl Default for Web {
             tls_key: None,
             tls_tailscale: false,
             session_hours: 24,
+            idle_logout: true,
+            idle_minutes: 30,
         }
     }
 }

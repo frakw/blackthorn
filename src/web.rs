@@ -1604,6 +1604,7 @@ fn chat_page(c: &Ctx, name: &str, id: &str, flash: &Flash) -> Reply {
             name: name.into(),
             id: id.into(),
             from: None,
+            before: None,
         },
     ) {
         Ok(f) => f,
@@ -1700,9 +1701,13 @@ fn chat_page(c: &Ctx, name: &str, id: &str, flash: &Flash) -> Reply {
         esc(if feed.title.is_empty() { "Chat" } else { feed.title.as_str() }),
         esc(&id[..8.min(id.len())]),
         if feed.cut {
-            "<p class=\"hint\">Older messages are not shown.</p>"
+            format!(
+                "<p class=\"older\"><button type=\"button\" class=\"link\" id=\"chat-older\" data-start=\"{}\">\
+                 Load earlier messages</button></p>",
+                feed.start
+            )
         } else {
-            ""
+            String::new()
         },
         chat_items_html(&feed.items),
         chat_state_html(c, &n, id, &feed),
@@ -1727,14 +1732,25 @@ fn chat_feed(c: &Ctx, name: &str, id: &str, query: &HashMap<String, String>) -> 
         return Reply::Json(404, "{\"error\":\"no such chat\"}".into());
     }
     let from = query.get("from").and_then(|f| f.parse().ok());
+    let before = query.get("before").and_then(|f| f.parse().ok());
     match get::<crate::chat::Feed>(
         c,
         Op::ChatFeed {
             name: name.into(),
             id: id.into(),
             from,
+            before,
         },
     ) {
+        Ok(feed) if before.is_some() => Reply::Json(
+            200,
+            serde_json::json!({
+                "html": chat_items_html(&feed.items),
+                "start": feed.start,
+                "cut": feed.cut,
+            })
+            .to_string(),
+        ),
         Ok(feed) => Reply::Json(
             200,
             serde_json::json!({
@@ -2674,7 +2690,7 @@ fn settings_page(c: &Ctx, flash: &Flash) -> Reply {
     for s in &settings {
         let key = esc(&s.key);
         let input = match list_kind(&s.key) {
-            _ if s.key == "egress.https_anywhere" => {
+            _ if matches!(s.key.as_str(), "egress.https_anywhere" | "web.idle_logout") => {
                 let on = s.value == "true";
                 format!(
                     "<select name=\"{key}\" id=\"{key}\"><option value=\"true\"{}>true</option><option value=\"false\"{}>false</option></select>",
@@ -3098,7 +3114,8 @@ fn sessions_card(c: &Ctx) -> String {
     format!(
         "<section class=\"card\" id=\"sessions\"><div class=\"page-head\"><h2>Logins</h2>{}</div>\
          <p class=\"hint\">Where this account is logged in, and the browsers that may type into chats. A login ends \
-         after 30 idle minutes, or <code>web.session_hours</code> after it began (Settings).</p>{}</section>",
+         after <code>web.idle_minutes</code> without use (if <code>web.idle_logout</code> is on), or \
+         <code>web.session_hours</code> after it began (Settings).</p>{}</section>",
         if others {
             format!(
                 "<form method=\"post\" action=\"/account/session-end-others\" class=\"inline\" \

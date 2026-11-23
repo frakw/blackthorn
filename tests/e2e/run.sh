@@ -339,6 +339,15 @@ chat_post send --data-urlencode "text=/model sonnet" | grep -q '"ok":"sent"' && 
 web_get /account | grep -q "may type into chats" && ok "the unlock is listed with the logins" || fail "unlock not on the account page"
 web_get "/space/t1-claude/chat/0000aaaa/feed" | grep -q '"error"' && ok "an unknown chat is an error" || fail "unknown chat feed"
 thorn chat stop t1-claude "${nid%%-*}" >/dev/null
+big=6b1e0c2e-1111-4222-8333-444455556666
+hub runuser -u "bt-$k1" -- sh -c "echo '{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"first of many\"}}' > '$dir/$big.jsonl'; yes '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"$(printf '%01000d' 0)\"}]}}' | head -n 6000 >> '$dir/$big.jsonl'"
+page=$(web_get "/space/t1-claude/chat/$big")
+echo "$page" | grep -q 'id="chat-older"' && ok "a long chat offers its earlier messages" || fail "no Load earlier: $(echo "$page" | head -c 600)"
+echo "$page" | grep -q "first of many" && fail "the whole long chat was sent" || ok "without sending them all at once"
+st=$(echo "$page" | sed -n 's/.*id="chat-older" data-start="\([0-9]*\)".*/\1/p')
+more=$(web_get "/space/t1-claude/chat/$big/feed?before=$st")
+echo "$more" | grep -q "first of many" && echo "$more" | grep -q '"cut":false' && ok "and loads them when asked" || fail "earlier: $(echo "$more" | head -c 300)"
+hub rm -f "$dir/$big.jsonl"
 sleep 3
 a=$(hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args")
 case "$a" in "--session-id $old"*) fail "still the old chat: $a";; --session-id*) ok "restarted into a new conversation";; *) fail "chat new: $a";; esac
@@ -384,6 +393,10 @@ web_get /account | grep -q "Account frakw" && ok "this one is not" || fail "ende
 thorn config set web.session_hours 0 2>&1 | grep -q "1 to 720" && ok "a login lifetime out of range is refused" || fail "session_hours 0"
 thorn config set web.session_hours 48 >/dev/null && thorn config show | grep -q "web.session_hours.*48" && ok "the login lifetime is a setting" || fail "session_hours: $(thorn config show | grep session)"
 thorn config set web.session_hours 24 >/dev/null
+thorn config set web.idle_minutes 0 2>&1 | grep -q "1 to 1440" && ok "an idle time out of range is refused" || fail "idle_minutes 0"
+thorn config set web.idle_logout false >/dev/null && thorn config show | grep -q "web.idle_logout = false" && ok "logging out when idle can be turned off" || fail "idle_logout"
+thorn config set web.idle_logout true >/dev/null
+thorn firewall show | grep -Eq "dport (\{ )?5252( \})? counter.*drop" && ok "Tailscale's web interface is closed in the firewall while off" || fail "5252 not closed: $(thorn firewall show | grep -n 5252)"
 
 say "notifications to an ntfy server"
 docker exec -d "$P-admin" sh -c "while true; do printf 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' | nc -N -l 8099 >> /tmp/ntfy.req; done"

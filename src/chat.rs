@@ -16,7 +16,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// The most of a transcript read at once.
-const WINDOW: u64 = 2 << 20;
+const WINDOW: u64 = 4 << 20;
 /// The longest text kept of one message, and of a tool's input or result.
 const MAX_TEXT: usize = 40_000;
 const MAX_TOOL: usize = 6_000;
@@ -67,8 +67,10 @@ pub struct Feed {
     /// The transcript was read from its start (or a window before its
     /// end): the page should start over with these items.
     pub reset: bool,
-    /// Older messages were left out.
+    /// Older messages were left out: they end at `start`.
     pub cut: bool,
+    #[serde(default)]
+    pub start: u64,
     pub title: String,
     pub screen: Screen,
     /// The hub can type into it (it runs in a terminal of the hub).
@@ -133,7 +135,7 @@ fn locate(s: &Space, id: &str) -> Result<(String, Option<std::path::PathBuf>)> {
 
 /// The chat's transcript from `from` on (None: its latest part), and its
 /// terminal.
-pub fn feed(name: &str, id: &str, from: Option<u64>) -> Result<Feed> {
+pub fn feed(name: &str, id: &str, from: Option<u64>, before: Option<u64>) -> Result<Feed> {
     sys::require_root()?;
     let (_, state) = ctx::read_only()?;
     let s = state.space(name)?;
@@ -151,6 +153,9 @@ pub fn feed(name: &str, id: &str, from: Option<u64>) -> Result<Feed> {
     };
     let mut f = open_own(&path, crate::ops::space_uid(&s.key)?)?;
     let len = f.metadata()?.len();
+    if let Some(before) = before {
+        return earlier(&mut f, before.min(len));
+    }
     let (start, reset) = match from {
         Some(o) if o <= len && len - o <= WINDOW => (o, false),
         _ => (len.saturating_sub(WINDOW), true),
@@ -160,12 +165,15 @@ pub fn feed(name: &str, id: &str, from: Option<u64>) -> Result<Feed> {
     (&mut f).take(len - start).read_to_end(&mut buf)?;
     let mut text = &buf[..];
     let cut = reset && start > 0;
+    let mut start = start;
     if cut {
         // From the first whole line.
-        match text.iter().position(|&b| b == b'\n') {
-            Some(i) => text = &text[i + 1..],
-            None => text = &[],
-        }
+        let skip = text
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(text.len(), |i| i + 1);
+        text = &text[skip..];
+        start += skip as u64;
     }
     // Only whole lines; a line being written is read next time.
     let whole = text.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
@@ -186,12 +194,37 @@ pub fn feed(name: &str, id: &str, from: Option<u64>) -> Result<Feed> {
         offset,
         reset,
         cut,
+        start,
         title,
         screen,
         typing,
         model,
         model_setting,
         effort,
+    })
+}
+
+/// The messages before `before` (where an earlier read started, so at a
+/// line's start): a window's worth, from a whole line.
+fn earlier(f: &mut std::fs::File, before: u64) -> Result<Feed> {
+    let mut start = before.saturating_sub(WINDOW);
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::new();
+    f.take(before - start).read_to_end(&mut buf)?;
+    let mut text = &buf[..];
+    if start > 0 {
+        let skip = text
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(text.len(), |i| i + 1);
+        text = &text[skip..];
+        start += skip as u64;
+    }
+    Ok(Feed {
+        items: parse(&String::from_utf8_lossy(text)),
+        cut: start > 0,
+        start,
+        ..Feed::default()
     })
 }
 

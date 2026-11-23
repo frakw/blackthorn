@@ -400,8 +400,9 @@ back, and offers no way to delete it.
 
 Each chat has a page (click its name on the space's page): Claude's
 answers as they come, with code (coloured), lists and tables; the tools it used and
-what they gave back, folded; edits as lines out and in. A new chat opens
-on its page.
+what they gave back, folded; edits as lines out and in. A long chat shows
+its latest part first; *Load earlier messages* brings the rest. A new chat
+opens on its page.
 
 To type into chats from a browser, unlock it once with your password and
 a code; it stays so for `web.session_hours` (24 by default), and the
