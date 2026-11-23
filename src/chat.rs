@@ -40,6 +40,9 @@ pub struct Item {
     pub summary: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub error: bool,
+    /// The language of a tool's text, to colour it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lang: String,
 }
 
 /// What the chat's terminal shows.
@@ -70,6 +73,46 @@ pub struct Feed {
     pub screen: Screen,
     /// The hub can type into it (it runs in a terminal of the hub).
     pub typing: bool,
+    /// The model of Claude's latest answer read now (empty: none read).
+    #[serde(default)]
+    pub model: String,
+    /// The space's settings: its model and effort level, if set.
+    #[serde(default)]
+    pub model_setting: String,
+    #[serde(default)]
+    pub effort: String,
+}
+
+/// The models and effort levels the chat page offers (Claude Code's
+/// /model and /effort take these).
+pub const MODELS: &[&str] = &["opus", "sonnet", "haiku", "fable"];
+pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "auto"];
+
+/// The model of the latest answer in transcript lines.
+fn last_model(text: &str) -> String {
+    text.lines()
+        .rev()
+        .filter(|l| l.contains("\"assistant\""))
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v["message"]["model"].as_str().map(String::from))
+        .find(|m| m.starts_with("claude"))
+        .unwrap_or_default()
+}
+
+/// The model and effort level in the space's Claude Code settings.
+fn settings(s: &Space) -> (String, String) {
+    let path = paths::space_home(&s.key).join(".claude/settings.json");
+    let Ok(uid) = crate::ops::space_uid(&s.key) else {
+        return Default::default();
+    };
+    let Ok(f) = open_own(&path, uid) else {
+        return Default::default();
+    };
+    let mut text = String::new();
+    let _ = f.take(256 * 1024).read_to_string(&mut text);
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    let get = |k: &str| v[k].as_str().unwrap_or("").chars().take(60).collect();
+    (get("model"), get("effortLevel"))
 }
 
 /// A chat by (the start of) its id, and its transcript; a new chat the
@@ -95,11 +138,14 @@ pub fn feed(name: &str, id: &str, from: Option<u64>) -> Result<Feed> {
     let (_, state) = ctx::read_only()?;
     let s = state.space(name)?;
     let (id, path) = locate(s, id)?;
+    let (model_setting, effort) = settings(s);
     let Some(path) = path else {
         return Ok(Feed {
             reset: from.is_none(),
             screen: screen(s, &id, Path::new("")),
             typing: true,
+            model_setting,
+            effort,
             ..Feed::default()
         });
     };
@@ -124,7 +170,9 @@ pub fn feed(name: &str, id: &str, from: Option<u64>) -> Result<Feed> {
     // Only whole lines; a line being written is read next time.
     let whole = text.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
     let offset = len - (text.len() - whole) as u64;
-    let items = parse(&String::from_utf8_lossy(&text[..whole]));
+    let lines = String::from_utf8_lossy(&text[..whole]);
+    let items = parse(&lines);
+    let model = last_model(&lines);
     let typing = target(s, &id).is_some();
     let screen = screen(s, &id, &path);
     // The name is near the end; read again with each start over.
@@ -141,6 +189,9 @@ pub fn feed(name: &str, id: &str, from: Option<u64>) -> Result<Feed> {
         title,
         screen,
         typing,
+        model,
+        model_setting,
+        effort,
     })
 }
 
@@ -272,6 +323,7 @@ fn user_note(t: &str) -> Option<Item> {
         id: None,
         summary: String::new(),
         error: false,
+        lang: String::new(),
     })
 }
 
@@ -283,6 +335,7 @@ fn note(text: String) -> Item {
         id: None,
         summary: String::new(),
         error: false,
+        lang: String::new(),
     }
 }
 
@@ -311,6 +364,7 @@ pub fn parse(text: &str) -> Vec<Item> {
                                 id: None,
                                 summary: String::new(),
                                 error: false,
+                                lang: String::new(),
                             }),
                             Some("tool_result") => out.push(Item {
                                 kind: "result".into(),
@@ -319,6 +373,7 @@ pub fn parse(text: &str) -> Vec<Item> {
                                 id: p["tool_use_id"].as_str().map(String::from),
                                 summary: String::new(),
                                 error: p["is_error"].as_bool() == Some(true),
+                                lang: String::new(),
                             }),
                             _ => {}
                         }
@@ -339,11 +394,21 @@ pub fn parse(text: &str) -> Vec<Item> {
                                     id: None,
                                     summary: String::new(),
                                     error: false,
+                                    lang: String::new(),
                                 });
                             }
                         }
                         Some("tool_use") => {
                             let name = p["name"].as_str().unwrap_or("tool").to_string();
+                            let lang = match name.as_str() {
+                                "Bash" => "sh".to_string(),
+                                "Write" => crate::highlight::lang_of_path(
+                                    p["input"]["file_path"].as_str().unwrap_or(""),
+                                )
+                                .to_string(),
+                                "Edit" | "MultiEdit" => String::new(),
+                                _ => "json".to_string(),
+                            };
                             out.push(Item {
                                 kind: "tool".into(),
                                 text: tool_text(&name, &p["input"]),
@@ -351,6 +416,7 @@ pub fn parse(text: &str) -> Vec<Item> {
                                 name: Some(name),
                                 id: p["id"].as_str().map(String::from),
                                 error: false,
+                                lang,
                             });
                         }
                         _ => {}
@@ -799,6 +865,18 @@ mod tests {
         assert_eq!(s.state, "asking");
         assert_eq!(s.choices[1].1, "No");
         assert_eq!(s.question, "Do you want to make this edit?");
+    }
+
+    #[test]
+    fn latest_model() {
+        let t = [
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-5-5","content":[]}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-5-5","content":[]}}"#,
+            r#"{"type":"assistant","message":{"model":"<synthetic>","content":[]}}"#,
+        ]
+        .join("\n");
+        assert_eq!(last_model(&t), "claude-opus-5-5");
+        assert_eq!(last_model("{}"), "");
     }
 
     #[test]

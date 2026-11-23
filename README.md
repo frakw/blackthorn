@@ -399,7 +399,7 @@ back, and offers no way to delete it.
 ### Chats on the web
 
 Each chat has a page (click its name on the space's page): Claude's
-answers as they come, with code, lists and tables; the tools it used and
+answers as they come, with code (coloured), lists and tables; the tools it used and
 what they gave back, folded; edits as lines out and in. A new chat opens
 on its page.
 
@@ -409,8 +409,12 @@ Account page lists and ends it like a login. Then:
 
 - **Send** a message (Enter on a computer, Shift+Enter for a new line).
 - **+**: add files or photos (up to 10 MB each, or paste a picture into
-  the box). They are saved in the chat's folder under `.uploads/` and
-  mentioned as `@.uploads/...`, so Claude reads them.
+  the box). Pictures show as previews; remove any, or drag them into
+  order. They are saved in the chat's folder under `.uploads/` and
+  mentioned at the end of the message as `@.uploads/...`, in that order,
+  so Claude reads them.
+- **Model and effort** (under the box): sent to the chat as `/model` and
+  `/effort`; the button shows the model of the latest answer.
 - **/**: Claude Code's commands, and the space's own commands and skills.
 - **Stop** while Claude works (Escape), and buttons for the choices when it
   asks a question (allow a command, say). Nothing is typed while it asks.

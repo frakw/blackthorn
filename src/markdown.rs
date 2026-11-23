@@ -28,7 +28,7 @@ pub fn to_html(src: &str) -> String {
                 } else {
                     format!(" data-lang=\"{}\"", esc(lang))
                 },
-                esc(&code)
+                crate::highlight::highlight(lang, &code)
             ));
             continue;
         }

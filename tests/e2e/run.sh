@@ -334,6 +334,8 @@ w="/var/lib/blackthorn/spaces/$k1/t1-claude"
 [ "$(hub cat "$w/$up")" = "hello file" ] && ok "in the chat's folder" || fail "uploaded file: $(hub ls -la "$w/.uploads")"
 [ "$(hub stat -c '%U %a' "$w/$up")" = "bt-$k1 600" ] && ok "owned by the space, private" || fail "upload owner: $(hub stat -c '%U %a' "$w/$up")"
 web_get "/space/t1-claude/chat/$nid" | grep -q 'data-cmd="/compact"' && ok "slash commands offered" || fail "no slash commands"
+web_get "/space/t1-claude/chat/$nid" | grep -q 'data-send="/effort xhigh"' && ok "and model and effort choices" || fail "no model menu"
+chat_post send --data-urlencode "text=/model sonnet" | grep -q '"ok":"sent"' && sleep 1 && web_get "/space/t1-claude/chat/$nid/feed?from=0" | grep -q '/model sonnet' && ok "a model chosen is sent as /model" || fail "/model not sent"
 web_get /account | grep -q "may type into chats" && ok "the unlock is listed with the logins" || fail "unlock not on the account page"
 web_get "/space/t1-claude/chat/0000aaaa/feed" | grep -q '"error"' && ok "an unknown chat is an error" || fail "unknown chat feed"
 thorn chat stop t1-claude "${nid%%-*}" >/dev/null

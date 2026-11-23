@@ -1467,7 +1467,7 @@ fn chat_items_html(items: &[crate::chat::Item]) -> String {
                         })
                         .collect::<String>()
                 } else {
-                    esc(&it.text)
+                    crate::highlight::highlight(&it.lang, &it.text)
                 };
                 out.push_str(&format!(
                     "<details class=\"tool\"><summary><span class=\"tool-name\">{}</span> <code>{}</code></summary>\
@@ -1495,6 +1495,49 @@ fn chat_items_html(items: &[crate::chat::Item]) -> String {
         }
     }
     out
+}
+
+/// "claude-opus-5-5" as "Opus 5.5" (and older names, aliases).
+fn model_label(id: &str) -> String {
+    let id = id.split('[').next().unwrap_or(id);
+    let id = id.strip_prefix("claude-").unwrap_or(id);
+    let mut name = String::new();
+    let mut version = Vec::new();
+    for part in id.split('-') {
+        if part.chars().all(|c| c.is_ascii_digit()) {
+            if part.len() <= 2 {
+                version.push(part);
+            }
+        } else if name.is_empty() {
+            let mut c = part.chars();
+            name = c
+                .next()
+                .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                .unwrap_or_default();
+        }
+    }
+    if version.is_empty() {
+        name
+    } else {
+        format!("{name} {}", version.join("."))
+    }
+}
+
+/// What the model button says: the model of the latest answer (else the
+/// space's setting), and the effort level if one is set.
+fn model_button(model: &str, setting: &str, effort: &str) -> String {
+    let m = if !model.is_empty() {
+        model_label(model)
+    } else if !setting.is_empty() {
+        model_label(setting)
+    } else {
+        "Default model".into()
+    };
+    if effort.is_empty() {
+        m
+    } else {
+        format!("{m} · {effort}")
+    }
 }
 
 /// What the chat's terminal is doing, with what can be done about it.
@@ -1586,6 +1629,29 @@ fn chat_page(c: &Ctx, name: &str, id: &str, flash: &Flash) -> Reply {
             )
         })
         .collect();
+    let models: String = crate::chat::MODELS
+        .iter()
+        .map(|m| {
+            format!(
+                "<button type=\"button\" data-send=\"/model {m}\" data-model=\"{m}\">{}</button>",
+                model_label(m)
+            )
+        })
+        .collect();
+    let efforts: String = crate::chat::EFFORTS
+        .iter()
+        .map(|e| {
+            let label = match *e {
+                "xhigh" => "Extra high",
+                "max" => "Max",
+                "low" => "Low",
+                "medium" => "Medium",
+                "high" => "High",
+                _ => "Auto",
+            };
+            format!("<button type=\"button\" data-send=\"/effort {e}\" data-effort=\"{e}\">{label}</button>")
+        })
+        .collect();
     let composer = if !feed.typing {
         String::new()
     } else if !c.chat {
@@ -1610,9 +1676,16 @@ fn chat_page(c: &Ctx, name: &str, id: &str, flash: &Flash) -> Reply {
              <button type=\"button\" data-act=\"slash\">Slash commands</button></div></div>\
              <textarea name=\"text\" id=\"chat-text\" rows=\"1\" placeholder=\"Message Claude; / for commands\" required></textarea>\
              <button class=\"primary send\">Send</button></div>\
+             <div class=\"composer-foot\"><div class=\"model-wrap\">\
+             <button type=\"button\" class=\"link model-btn\" id=\"model-btn\" data-model=\"{}\" data-effort=\"{}\" hidden>{}</button>\
+             <div class=\"plus-menu model-menu\" id=\"model-menu\" hidden><p class=\"menu-h\">Model</p>{models}\
+             <p class=\"menu-h\">Effort</p>{efforts}</div></div></div>\
              <input type=\"file\" id=\"chat-file\" multiple hidden>\
              <ul class=\"slash\" id=\"slash\" hidden>{slash}</ul></form>",
-            csrf(c)
+            csrf(c),
+            esc(if feed.model.is_empty() { &feed.model_setting } else { &feed.model }),
+            esc(&feed.effort),
+            esc(&model_button(&feed.model, &feed.model_setting, &feed.effort)),
         )
     };
     let body = format!(
@@ -1671,6 +1744,9 @@ fn chat_feed(c: &Ctx, name: &str, id: &str, query: &HashMap<String, String>) -> 
                 "state": feed.screen.state,
                 "state_html": chat_state_html(c, &url_encode(name), id, &feed),
                 "title": feed.title,
+                "model": feed.model,
+                "model_label": if feed.model.is_empty() { String::new() } else { model_label(&feed.model) },
+                "effort": feed.effort,
             })
             .to_string(),
         ),
@@ -3278,6 +3354,19 @@ fn bridges_page(c: &Ctx, flash: &Flash) -> Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_names() {
+        assert_eq!(model_label("claude-opus-5-5"), "Opus 5.5");
+        assert_eq!(model_label("claude-haiku-4-5-20251001"), "Haiku 4.5");
+        assert_eq!(model_label("claude-3-5-sonnet-20241022"), "Sonnet 3.5");
+        assert_eq!(model_label("opus[1m]"), "Opus");
+        assert_eq!(model_button("", "", ""), "Default model");
+        assert_eq!(
+            model_button("claude-fable-5-2", "", "high"),
+            "Fable 5.2 · high"
+        );
+    }
 
     #[test]
     fn messages_go_before_the_anchor() {

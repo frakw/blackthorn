@@ -415,3 +415,41 @@ ul.slash span { color: var(--dim); font-size: 13px; }
 a.chat-title { color: var(--ink); text-decoration: none; }
 a.chat-title:hover { text-decoration: underline; }
 [hidden] { display: none !important; }
+
+/* Code colours. */
+.hl-c { color: #6a737d; font-style: italic; }
+.hl-s { color: #2f7d32; }
+.hl-n { color: #b35c00; }
+.hl-k { color: #8a3ab9; font-weight: 600; }
+.hl-f { color: #1f5fbf; }
+.hl-v { color: #a0422a; }
+@media (prefers-color-scheme: dark) {
+  .hl-c { color: #8b949e; }
+  .hl-s { color: #8fd48f; }
+  .hl-n { color: #f0a05a; }
+  .hl-k { color: #d2a8ff; }
+  .hl-f { color: #79b8ff; }
+  .hl-v { color: #ffa198; }
+}
+
+/* Files for the next message. */
+.attached { gap: 8px; }
+.att { position: relative; display: flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 12px;
+  background: var(--panel); padding: 6px 28px 6px 10px; font-size: 13px; max-width: 220px; touch-action: none;
+  user-select: none; cursor: grab; }
+.att.pic { flex-direction: column; align-items: stretch; padding: 4px; width: 104px; }
+.att.pic img { width: 96px; height: 96px; object-fit: cover; border-radius: 8px; display: block; }
+.att.pic .att-name { font-size: 11px; padding: 2px 2px 0; }
+.att-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); }
+.att.bad .att-name { color: var(--bad); white-space: normal; }
+.att-x { position: absolute; top: 4px; right: 4px; width: 22px; height: 22px; border-radius: 50%; padding: 0;
+  line-height: 20px; font-size: 15px; background: var(--panel); border: 1px solid var(--line); color: var(--ink); cursor: pointer; }
+.att.dragging { opacity: .55; outline: 2px dashed var(--accent); }
+
+/* Model and effort. */
+.composer-foot { display: flex; justify-content: flex-end; padding: 4px 6px 0; }
+.model-wrap { position: relative; }
+.model-btn { font-size: 13.5px; color: var(--dim); }
+.model-menu { left: auto; right: 0; bottom: 30px; }
+.menu-h { margin: 6px 10px 2px; font-size: 12px; color: var(--dim); }
+.plus-menu button.on::after { content: "✓"; float: right; color: var(--accent); }

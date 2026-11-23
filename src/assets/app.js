@@ -686,6 +686,7 @@ document.querySelectorAll("time[data-local]").forEach(function (t) {
           wireKeys();
         }
         busy = j.state === "busy";
+        if (window.btModel) window.btModel(j);
         if (stick && (j.html || j.reset)) toBottom();
       })
       .catch(function () { /* try again later */ })
@@ -725,15 +726,25 @@ document.querySelectorAll("time[data-local]").forEach(function (t) {
   };
   text.addEventListener("input", grow);
 
+  // Files added to the next message, in order: { name, path (once saved),
+  // preview (a picture's data URL), el }.
+  var files = [];
+  var pending = 0;
+
   var send = function () {
-    var t = text.value;
-    if (!t.trim()) return;
+    var t = text.value.trim();
+    var refs = files.filter(function (f) { return f.path; })
+      .map(function (f) { return "@" + f.path; });
+    if (!t && !refs.length) return;
+    if (pending) { showError("A file is still being added."); return; }
+    if (refs.length) t = (t ? t + "\n\n" : "") + refs.join(" ");
     var button = form.querySelector(".send");
     button.disabled = true;
     post("send", { text: t })
       .then(function () {
         text.value = "";
-        attached.innerHTML = "";
+        files = [];
+        drawFiles();
         grow();
         showError("");
         window.setTimeout(poll, 400);
@@ -762,26 +773,95 @@ document.querySelectorAll("time[data-local]").forEach(function (t) {
     grow();
   };
 
-  var upload = function (f) {
-    var chip = document.createElement("span");
-    chip.className = "badge";
-    chip.textContent = f.name + " …";
-    attached.appendChild(chip);
-    if (f.size > 10 * 1024 * 1024) {
-      chip.textContent = f.name + ": over 10 MB";
+  // The files as cards: a picture's preview, else its name; × removes
+  // one; drag (mouse or finger) to put them in order.
+  var drawFiles = function () {
+    attached.innerHTML = "";
+    files.forEach(function (f, i) {
+      var card = document.createElement("div");
+      card.className = "att" + (f.preview ? " pic" : "") + (f.error ? " bad" : "");
+      card.setAttribute("data-i", i);
+      if (f.preview) {
+        var img = document.createElement("img");
+        img.src = f.preview;
+        img.alt = f.name;
+        img.draggable = false;
+        card.appendChild(img);
+      }
+      var label = document.createElement("span");
+      label.className = "att-name";
+      label.textContent = f.error ? f.name + ": " + f.error : (f.path ? f.name : f.name + " …");
+      card.appendChild(label);
+      var x = document.createElement("button");
+      x.type = "button";
+      x.className = "att-x";
+      x.setAttribute("aria-label", "Remove " + f.name);
+      x.textContent = "×";
+      x.addEventListener("click", function (e) {
+        e.stopPropagation();
+        files.splice(files.indexOf(f), 1);
+        drawFiles();
+      });
+      card.appendChild(x);
+      f.el = card;
+      attached.appendChild(card);
+    });
+  };
+
+  var dragging = null;
+  attached.addEventListener("pointerdown", function (e) {
+    var card = e.target.closest(".att");
+    if (!card || e.target.closest(".att-x") || files.length < 2) return;
+    dragging = { f: files[+card.getAttribute("data-i")], id: e.pointerId };
+    card.classList.add("dragging");
+    attached.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  attached.addEventListener("pointermove", function (e) {
+    if (!dragging || e.pointerId !== dragging.id) return;
+    var over = document.elementFromPoint(e.clientX, e.clientY);
+    var card = over && over.closest && over.closest(".att");
+    if (!card || card === dragging.f.el) return;
+    var target = files[+card.getAttribute("data-i")];
+    var r = card.getBoundingClientRect();
+    var after = e.clientX > r.left + r.width / 2;
+    var from = files.indexOf(dragging.f);
+    files.splice(from, 1);
+    var at = files.indexOf(target) + (after ? 1 : 0);
+    files.splice(at, 0, dragging.f);
+    if (at === from) return;
+    drawFiles();
+    dragging.f.el.classList.add("dragging");
+  });
+  var drop = function () {
+    if (!dragging) return;
+    if (dragging.f.el) dragging.f.el.classList.remove("dragging");
+    dragging = null;
+  };
+  attached.addEventListener("pointerup", drop);
+  attached.addEventListener("pointercancel", drop);
+
+  var upload = function (blob) {
+    var f = { name: blob.name || "pasted.png", path: null, preview: null, error: null };
+    files.push(f);
+    if (blob.size > 10 * 1024 * 1024) {
+      f.error = "over 10 MB";
+      drawFiles();
       return;
     }
+    drawFiles();
+    pending += 1;
     var r = new FileReader();
     r.onload = function () {
-      var data = String(r.result).replace(/^data:[^,]*,/, "");
-      post("chat-upload", { filename: f.name || "pasted.png", data: data })
-        .then(function (j) {
-          chip.textContent = f.name;
-          insert("@" + j.data + " ");
-        })
-        .catch(function (err) { chip.textContent = f.name + ": " + err.message; });
+      var url = String(r.result);
+      if (/^data:image\//.test(url)) { f.preview = url; drawFiles(); }
+      post("chat-upload", { filename: f.name, data: url.replace(/^data:[^,]*,/, "") })
+        .then(function (j) { f.path = j.data; })
+        .catch(function (err) { f.error = err.message; })
+        .then(function () { pending -= 1; drawFiles(); });
     };
-    r.readAsDataURL(f);
+    r.onerror = function () { pending -= 1; f.error = "could not be read"; drawFiles(); };
+    r.readAsDataURL(blob);
   };
   file.addEventListener("change", function () {
     Array.prototype.forEach.call(file.files, upload);
@@ -829,6 +909,44 @@ document.querySelectorAll("time[data-local]").forEach(function (t) {
     grow();
   });
   document.addEventListener("click", function (e) {
-    if (!form.contains(e.target)) { slash.hidden = true; menu.hidden = true; }
+    if (!form.contains(e.target)) { slash.hidden = true; menu.hidden = true; modelMenu.hidden = true; }
   });
+
+  // Model and effort: sent to the chat as /model and /effort.
+  var modelBtn = document.getElementById("model-btn");
+  var modelMenu = document.getElementById("model-menu");
+  var current = { model: modelBtn.getAttribute("data-model"), effort: modelBtn.getAttribute("data-effort") };
+  var markCurrent = function () {
+    modelMenu.querySelectorAll("[data-model]").forEach(function (b) {
+      b.classList.toggle("on", !!current.model && current.model.indexOf(b.getAttribute("data-model")) >= 0);
+    });
+    modelMenu.querySelectorAll("[data-effort]").forEach(function (b) {
+      b.classList.toggle("on", b.getAttribute("data-effort") === current.effort);
+    });
+  };
+  modelBtn.hidden = false;
+  modelBtn.addEventListener("click", function () { modelMenu.hidden = !modelMenu.hidden; menu.hidden = true; slash.hidden = true; markCurrent(); });
+  modelMenu.addEventListener("click", function (e) {
+    var b = e.target.closest("button[data-send]");
+    if (!b) return;
+    modelMenu.hidden = true;
+    post("send", { text: b.getAttribute("data-send") })
+      .then(function () {
+        if (b.hasAttribute("data-effort")) current.effort = b.getAttribute("data-effort");
+        if (b.hasAttribute("data-model")) {
+          current.model = b.getAttribute("data-model");
+          modelBtn.textContent = b.textContent + (current.effort ? " · " + current.effort : "");
+        } else {
+          modelBtn.textContent = modelBtn.textContent.replace(/ · .*$/, "") + " · " + current.effort;
+        }
+        showError("");
+        window.setTimeout(poll, 500);
+      })
+      .catch(function (err) { showError(err.message); });
+  });
+  window.btModel = function (j) {
+    if (j.model) current.model = j.model;
+    if (j.effort) current.effort = j.effort;
+    if (j.model_label) modelBtn.textContent = j.model_label + (current.effort ? " · " + current.effort : "");
+  };
 })();

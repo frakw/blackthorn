@@ -10,6 +10,7 @@ mod config_cmd;
 mod ctx;
 mod firewall;
 mod harden;
+mod highlight;
 mod host_cmd;
 mod http;
 mod init_cmd;
