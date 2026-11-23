@@ -1698,6 +1698,7 @@ fn chat_state_html(c: &Ctx, n: &str, id: &str, feed: &crate::chat::Feed) -> Stri
                 }
             )
         }
+        "stopped" if !may_use(feed) => "<div class=\"chat-state\">This chat is not running.</div>".to_string(),
         "stopped" => format!(
             "<div class=\"chat-state\">This chat is not running. <form method=\"post\" action=\"/space/{n}/chat-open\" \
              class=\"inline\">{}<input type=\"hidden\" name=\"id\" value=\"{id}\"><button>Continue it</button></form></div>",
