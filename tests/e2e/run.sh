@@ -291,8 +291,8 @@ sleep 2
 hub grep -Eq -- "^--session-id [0-9a-f-]+ --name [0-9a-f]{8} web check --remote-control --remote-control-session-name-prefix t1-claude" "/var/lib/blackthorn/spaces/$k1/fake-claude.args" && ok "a named chat window: Claude gets the id's start and the name" || fail "named chat window: $(hub tail -2 "/var/lib/blackthorn/spaces/$k1/fake-claude.args")"
 wid=$(hub grep -- " web check --remote-control" "/var/lib/blackthorn/spaces/$k1/fake-claude.args" | tail -1 | cut -d' ' -f2)
 hub grep -q -- "--name ${wid%%-*} web check" "/var/lib/blackthorn/spaces/$k1/fake-claude.args" && ok "the start of its own id" || fail "id in the name"
-thorn chat ls t1-claude | grep -q "${wid%%-*}.*web check" && ok "the hub lists it by the name given" || fail "hub name of a new chat: $(thorn chat ls t1-claude)"
 hub runuser -u "bt-$k1" -- sh -c "echo '{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"web\"}}' > '$dir/$wid.jsonl'"
+thorn chat ls t1-claude | grep -q "${wid%%-*}.*web check" && ok "the hub lists it by the name given" || fail "hub name of a new chat: $(thorn chat ls t1-claude)"
 thorn chat ls t1-claude | grep -q "running, started from the hub" && ok "a chat started from the hub is listed as running" || fail "window chat in ls: $(thorn chat ls t1-claude)"
 web_get /space/t1-claude | grep -q "/space/t1-claude/chat-stop" && ok "the space page offers to stop it" || fail "no Stop on the space page"
 thorn chat rename t1-claude "${wid%%-*}" "y" | grep -q "on the hub" && ok "renamed on the hub while it runs" || fail "window chat rename while running"
