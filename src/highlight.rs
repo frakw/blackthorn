@@ -268,9 +268,9 @@ pub fn highlight(lang_name: &str, code: &str) -> String {
             }
         }
         if let Some((open, close)) = l.block {
-            if rest.starts_with(open) {
+            if let Some(after) = rest.strip_prefix(open) {
                 flush(&mut plain, &mut out);
-                let end = rest[open.len()..]
+                let end = after
                     .find(close)
                     .map_or(rest.len(), |e| open.len() + e + close.len());
                 out.push_str(&span("c", &rest[..end]));
@@ -283,7 +283,7 @@ pub fn highlight(lang_name: &str, code: &str) -> String {
         if l.quotes.contains(&ch) && !(ch == '\'' && in_word) {
             flush(&mut plain, &mut out);
             // Python's triple quotes.
-            let triple: String = std::iter::repeat_n(ch, 3).collect();
+            let triple: String = std::iter::repeat(ch).take(3).collect();
             let end = if rest.starts_with(&triple) {
                 rest[3..].find(&triple).map_or(rest.len(), |e| e + 6)
             } else {
