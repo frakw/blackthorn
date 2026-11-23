@@ -1775,10 +1775,10 @@ fn chat_page(c: &Ctx, name: &str, id: &str, flash: &Flash) -> Reply {
             format!("<button type=\"button\" data-send=\"/effort {e}\" data-effort=\"{e}\">{label}</button>")
         })
         .collect();
-    let composer = if !feed.typing {
-        String::new()
-    } else if !may_use(&feed) {
+    let composer = if !may_use(&feed) {
         "<p class=\"hint\">You may read this chat; typing into it needs <b>use</b> of the space.</p>".to_string()
+    } else if !feed.typing {
+        String::new()
     } else if !c.chat {
         format!(
             "<form method=\"post\" action=\"/space/{n}/chat/{id}/unlock\" class=\"card stack chat-unlock\">{}\
