@@ -24,16 +24,33 @@ use std::net::{IpAddr, SocketAddr};
 const CSS: &str = include_str!("assets/app.css");
 const JS: &str = include_str!("assets/app.js");
 const COOKIE: &str = "bt_session";
+/// Lets this browser type into chats (see Op::ChatUnlock).
+const CHAT_COOKIE: &str = "bt_chat";
+
+thread_local! {
+    /// This request's User-Agent and chat-unlock token, sent along to the
+    /// API with every call made for it.
+    static META: std::cell::RefCell<(Option<String>, Option<String>)> =
+        const { std::cell::RefCell::new((None, None)) };
+}
+
+/// A request to the API, with this browser's User-Agent and chat token.
+fn request(token: Option<String>, csrf: Option<String>, client: Option<IpAddr>, op: Op) -> Request {
+    let (agent, chat) = META.with(|m| m.borrow().clone());
+    Request {
+        token,
+        csrf,
+        client,
+        agent,
+        chat,
+        op,
+    }
+}
 
 /// What the API tells the web process at start: where to listen, and the
 /// certificate for HTTPS.
 fn web_config() -> Result<(Vec<SocketAddr>, Option<crate::tls::Material>)> {
-    let cfg = api::call(&Request {
-        token: None,
-        csrf: None,
-        client: None,
-        op: Op::WebConfig,
-    })?;
+    let cfg = api::call(&request(None, None, None, Op::WebConfig))?;
     if !cfg.ok {
         anyhow::bail!("{}", cfg.error.unwrap_or_default());
     }
@@ -118,6 +135,10 @@ struct Ctx {
     path: String,
     /// The account can step up with a passkey (on HTTPS).
     passkey: bool,
+    /// This login's id (see Op::SessionList).
+    session: String,
+    /// This browser may type into chats.
+    chat: bool,
 }
 
 enum Reply {
@@ -140,6 +161,8 @@ fn handle(req: http::Request) -> http::Response {
     let (path, query) = req.target.split_once('?').unwrap_or((&req.target, ""));
     let query = parse_form(query);
     let token = cookie(&req, COOKIE);
+    let agent = req.header("User-Agent").next().map(String::from);
+    META.with(|m| *m.borrow_mut() = (agent, cookie(&req, CHAT_COOKIE)));
     let form = if method == "POST" {
         parse_form(&req.body)
     } else {
@@ -181,11 +204,16 @@ fn handle(req: http::Request) -> http::Response {
         }
         Reply::Redirect(to, set_cookie) => {
             add("Location", &to);
-            if let Some(c) = set_cookie {
+            // Several cookies are separated by a newline.
+            for c in set_cookie.iter().flat_map(|c| c.lines()) {
                 // Over HTTPS the browser must never send it over plain HTTP.
                 add(
                     "Set-Cookie",
-                    &if secure { format!("{c}; Secure") } else { c },
+                    &if secure {
+                        format!("{c}; Secure")
+                    } else {
+                        c.to_string()
+                    },
                 );
             }
             (303, Vec::new())
@@ -236,12 +264,12 @@ fn url_decode(s: &str) -> Option<String> {
 }
 
 fn call(c: &Ctx, op: Op) -> Result<Response> {
-    api::call(&Request {
-        token: c.token.clone(),
-        csrf: Some(c.csrf.clone()),
-        client: c.client,
+    api::call(&request(
+        c.token.clone(),
+        Some(c.csrf.clone()),
+        c.client,
         op,
-    })
+    ))
 }
 
 /// Calls the API and decodes the data, or returns its error message.
@@ -308,6 +336,8 @@ fn route(
         user: String::new(),
         path: path.to_string(),
         passkey: false,
+        session: String::new(),
+        chat: false,
     };
     if c.token.is_none() {
         return Reply::Redirect("/login".into(), None);
@@ -317,6 +347,8 @@ fn route(
             c.user = v["user"].as_str().unwrap_or("").to_string();
             c.csrf = v["csrf"].as_str().unwrap_or("").to_string();
             c.passkey = v["passkey"].as_bool().unwrap_or(false);
+            c.session = v["session"].as_str().unwrap_or("").to_string();
+            c.chat = v["chat"].as_bool().unwrap_or(false);
         }
         Err(_) => return Reply::Redirect("/login".into(), Some(clear_cookie())),
     }
@@ -711,6 +743,8 @@ fn login_page(err: Option<&str>) -> Reply {
         user: String::new(),
         path: "/login".into(),
         passkey: false,
+        session: String::new(),
+        chat: false,
     };
     let passkey = if https() {
         "<div class=\"passkey-login\" hidden><button type=\"button\" class=\"primary\" data-passkey-login>Log in with a passkey</button>\
@@ -737,14 +771,14 @@ fn login_page(err: Option<&str>) -> Reply {
 
 /// A WebAuthn challenge for the page's script, as JSON.
 fn passkey_begin(c: Option<&Ctx>, client: Option<IpAddr>, purpose: &str) -> Reply {
-    let r = api::call(&Request {
-        token: c.and_then(|c| c.token.clone()),
-        csrf: c.map(|c| c.csrf.clone()),
+    let r = api::call(&request(
+        c.and_then(|c| c.token.clone()),
+        c.map(|c| c.csrf.clone()),
         client,
-        op: Op::PasskeyBegin {
+        Op::PasskeyBegin {
             purpose: purpose.into(),
         },
-    });
+    ));
     match r {
         Ok(r) if r.ok => Reply::Json(200, r.data.to_string()),
         Ok(r) => Reply::Json(
@@ -763,35 +797,36 @@ fn passkey_login_post(form: &HashMap<String, String>, client: Option<IpAddr>) ->
         Ok(a) => a,
         Err(_) => return Reply::Redirect("/login?err=no%20passkey%20answer".into(), None),
     };
-    login_reply(api::call(&Request {
-        token: None,
-        csrf: None,
+    login_reply(api::call(&request(
+        None,
+        None,
         client,
-        op: Op::PasskeyLogin { answer },
-    }))
+        Op::PasskeyLogin { answer },
+    )))
 }
 
 fn login_post(form: &HashMap<String, String>, client: Option<IpAddr>) -> Reply {
-    login_reply(api::call(&Request {
-        token: None,
-        csrf: None,
+    login_reply(api::call(&request(
+        None,
+        None,
         client,
-        op: Op::Login {
+        Op::Login {
             user: f(form, "user").into(),
             password: f(form, "password").into(),
             code: f(form, "code").into(),
         },
-    }))
+    )))
 }
 
 fn login_reply(r: Result<Response>) -> Reply {
     match r {
         Ok(r) if r.ok => {
             let token = r.data["token"].as_str().unwrap_or("").to_string();
+            let age = r.data["max_age"].as_u64().unwrap_or(24 * 3600);
             Reply::Redirect(
                 "/".into(),
                 Some(format!(
-                    "{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/"
+                    "{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={age}"
                 )),
             )
         }
@@ -1339,31 +1374,11 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
                 csrf(c)
             )
         };
-        let rename = rename_dialog(
-            c,
-            &format!("/space/{n}/chat-rename"),
-            "chat",
-            "title",
-            &ch.title,
-            &hidden,
-            &format!(
-                "<p class=\"hint\">This name is the hub's own, for this list only. Claude Code and the Claude app keep \
-                 theirs{}.</p>",
-                match &ch.claude_title {
-                    Some(t) => format!(" (now <b>{}</b>)", esc(t)),
-                    None => String::new(),
-                }
-            ),
-        );
         rows.push_str(&format!(
             "<li class=\"chat\"><div class=\"chat-main\"><span class=\"chat-title\">{}</span>\
-             <span class=\"item-meta\">{}{} · {} KB · <code>{}</code></span></div>\
-             <div class=\"chat-actions\">{rename}{side}</div></li>",
+             <span class=\"item-meta\">{} · {} KB · <code>{}</code></span></div>\
+             <div class=\"chat-actions\">{side}</div></li>",
             esc(&ch.title),
-            match &ch.claude_title {
-                Some(t) => format!("in Claude: {} · ", esc(t)),
-                None => String::new(),
-            },
             ago(now.saturating_sub(ch.modified)),
             ch.kb,
             esc(&ch.id[..8.min(ch.id.len())]),
@@ -1394,17 +1409,16 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
         &format!(
             "<p class=\"hint\">{}</p><label>Name <input name=\"title\" maxlength=\"100\" autocomplete=\"off\" \
              placeholder=\"optional: Claude names it otherwise\" autofocus></label>\
-             <p class=\"hint\">Claude Code and the Claude app call it by the start of its id and this name \
-             (<code>9cf982e0 name</code>), so it is easy to find there. Renaming it later changes only the hub's \
-             name.</p>",
+             <p class=\"hint\">It is called by the start of its id and this name (<code>9cf982e0 name</code>), \
+             here and in the Claude app. To rename it later, type <code>/rename NAME</code> in the chat.</p>",
             esc(&confirm)
         ),
         "Start chat",
     );
     format!(
         "<section class=\"card\" id=\"chats\"><div class=\"page-head\"><h2>Chats</h2>{new_chat}</div>\
-         <p class=\"hint\">{how} Newest first. Names given here are the hub's own: the Claude app keeps its \
-         name for a chat (the id's start and the name it was started with). Deleting removes the hub's copy.</p>{}</section>",
+         <p class=\"hint\">{how} Newest first, under Claude's name for each (rename one by typing \
+         <code>/rename NAME</code> in it). Deleting removes the hub's copy; the Claude app may still list it.</p>{}</section>",
         if rows.is_empty() {
             "<p>No chats yet.</p>".to_string()
         } else {
@@ -1682,19 +1696,6 @@ fn space_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>)
                     "Remote Control name changed".into()
                 }
             }),
-        ),
-        "chat-rename" => back(
-            &format!("{here}#chats"),
-            get::<String>(
-                c,
-                Op::ChatRename {
-                    name: name.into(),
-                    id: f(form, "id").into(),
-                    title: f(form, "title").into(),
-                    code: f(form, "code").into(),
-                },
-            )
-            .map(|_| "chat renamed".into()),
         ),
         "chat-new" | "chat-open" => back(
             &format!("{here}#chats"),
@@ -2599,7 +2600,7 @@ fn account_page(c: &Ctx, flash: &Flash) -> Reply {
          <form method=\"post\" action=\"/account/totp-begin\" class=\"stack\">{}\
          <label>Code from your current authenticator <input name=\"code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" \
          pattern=\"[0-9]{{6}}\" maxlength=\"6\" required class=\"code\"></label>\
-         <div><button>Set up a new authenticator</button></div></form></section></section>{}\
+         <div><button>Set up a new authenticator</button></div></form></section></section>{}{}\
          <p class=\"hint\">Accounts are added and removed on the hub itself: <code>sudo thorn web user add &lt;name&gt;</code>, \
          <code>sudo thorn web user rm &lt;name&gt;</code>.</p>",
         esc(&c.user),
@@ -2608,12 +2609,120 @@ fn account_page(c: &Ctx, flash: &Flash) -> Reply {
         code_field(),
         csrf(c),
         passkeys_card(c, &acct),
+        sessions_card(c),
     );
     Reply::Html(200, page(c, "Account", &b, flash))
 }
 
+/// A time, in UTC; the page's script shows it in the browser's own time.
+fn when(t: u64) -> String {
+    let utc = ops::rfc3339(t);
+    format!(
+        "<time datetime=\"{utc}\" data-local>{}</time>",
+        utc.replace('T', " ")
+    )
+}
+
+/// The account's logins and chat unlocks, each ended on its own.
+fn sessions_card(c: &Ctx) -> String {
+    let list = match get::<Vec<api::SessionView>>(c, Op::SessionList) {
+        Ok(v) => v,
+        Err(e) => {
+            return format!(
+                "<section class=\"card\" id=\"sessions\"><h2>Logins</h2><p class=\"t-bad\">{}</p></section>",
+                esc(&e)
+            )
+        }
+    };
+    let now = crate::state::now();
+    let mut rows = String::new();
+    for x in &list {
+        let what = if x.chat {
+            "may type into chats".to_string()
+        } else {
+            format!(
+                "logged in with a {}",
+                if x.how == "passkey" {
+                    "passkey"
+                } else {
+                    "password and code"
+                }
+            )
+        };
+        let ip = |a: &Option<IpAddr>| a.map(|a| a.to_string()).unwrap_or_else(|| "?".into());
+        let from = if x.ip != x.login_ip {
+            format!("{} (logged in from {})", ip(&x.ip), ip(&x.login_ip))
+        } else {
+            ip(&x.ip)
+        };
+        let end = format!(
+            "<form method=\"post\" action=\"/account/session-end\" class=\"inline\" data-confirm=\"{}\">{}\
+             <input type=\"hidden\" name=\"id\" value=\"{}\"><button class=\"link danger-text\">{}</button></form>",
+            if x.current && !x.chat {
+                "Log out this browser?"
+            } else if x.chat {
+                "This browser will need the password and a code again to type into chats. End it?"
+            } else {
+                "End this login? That browser goes back to the login page."
+            },
+            csrf(c),
+            esc(&x.id),
+            if x.current && !x.chat { "Log out" } else { "End" }
+        );
+        rows.push_str(&format!(
+            "<li class=\"chat\"><div class=\"chat-main\"><span class=\"chat-title\">{} on {} <span class=\"hint\">({})</span>{}</span>\
+             <span class=\"item-meta\">{what} · from {} · since {} · last used {} · ends {}</span>\
+             <span class=\"item-meta\" title=\"{}\"><code>{}</code></span></div>\
+             <div class=\"chat-actions\">{end}</div></li>",
+            esc(&x.browser),
+            esc(&x.os),
+            esc(&x.device),
+            if x.current { " <span class=\"badge\">this browser</span>" } else { "" },
+            esc(&from),
+            when(x.created),
+            if now.saturating_sub(x.last_seen) < 60 { "just now".to_string() } else { ago(now.saturating_sub(x.last_seen)) },
+            when(x.expires),
+            esc(&x.agent),
+            esc(&x.id),
+        ));
+    }
+    let others = list.iter().any(|x| !x.current);
+    format!(
+        "<section class=\"card\" id=\"sessions\"><div class=\"page-head\"><h2>Logins</h2>{}</div>\
+         <p class=\"hint\">Where this account is logged in, and the browsers that may type into chats. A login ends \
+         after 30 idle minutes, or <code>web.session_hours</code> after it began (Settings).</p>{}</section>",
+        if others {
+            format!(
+                "<form method=\"post\" action=\"/account/session-end-others\" class=\"inline\" \
+                 data-confirm=\"End every login and chat unlock but this browser's?\">{}<button>End all others</button></form>",
+                csrf(c)
+            )
+        } else {
+            String::new()
+        },
+        if rows.is_empty() {
+            "<p>None.</p>".to_string()
+        } else {
+            format!("<ul class=\"chats\">{rows}</ul>")
+        }
+    )
+}
+
 fn account_post(c: &Ctx, action: &str, form: &HashMap<String, String>) -> Reply {
     match action {
+        "session-end" => {
+            let id = f(form, "id");
+            let r = get::<serde_json::Value>(c, Op::SessionEnd { id: id.into() });
+            if r.is_ok() && id == c.session {
+                return Reply::Redirect("/login".into(), Some(clear_cookie()));
+            }
+            back("/account#sessions", r.map(|_| "ended".into()))
+        }
+        "session-end-others" => back(
+            "/account#sessions",
+            get::<serde_json::Value>(c, Op::SessionEndOthers)
+                .map(|_| "every other login ended".into()),
+        ),
         "passkey-add" => back(
             "/account#passkeys",
             match serde_json::from_str(f(form, "answer")) {

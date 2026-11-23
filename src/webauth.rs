@@ -255,6 +255,92 @@ pub fn same(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
+/// A browser's User-Agent, told plainly: browser, system, kind of device.
+/// A guess (a browser may say anything), good enough to tell logins apart.
+pub fn describe_agent(ua: &str) -> (String, String, String) {
+    let version = |key: &str| -> Option<String> {
+        let at = ua.find(key)? + key.len();
+        let v: String = ua[at..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        (!v.is_empty()).then_some(v)
+    };
+    let named = |name: &str, key: &str| match version(key) {
+        Some(v) => format!("{name} {v}"),
+        None => name.to_string(),
+    };
+    let browser = if ua.contains("Edg/") || ua.contains("EdgA/") || ua.contains("EdgiOS/") {
+        named(
+            "Edge",
+            if ua.contains("EdgiOS/") {
+                "EdgiOS/"
+            } else if ua.contains("EdgA/") {
+                "EdgA/"
+            } else {
+                "Edg/"
+            },
+        )
+    } else if ua.contains("OPR/") {
+        named("Opera", "OPR/")
+    } else if ua.contains("SamsungBrowser/") {
+        named("Samsung Internet", "SamsungBrowser/")
+    } else if ua.contains("Firefox/") || ua.contains("FxiOS/") {
+        named(
+            "Firefox",
+            if ua.contains("FxiOS/") {
+                "FxiOS/"
+            } else {
+                "Firefox/"
+            },
+        )
+    } else if ua.contains("CriOS/") {
+        named("Chrome", "CriOS/")
+    } else if ua.contains("Chrome/") {
+        named("Chrome", "Chrome/")
+    } else if ua.contains("Safari/") {
+        named("Safari", "Version/")
+    } else if ua.starts_with("curl/") {
+        named("curl", "curl/")
+    } else if ua.is_empty() {
+        "unknown".into()
+    } else {
+        ua.split(['/', ' '])
+            .next()
+            .unwrap_or("unknown")
+            .chars()
+            .take(30)
+            .collect()
+    };
+    let os = if ua.contains("iPhone") {
+        "iOS"
+    } else if ua.contains("iPad") {
+        "iPadOS"
+    } else if ua.contains("Android") {
+        "Android"
+    } else if ua.contains("CrOS") {
+        "ChromeOS"
+    } else if ua.contains("Mac OS X") || ua.contains("Macintosh") {
+        "macOS"
+    } else if ua.contains("Windows") {
+        "Windows"
+    } else if ua.contains("Linux") {
+        "Linux"
+    } else {
+        "unknown"
+    };
+    let device = if ua.contains("iPad") || (ua.contains("Android") && !ua.contains("Mobile")) {
+        "tablet"
+    } else if ua.contains("Mobi") || ua.contains("iPhone") {
+        "phone"
+    } else if os == "unknown" {
+        "unknown"
+    } else {
+        "computer"
+    };
+    (browser, os.into(), device.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +407,35 @@ mod tests {
         assert!(same("abc", "abc"));
         assert!(!same("abc", "abd"));
         assert!(!same("abc", "abcd"));
+    }
+
+    #[test]
+    fn agents_told_plainly() {
+        let d = |ua: &str| {
+            let (b, o, k) = describe_agent(ua);
+            format!("{b} / {o} / {k}")
+        };
+        assert_eq!(
+            d("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
+            "Chrome 131 / macOS / computer"
+        );
+        assert_eq!(
+            d("Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1"),
+            "Safari 18 / iOS / phone"
+        );
+        assert_eq!(
+            d("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"),
+            "Edge 131 / Windows / computer"
+        );
+        assert_eq!(
+            d("Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0"),
+            "Firefox 133 / Linux / computer"
+        );
+        assert_eq!(
+            d("Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"),
+            "Chrome 131 / Android / phone"
+        );
+        assert_eq!(d("curl/8.5.0"), "curl 8 / unknown / unknown");
+        assert_eq!(d(""), "unknown / unknown / unknown");
     }
 }

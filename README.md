@@ -174,7 +174,7 @@ The web UI is the everyday way to run blackthorn, on a laptop or a phone:
   the machines the spaces work on, as boxes and wires like a node editor.
   Arrows point the way commands go.
   Drag boxes around, pan and zoom; the layout is remembered in your browser.
-- **Spaces**: each one's chats (new, continue, stop, rename, delete; with
+- **Spaces**: each one's chats (new, continue, stop, delete; with
   Remote Control a new chat runs next to the others and shows in the Claude
   app),
   a live view of its terminal, Claude sign-in, bridges, Remote Control on
@@ -277,7 +277,7 @@ restores the old settings at any time.
 | `thorn attach SPACE` | Open the space's terminal |
 | `thorn screen SPACE` / `thorn send SPACE TEXT` | Read or type into the terminal without attaching |
 | `thorn rename OLD NEW [--rc-name N]` | Rename; same chats |
-| `thorn chat ls SPACE` / `chat rename SPACE ID NAME` / `chat stop SPACE ID` / `chat rm SPACE ID` | A space's Claude chats |
+| `thorn chat ls SPACE` / `chat new SPACE [--name N]` / `chat stop SPACE ID` / `chat rm SPACE ID` | A space's Claude chats |
 | `thorn chat new SPACE [--name N]` / `chat open SPACE ID` | Start a new chat, or go back to one |
 | `thorn remote SPACE on\|off` | Remote Control on, or off: one local conversation, only from the hub |
 | `thorn rm SPACE [--purge]` | Delete; files are archived unless `--purge` |
@@ -385,11 +385,9 @@ name (*New chat*, or `thorn chat new SPACE --name NAME`) is called
 it is easy to match with the hub's list. Otherwise it shows under Claude's
 title for it, else `<Remote Control name>-<random>` until it has one.
 
-Renaming a chat on the hub (*Rename*, `thorn chat rename`) changes only the
-hub's name for it, running or not; the hub's list shows Claude's name next
-to it. The hub does not rename chats in Claude Code: a running Claude Code
-keeps its name in memory and writes it back when it stops. To rename it in
-the app too, type `/rename NAME` in the chat.
+The hub lists chats under Claude's own names and does not rename them: a
+running Claude Code keeps its name in memory and writes it back when it
+stops. Rename a chat by typing `/rename NAME` in it.
 
 Changing a Remote Control name moves the folder, so the app gets a new
 environment. The old one stays in its list, offline, until Anthropic clears

@@ -604,3 +604,12 @@
     });
   }
 })();
+
+// Times in the browser's own time zone.
+document.querySelectorAll("time[data-local]").forEach(function (t) {
+  var d = new Date(t.getAttribute("datetime"));
+  if (!isNaN(d)) {
+    t.title = t.textContent + " UTC";
+    t.textContent = d.toLocaleString();
+  }
+});

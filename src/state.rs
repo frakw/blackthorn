@@ -170,10 +170,6 @@ pub struct Space {
     /// spaces without Remote Control).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// The hub's own names for chats (by full id), for the hub's lists
-    /// only: Claude Code and the Claude app never see them.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub chat_names: BTreeMap<String, String>,
 }
 
 fn is_admin(a: &Access) -> bool {
@@ -499,7 +495,6 @@ mod tests {
             access: Access::Admin,
             until: None,
             title: None,
-            chat_names: BTreeMap::new(),
         }
     }
 

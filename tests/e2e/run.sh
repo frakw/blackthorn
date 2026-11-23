@@ -253,22 +253,16 @@ hub runuser -u "bt-$k1" -- sh -c "mkdir -p '$dir' && echo '{\"type\":\"user\",\"
 hub runuser -u "bt-$k1" -- ln -s /etc/shadow "$dir/5b2e1d3f-1111-4222-8333-444455556666.jsonl"
 thorn chat ls t1-claude | grep -q "check the disks" && ok "thorn chat ls names a chat by its first message" || fail "chat ls"
 thorn chat ls t1-claude | grep -q "5b2e1d3f" && fail "chat ls followed a planted link" || ok "chat ls skips links the space user planted"
-thorn chat rename t1-claude 5b2e1d3f "x" 2>&1 | grep -q "no chat" && ok "and will not write through one" || fail "rename through a link"
+thorn chat rm t1-claude 5b2e1d3f 2>&1 | grep -q "no chat" && ok "and will not delete through one" || fail "rm through a link"
 thorn chat rm t1-claude 4a1f 2>&1 | grep -q "running" && ok "a chat in use is not deleted" || fail "chat rm while in use"
-thorn chat rename t1-claude 4a1f "x" | grep -q "on the hub" && ok "but renamed on the hub while in use" || fail "rename while in use"
-hub grep -q customTitle "$dir/$cid.jsonl" && fail "the hub wrote a name into the transcript" || ok "without touching the transcript"
 hub touch -h -d '2 hours ago' "$dir/$cid.jsonl"
 # Claude Code's list of its live processes names the chat: running, however old.
 pid=$(hub pgrep -o -u "bt-$k1")
 hub runuser -u "bt-$k1" -- sh -c "mkdir -p /var/lib/blackthorn/spaces/$k1/.claude/sessions && echo '{\"pid\":$pid,\"sessionId\":\"$cid\",\"kind\":\"bg\"}' > /var/lib/blackthorn/spaces/$k1/.claude/sessions/$pid.json"
-thorn chat ls t1-claude | grep -q "x  \[in Claude: check the disks\]  (running)" && ok "a chat Claude Code lists as live is running, under both names" || fail "live chat in ls: $(thorn chat ls t1-claude)"
+thorn chat ls t1-claude | grep -q "check the disks  (running)" && ok "a chat Claude Code lists as live is running" || fail "live chat in ls: $(thorn chat ls t1-claude)"
 hub rm -f "/var/lib/blackthorn/spaces/$k1/.claude/sessions/$pid.json"
-r=$(web_post /space/t1-claude/chat-rename --data-urlencode "csrf=$C" --data-urlencode "id=$cid" --data-urlencode "title=disk check" --data-urlencode "code=000000")
-case "$r" in *"fresh%20code"*) ok "renaming needs a fresh code";; *) fail "chat rename without a code: $r";; esac
-r=$(web_post /space/t1-claude/chat-rename --data-urlencode "csrf=$C" --data-urlencode "id=$cid" --data-urlencode "title=disk check" --data-urlencode "code=$(fresh_code $WEB_SECRET)")
-case "$r" in *"ok=chat%20renamed"*) ok "chat renamed from the web";; *) fail "chat rename: $r";; esac
-thorn chat ls t1-claude | grep -q "disk check  \[in Claude: check the disks\]" && ok "the hub's name, and Claude's" || fail "names in ls: $(thorn chat ls t1-claude)"
-web_get /space/t1-claude | grep -q "disk check" && ok "the space page lists the chat by its new name" || fail "chats on the space page"
+web_get /space/t1-claude | grep -q "check the disks" && ok "the space page lists the chat" || fail "chats on the space page"
+web_get /space/t1-claude | grep -q "chat-rename" && fail "the space page still offers to rename chats" || ok "and offers no hub-only rename"
 hub touch -h -d '2 hours ago' "$dir/$cid.jsonl"
 r=$(web_post /space/t1-claude/chat-rm --data-urlencode "csrf=$C" --data-urlencode "id=$cid")
 case "$r" in *"ok=chat%20deleted"*) ok "an old chat deleted from the web";; *) fail "chat rm: $r";; esac
@@ -292,13 +286,10 @@ hub grep -Eq -- "^--session-id [0-9a-f-]+ --name [0-9a-f]{8} web check --remote-
 wid=$(hub grep -- " web check --remote-control" "/var/lib/blackthorn/spaces/$k1/fake-claude.args" | tail -1 | cut -d' ' -f2)
 hub grep -q -- "--name ${wid%%-*} web check" "/var/lib/blackthorn/spaces/$k1/fake-claude.args" && ok "the start of its own id" || fail "id in the name"
 hub runuser -u "bt-$k1" -- sh -c "echo '{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"web\"}}' > '$dir/$wid.jsonl'"
-thorn chat ls t1-claude | grep -q "${wid%%-*}.*web check" && ok "the hub lists it by the name given" || fail "hub name of a new chat: $(thorn chat ls t1-claude)"
 thorn chat ls t1-claude | grep -q "running, started from the hub" && ok "a chat started from the hub is listed as running" || fail "window chat in ls: $(thorn chat ls t1-claude)"
 web_get /space/t1-claude | grep -q "/space/t1-claude/chat-stop" && ok "the space page offers to stop it" || fail "no Stop on the space page"
-thorn chat rename t1-claude "${wid%%-*}" "y" | grep -q "on the hub" && ok "renamed on the hub while it runs" || fail "window chat rename while running"
 thorn chat stop t1-claude "${wid%%-*}" | grep -q "stopped chat" && ok "thorn chat stop" || fail "chat stop"
 hub tmux -S "/run/blackthorn/$k1/tmux.sock" list-windows -F '#{window_name}' | grep -q "^chat-${wid%%-*}" && fail "its window is still there" || ok "its window is closed"
-thorn chat rename t1-claude "${wid%%-*}" "web check 2" >/dev/null && ok "stopped, it can be renamed" || fail "rename after stop"
 thorn chat open t1-claude "${wid%%-*}" >/dev/null && ok "and continued at once" || fail "continue after stop"
 sleep 2
 thorn chat rm t1-claude "${wid%%-*}" | grep -q "deleted chat" && ok "a running chat from the hub is stopped and deleted" || fail "rm of a window chat"
@@ -328,6 +319,27 @@ admin rm -f /tmp/jar
 r=$(web_post /login --data-urlencode "user=frakw" --data-urlencode "password=$PASSWORD" --data-urlencode "code=$(fresh_code $WEB_SECRET)")
 [ "$r" = "http://$HUB:7180/" ] && ok "log in again under the old name" || fail "login after rename: $r"
 C=$(csrf)
+
+say "logins: listed, kept across restarts, ended from the account page"
+exp=$(admin awk '$6 == "bt_session" { print $5 }' /tmp/jar)
+[ "${exp:-0}" -gt $(( $(date +%s) + 20 * 3600 )) ] && ok "the login cookie lasts a day" || fail "cookie expiry: $exp"
+tok=$(admin awk '$6 == "bt_session" { print $7 }' /tmp/jar)
+hub stat -c %a /var/lib/blackthorn/web-sessions.json | grep -q 600 && ok "logins are kept root-only" || fail "web-sessions.json mode"
+hub grep -q "$tok" /var/lib/blackthorn/web-sessions.json && fail "the file holds a token" || ok "without their tokens"
+web_get /account | grep -q "this browser" && ok "the account page lists this login" || fail "logins card: $(web_get /account | grep -o 'id="sessions".*' | head -c 600)"
+admin rm -f /tmp/jar2
+admin curl -s -o /dev/null -c /tmp/jar2 -A "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1" --data-urlencode "user=frakw" --data-urlencode "password=$PASSWORD" --data-urlencode "code=$(fresh_code $WEB_SECRET)" "http://$HUB:7180/login"
+web_get /account | grep -q "Safari 18 on iOS" && ok "and another, by its browser and system" || fail "phone login not listed"
+hub systemctl restart blackthorn-api
+sleep 1
+web_get /account | grep -q "Account frakw" && ok "logins survive a restart of the API" || fail "logged out by a restart"
+r=$(web_post /account/session-end-others --data-urlencode "csrf=$C")
+case "$r" in *"ok=every%20other"*) ok "every other login ended";; *) fail "end others: $r";; esac
+[ "$(admin curl -s -o /dev/null -w '%{redirect_url}' -b /tmp/jar2 "http://$HUB:7180/")" = "http://$HUB:7180/login" ] && ok "that browser is logged out" || fail "other login still works"
+web_get /account | grep -q "Account frakw" && ok "this one is not" || fail "ended our own login"
+thorn config set web.session_hours 0 2>&1 | grep -q "1 to 720" && ok "a login lifetime out of range is refused" || fail "session_hours 0"
+thorn config set web.session_hours 48 >/dev/null && thorn config show | grep -q "web.session_hours.*48" && ok "the login lifetime is a setting" || fail "session_hours: $(thorn config show | grep session)"
+thorn config set web.session_hours 24 >/dev/null
 
 say "notifications to an ntfy server"
 docker exec -d "$P-admin" sh -c "while true; do printf 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' | nc -N -l 8099 >> /tmp/ntfy.req; done"
@@ -494,7 +506,7 @@ thorn log t1-ro | grep -q "df -h" && ok "and what it held stays in the log" || f
 say "a new chat with a name"
 thorn chat new t2-claude --name "disk check" >/dev/null
 sleep 3
-hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args" | grep -q -- "--name disk check" && ok "the new chat starts with its name" || fail "chat name: $(hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args")"
+hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args" | grep -Eq -- "--name [0-9a-f]{8} disk check" && ok "the new chat starts with the id's start and its name" || fail "chat name: $(hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args")"
 
 echo "   waiting for t1-main's admin time to run out (tick runs every minute)..."
 for _ in $(seq 75); do [ "$(hub systemctl is-active "blackthorn-space@$k1.service")" != active ] && break; sleep 2; done

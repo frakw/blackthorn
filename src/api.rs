@@ -24,7 +24,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const IDLE: u64 = 30 * 60;
-const ABSOLUTE: u64 = 12 * 3600;
 const MAX_FAILURES: u32 = 5;
 const LOCKOUT: u64 = 15 * 60;
 const MAX_REQUEST: u64 = 256 * 1024;
@@ -37,6 +36,12 @@ pub struct Request {
     pub csrf: Option<String>,
     #[serde(default)]
     pub client: Option<IpAddr>,
+    /// The browser's User-Agent, to tell logins apart.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// The token that unlocks typing into chats on this browser.
+    #[serde(default)]
+    pub chat: Option<String>,
     pub op: Op,
 }
 
@@ -54,6 +59,20 @@ pub enum Op {
     Logout,
     Whoami,
     Overview,
+    /// The account's logins, and the browsers that may type into chats.
+    SessionList,
+    /// Ends one of them (by its id from SessionList).
+    SessionEnd {
+        id: String,
+    },
+    /// Ends every login and chat unlock of the account but this browser's.
+    SessionEndOthers,
+    /// Lets this browser type into chats, for the login lifetime: asks the
+    /// password and a code again.
+    ChatUnlock {
+        password: String,
+        code: String,
+    },
     SpaceNew {
         space: NewSpace,
     },
@@ -173,12 +192,6 @@ pub enum Op {
     ChatList {
         name: String,
     },
-    ChatRename {
-        name: String,
-        id: String,
-        title: String,
-        code: String,
-    },
     /// A new conversation (id None), or an earlier one, becomes the one a
     /// one-conversation space runs.
     ChatOpen {
@@ -297,6 +310,7 @@ impl Op {
                 | Op::Login { .. }
                 | Op::Whoami
                 | Op::Overview
+                | Op::SessionList
                 | Op::SpaceScreen { .. }
                 | Op::HostPubkey { .. }
                 | Op::ConfigShow
@@ -324,7 +338,6 @@ impl Op {
             | Op::AccountPassword { code, .. }
             | Op::AccountTotpBegin { code }
             | Op::SpaceRename { code, .. }
-            | Op::ChatRename { code, .. }
             | Op::HostRename { code, .. }
             | Op::AccountRename { code, .. }
             | Op::NotifySet { code, .. }
@@ -350,16 +363,63 @@ pub struct Response {
     pub data: serde_json::Value,
 }
 
+/// A login, or a chat unlock. Kept by the hash of its token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Session {
+    /// Shown, and used to end it; not the token.
+    id: String,
     user: String,
+    #[serde(default)]
     csrf: String,
     created: u64,
     last_seen: u64,
+    /// "password", "passkey"; "chat" for a chat unlock.
+    #[serde(default)]
+    how: String,
+    #[serde(default)]
+    agent: String,
+    #[serde(default)]
+    ip: Option<IpAddr>,
+    #[serde(default)]
+    login_ip: Option<IpAddr>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Stored {
+    #[serde(default)]
+    sessions: HashMap<String, Session>,
+    #[serde(default)]
+    unlocks: HashMap<String, Session>,
+}
+
+/// What the account's logins page shows of one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionView {
+    pub id: String,
+    /// A login, or a chat unlock.
+    pub chat: bool,
+    pub how: String,
+    pub browser: String,
+    pub os: String,
+    pub device: String,
+    pub agent: String,
+    pub ip: Option<IpAddr>,
+    pub login_ip: Option<IpAddr>,
+    pub created: u64,
+    pub last_seen: u64,
+    pub expires: u64,
+    /// This browser's.
+    pub current: bool,
 }
 
 #[derive(Default)]
 struct Server {
     sessions: HashMap<String, Session>,
+    unlocks: HashMap<String, Session>,
+    /// When the sessions were last written to disk.
+    saved: u64,
+    /// web.session_hours in seconds, and when it was read.
+    lifetime: Option<(u64, u64)>,
     /// Failed logins per account and per client address.
     failures: HashMap<String, (u32, u64)>,
     /// `claude --version` is slow; cache it.
@@ -374,6 +434,82 @@ struct Server {
 }
 
 const CHALLENGE_TTL: u64 = 300;
+
+/// A token as it is kept: its SHA-256, so the file does not hold them.
+fn token_key(token: &str) -> String {
+    webauth::hex(ring::digest::digest(&ring::digest::SHA256, token.as_bytes()).as_ref())
+}
+
+/// The longest a browser's User-Agent is kept.
+fn agent_of(a: Option<&str>) -> String {
+    a.unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(300)
+        .collect()
+}
+
+impl Server {
+    fn load() -> Server {
+        let stored: Stored = std::fs::read_to_string(paths::WEB_SESSIONS_FILE)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        Server {
+            sessions: stored.sessions,
+            unlocks: stored.unlocks,
+            ..Server::default()
+        }
+    }
+
+    /// Writes the sessions now, or (`force` false) if a minute has passed.
+    fn save(&mut self, now: u64, force: bool) {
+        if !force && now < self.saved + 60 {
+            return;
+        }
+        self.saved = now;
+        let stored = Stored {
+            sessions: self.sessions.clone(),
+            unlocks: self.unlocks.clone(),
+        };
+        if let Ok(text) = serde_json::to_string(&stored) {
+            if let Err(e) = sys::write_file(Path::new(paths::WEB_SESSIONS_FILE), &text, 0o600, None)
+            {
+                eprintln!("api: saving the web sessions: {e:#}");
+            }
+        }
+    }
+
+    /// How long a login (and a chat unlock) lasts.
+    fn lifetime(&mut self, now: u64) -> u64 {
+        match self.lifetime {
+            Some((at, secs)) if now < at + 60 => secs,
+            _ => {
+                let hours = crate::config::Config::load(Path::new(paths::CONFIG_FILE))
+                    .map(|c| c.web.session_hours)
+                    .unwrap_or(24)
+                    .clamp(1, 720);
+                let secs = u64::from(hours) * 3600;
+                self.lifetime = Some((now, secs));
+                secs
+            }
+        }
+    }
+
+    /// Drops what has expired; writes the change.
+    fn expire(&mut self, now: u64) {
+        let life = self.lifetime(now);
+        let before = self.sessions.len() + self.unlocks.len();
+        self.sessions.retain(|_, x| {
+            now.saturating_sub(x.last_seen) < IDLE && now.saturating_sub(x.created) < life
+        });
+        self.unlocks
+            .retain(|_, x| now.saturating_sub(x.created) < life);
+        if self.sessions.len() + self.unlocks.len() != before {
+            self.save(now, true);
+        }
+    }
+}
 
 const UPDATE_EVERY: u64 = 6 * 3600;
 const PENDING_TOTP: u64 = 10 * 60;
@@ -395,7 +531,7 @@ pub fn serve() -> Result<()> {
     std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o660))?;
     eprintln!("blackthorn api: listening on {}", sock.display());
 
-    let server = Arc::new(Mutex::new(Server::default()));
+    let server = Arc::new(Mutex::new(Server::load()));
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         let server = server.clone();
@@ -515,26 +651,25 @@ fn dispatch(req: Request, server: &Mutex<Server>) -> Out {
             code,
         } => {
             return (
-                login(server, user, password, code, req.client, now),
+                login(server, user, password, code, &req, now),
                 Some(user.clone()),
             )
         }
         Op::PasskeyBegin { purpose } if purpose == "login" => {
             return (passkey_begin(server, "login", None, now), None);
         }
-        Op::PasskeyLogin { answer } => return passkey_login(server, answer, req.client, now),
+        Op::PasskeyLogin { answer } => return passkey_login(server, answer, &req, now),
         _ => {}
     }
 
     // Everything else needs a live session.
     let user = {
         let mut s = server.lock().expect("lock");
-        s.sessions
-            .retain(|_, x| now - x.last_seen < IDLE && now - x.created < ABSOLUTE);
+        s.expire(now);
         let Some(tok) = req.token.as_deref() else {
             return (Err(anyhow::anyhow!("not logged in")), None);
         };
-        let Some(sess) = s.sessions.get_mut(tok) else {
+        let Some(sess) = s.sessions.get_mut(&token_key(tok)) else {
             return (Err(anyhow::anyhow!("not logged in")), None);
         };
         if req.op.changes_state()
@@ -546,7 +681,12 @@ fn dispatch(req: Request, server: &Mutex<Server>) -> Out {
             return (Err(anyhow::anyhow!("stale form; reload the page")), None);
         }
         sess.last_seen = now;
-        sess.user.clone()
+        if req.client.is_some() {
+            sess.ip = req.client;
+        }
+        let user = sess.user.clone();
+        s.save(now, false);
+        user
     };
     if let Some(code) = req.op.step_up_code() {
         if let Err(e) = check_step_up(server, &user, code, now) {
@@ -562,9 +702,23 @@ fn login(
     user: &str,
     password: &str,
     code: &str,
-    client: Option<IpAddr>,
+    req: &Request,
     now: u64,
 ) -> Result<serde_json::Value> {
+    check_password_and_code(server, user, password, code, req.client, now)?;
+    let mut s = server.lock().expect("lock");
+    Ok(new_session(&mut s, user, now, req, "password"))
+}
+
+/// Password and a code, counting failures per account and address.
+fn check_password_and_code(
+    server: &Mutex<Server>,
+    user: &str,
+    password: &str,
+    code: &str,
+    client: Option<IpAddr>,
+    now: u64,
+) -> Result<()> {
     let keys = [format!("user:{user}"), format!("ip:{}", show(client))];
     {
         let s = server.lock().expect("lock");
@@ -596,22 +750,90 @@ fn login(
     for k in keys {
         s.failures.remove(&k);
     }
-    Ok(new_session(&mut s, user, now))
+    Ok(())
 }
 
-fn new_session(s: &mut Server, user: &str, now: u64) -> serde_json::Value {
+fn new_session(
+    s: &mut Server,
+    user: &str,
+    now: u64,
+    req: &Request,
+    how: &str,
+) -> serde_json::Value {
     let token = webauth::random_token();
     let csrf = webauth::random_token();
     s.sessions.insert(
-        token.clone(),
+        token_key(&token),
         Session {
+            id: webauth::hex(&webauth::random_bytes::<8>()),
             user: user.to_string(),
             csrf: csrf.clone(),
             created: now,
             last_seen: now,
+            how: how.into(),
+            agent: agent_of(req.agent.as_deref()),
+            ip: req.client,
+            login_ip: req.client,
         },
     );
-    serde_json::json!({ "token": token, "csrf": csrf, "user": user })
+    let life = s.lifetime(now);
+    s.save(now, true);
+    serde_json::json!({ "token": token, "csrf": csrf, "user": user, "max_age": life })
+}
+
+/// The account's logins and chat unlocks, newest use first.
+fn session_list(
+    s: &mut Server,
+    user: &str,
+    token: Option<&str>,
+    chat: Option<&str>,
+    now: u64,
+) -> Vec<SessionView> {
+    let life = s.lifetime(now);
+    let mine = token.map(token_key);
+    let chat = chat.map(token_key);
+    let view = |k: &String, x: &Session, is_chat: bool| {
+        let (browser, os, device) = webauth::describe_agent(&x.agent);
+        let idle_end = if is_chat {
+            u64::MAX
+        } else {
+            x.last_seen + IDLE
+        };
+        SessionView {
+            id: x.id.clone(),
+            chat: is_chat,
+            how: x.how.clone(),
+            browser,
+            os,
+            device,
+            agent: x.agent.clone(),
+            ip: x.ip,
+            login_ip: x.login_ip,
+            created: x.created,
+            last_seen: x.last_seen,
+            expires: (x.created + life).min(idle_end),
+            current: Some(k)
+                == if is_chat {
+                    chat.as_ref()
+                } else {
+                    mine.as_ref()
+                },
+        }
+    };
+    let mut v: Vec<SessionView> = s
+        .sessions
+        .iter()
+        .filter(|(_, x)| x.user == user)
+        .map(|(k, x)| view(k, x, false))
+        .chain(
+            s.unlocks
+                .iter()
+                .filter(|(_, x)| x.user == user)
+                .map(|(k, x)| view(k, x, true)),
+        )
+        .collect();
+    v.sort_by_key(|x| (std::cmp::Reverse(x.current), std::cmp::Reverse(x.last_seen)));
+    v
 }
 
 /// The hub's WebAuthn identity: its HTTPS name and the origins of its pages.
@@ -699,10 +921,10 @@ fn take_challenge(
 fn passkey_login(
     server: &Mutex<Server>,
     answer: &crate::webauthn::Answer,
-    client: Option<IpAddr>,
+    req: &Request,
     now: u64,
 ) -> Out {
-    let ip_key = format!("ip:{}", show(client));
+    let ip_key = format!("ip:{}", show(req.client));
     {
         let s = server.lock().expect("lock");
         if let Some((n, until)) = s.failures.get(&ip_key) {
@@ -743,7 +965,10 @@ fn passkey_login(
         Ok(user) => {
             s.failures.remove(&ip_key);
             eprintln!("api: {user} logged in with a passkey");
-            (Ok(new_session(&mut s, &user, now)), Some(user))
+            (
+                Ok(new_session(&mut s, &user, now, req, "passkey")),
+                Some(user),
+            )
         }
         Err(e) => {
             let f = s.failures.entry(ip_key).or_insert((0, 0));
@@ -838,22 +1063,81 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
     match req.op {
         Op::WebConfig | Op::Login { .. } => unreachable!("handled before"),
         Op::Logout => {
-            if let Some(t) = req.token {
-                server.lock().expect("lock").sessions.remove(&t);
+            if let Some(t) = &req.token {
+                let mut s = server.lock().expect("lock");
+                s.sessions.remove(&token_key(t));
+                s.save(now, true);
             }
             json(())
         }
+        Op::SessionList => {
+            let mut s = server.lock().expect("lock");
+            json(session_list(
+                &mut s,
+                user,
+                req.token.as_deref(),
+                req.chat.as_deref(),
+                now,
+            ))
+        }
+        Op::SessionEnd { id } => {
+            let mut s = server.lock().expect("lock");
+            let before = s.sessions.len() + s.unlocks.len();
+            s.sessions.retain(|_, x| !(x.user == user && x.id == id));
+            s.unlocks.retain(|_, x| !(x.user == user && x.id == id));
+            if s.sessions.len() + s.unlocks.len() == before {
+                bail!("no such login (it may have ended already)");
+            }
+            s.save(now, true);
+            json(())
+        }
+        Op::SessionEndOthers => {
+            end_other_sessions(server, user, req.token.as_deref(), req.chat.as_deref());
+            json(())
+        }
+        Op::ChatUnlock { password, code } => {
+            check_password_and_code(server, user, &password, &code, req.client, now)?;
+            let token = webauth::random_token();
+            let mut s = server.lock().expect("lock");
+            s.unlocks.insert(
+                token_key(&token),
+                Session {
+                    id: webauth::hex(&webauth::random_bytes::<8>()),
+                    user: user.to_string(),
+                    csrf: String::new(),
+                    created: now,
+                    last_seen: now,
+                    how: "chat".into(),
+                    agent: agent_of(req.agent.as_deref()),
+                    ip: req.client,
+                    login_ip: req.client,
+                },
+            );
+            let life = s.lifetime(now);
+            s.save(now, true);
+            json(serde_json::json!({ "token": token, "max_age": life }))
+        }
         Op::Whoami => {
             let s = server.lock().expect("lock");
-            let csrf = req
+            let mine = req
                 .token
-                .and_then(|t| s.sessions.get(&t).map(|x| x.csrf.clone()));
+                .as_deref()
+                .and_then(|t| s.sessions.get(&token_key(t)));
+            let csrf = mine.map(|x| x.csrf.clone());
+            let session = mine.map(|x| x.id.clone());
+            let chat = req
+                .chat
+                .as_deref()
+                .and_then(|t| s.unlocks.get(&token_key(t)))
+                .is_some_and(|x| x.user == user);
             drop(s);
             // Whether this account can step up with a passkey.
             let passkey = ctx::read_only().is_ok_and(|(c, _)| c.web.https())
                 && Users::load(Path::new(paths::WEB_USERS_FILE))
                     .is_ok_and(|u| u.users.get(user).is_some_and(|x| !x.passkeys.is_empty()));
-            json(serde_json::json!({ "user": user, "csrf": csrf, "passkey": passkey }))
+            json(serde_json::json!({
+                "user": user, "csrf": csrf, "passkey": passkey, "session": session, "chat": chat,
+            }))
         }
         Op::Overview => {
             let cached = {
@@ -961,9 +1245,6 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
         Op::TailscaleUp { .. } => json(ops::tailscale_up()?),
         Op::TailscaleWeb { on, .. } => json(ops::tailscale_web(on)?),
         Op::ChatList { name } => json(ops::chat_list(&name)?),
-        Op::ChatRename {
-            name, id, title, ..
-        } => json(ops::chat_rename(&name, &id, &title)?),
         Op::ChatOpen { name, id, title } => {
             json(ops::chat_open(&name, id.as_deref(), title.as_deref())?)
         }
@@ -985,11 +1266,13 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
         Op::AccountRename { new, .. } => {
             crate::web_cmd::rename_account(user, &new)?;
             let mut s = server.lock().expect("lock");
-            for sess in s.sessions.values_mut() {
+            let srv = &mut *s;
+            for sess in srv.sessions.values_mut().chain(srv.unlocks.values_mut()) {
                 if sess.user == user {
                     sess.user = new.clone();
                 }
             }
+            s.save(now, true);
             if let Some(p) = s.pending_totp.remove(user) {
                 s.pending_totp.insert(new.clone(), p);
             }
@@ -1105,7 +1388,7 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
             webauth::check_password_strength(&new)?;
             u.password = webauth::hash_password(&new)?;
             users.save(path)?;
-            end_other_sessions(server, user, req.token.as_deref());
+            end_other_sessions(server, user, req.token.as_deref(), req.chat.as_deref());
             json("password changed; your other logins ended")
         }
         Op::AccountTotpBegin { .. } => {
@@ -1145,7 +1428,7 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
                 .collect::<Result<_>>()?;
             users.save(path)?;
             server.lock().expect("lock").pending_totp.remove(user);
-            end_other_sessions(server, user, req.token.as_deref());
+            end_other_sessions(server, user, req.token.as_deref(), req.chat.as_deref());
             json(codes)
         }
         Op::ConfigSet { changes, .. } => {
@@ -1164,12 +1447,20 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
 
 /// After a password or authenticator change: every login of `user` but
 /// this one ends.
-fn end_other_sessions(server: &Mutex<Server>, user: &str, keep: Option<&str>) {
-    server
-        .lock()
-        .expect("lock")
-        .sessions
-        .retain(|t, s| s.user != user || Some(t.as_str()) == keep);
+fn end_other_sessions(
+    server: &Mutex<Server>,
+    user: &str,
+    keep: Option<&str>,
+    keep_chat: Option<&str>,
+) {
+    let keep = keep.map(token_key);
+    let keep_chat = keep_chat.map(token_key);
+    let mut s = server.lock().expect("lock");
+    s.sessions
+        .retain(|t, x| x.user != user || Some(t) == keep.as_ref());
+    s.unlocks
+        .retain(|t, x| x.user != user || Some(t) == keep_chat.as_ref());
+    s.save(crate::state::now(), true);
 }
 
 /// One example of every operation, for the test that the CLI offers each.
@@ -1188,6 +1479,13 @@ pub fn all_op_names() -> Vec<String> {
         Op::Logout,
         Op::Whoami,
         Op::Overview,
+        Op::SessionList,
+        Op::SessionEnd { id: s() },
+        Op::SessionEndOthers,
+        Op::ChatUnlock {
+            password: s(),
+            code: s(),
+        },
         Op::SpaceNew {
             space: NewSpace::default(),
         },
@@ -1281,12 +1579,6 @@ pub fn all_op_names() -> Vec<String> {
             code: s(),
         },
         Op::ChatList { name: s() },
-        Op::ChatRename {
-            name: s(),
-            id: s(),
-            title: s(),
-            code: s(),
-        },
         Op::ChatOpen {
             name: s(),
             id: None,
@@ -1361,6 +1653,10 @@ pub fn all_op_names() -> Vec<String> {
             | Op::Logout
             | Op::Whoami
             | Op::Overview
+            | Op::SessionList
+            | Op::SessionEnd { .. }
+            | Op::SessionEndOthers
+            | Op::ChatUnlock { .. }
             | Op::SpaceNew { .. }
             | Op::SpaceRm { .. }
             | Op::SpaceRename { .. }
@@ -1395,7 +1691,6 @@ pub fn all_op_names() -> Vec<String> {
             | Op::TailscaleUp { .. }
             | Op::TailscaleWeb { .. }
             | Op::ChatList { .. }
-            | Op::ChatRename { .. }
             | Op::ChatRm { .. }
             | Op::ChatStop { .. }
             | Op::SpaceRemote { .. }

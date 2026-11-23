@@ -58,7 +58,7 @@ pub struct Inbound {
     pub deny_from: Vec<IpAddr>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Web {
     /// Where the web UI listens, e.g. ["100.64.0.10:7180"] (the hub's
@@ -78,6 +78,22 @@ pub struct Web {
     /// Tailscale's own coordination server with HTTPS on, not Headscale).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub tls_tailscale: bool,
+    /// How long a web login lasts, in hours, however busy; it also ends
+    /// after 30 idle minutes. A chat unlocked for typing stays so as long.
+    pub session_hours: u32,
+}
+
+impl Default for Web {
+    fn default() -> Self {
+        Web {
+            listen: Vec::new(),
+            name: String::new(),
+            tls_cert: None,
+            tls_key: None,
+            tls_tailscale: false,
+            session_hours: 24,
+        }
+    }
 }
 
 impl Web {

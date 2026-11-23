@@ -275,13 +275,6 @@ enum BridgeCmd {
 enum ChatCmd {
     /// List a space's chats, newest first.
     Ls { space: String },
-    /// Name a chat on the hub (the first characters of its id are enough).
-    /// The Claude app keeps its own name for it.
-    Rename {
-        space: String,
-        id: String,
-        title: String,
-    },
     /// Delete a chat's transcript from the hub (one started from the hub is
     /// stopped first).
     Rm { space: String, id: String },
@@ -573,7 +566,6 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Remote { name, state } => s::remote(&name, state == "on"),
         Cmd::Chat(c) => match c {
             ChatCmd::Ls { space } => s::chat_ls(&space),
-            ChatCmd::Rename { space, id, title } => s::chat_rename(&space, &id, &title),
             ChatCmd::Rm { space, id } => s::chat_rm(&space, &id),
             ChatCmd::Stop { space, id } => s::chat_stop(&space, &id),
             ChatCmd::New { space, name } => s::chat_open(&space, None, name.as_deref()),
@@ -844,7 +836,6 @@ mod tests {
             ("tailscale_up", &["tailscale", "up"]),
             ("tailscale_web", &["tailscale", "web"]),
             ("chat_list", &["chat", "ls"]),
-            ("chat_rename", &["chat", "rename"]),
             ("chat_rm", &["chat", "rm"]),
             ("chat_stop", &["chat", "stop"]),
             ("space_remote", &["remote"]),
@@ -876,6 +867,10 @@ mod tests {
             "passkey_begin",
             "passkey_login",
             "passkey_add",
+            "session_list",
+            "session_end",
+            "session_end_others",
+            "chat_unlock",
         ];
         for (op, path) in table {
             assert!(has(path), "{op}: missing thorn {}", path.join(" "));

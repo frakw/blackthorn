@@ -13,6 +13,8 @@ pub const NOTIFY_FILE: &str = "/etc/blackthorn/notify.toml";
 
 pub const STATE_DIR: &str = "/var/lib/blackthorn";
 pub const STATE_FILE: &str = "/var/lib/blackthorn/state.toml";
+/// Web logins (their tokens hashed), so an update does not end them.
+pub const WEB_SESSIONS_FILE: &str = "/var/lib/blackthorn/web-sessions.json";
 pub const LOCK_FILE: &str = "/var/lib/blackthorn/state.lock";
 /// Space homes: /var/lib/blackthorn/spaces/<key>.
 pub const SPACES_DIR: &str = "/var/lib/blackthorn/spaces";

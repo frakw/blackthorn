@@ -332,7 +332,6 @@ mod tests {
                     access: crate::state::Access::Admin,
                     until: None,
                     title: None,
-                    chat_names: Default::default(),
                 },
             );
         }

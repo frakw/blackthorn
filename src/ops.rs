@@ -568,7 +568,6 @@ pub fn space_new(o: NewSpace) -> Result<String> {
         access,
         until: None,
         title: None,
-        chat_names: Default::default(),
     };
     let limited = ctx.state.limited(&space);
     let start_now = logged_in(&space) && !limited;
@@ -1064,11 +1063,8 @@ fn send_keys(sock: &Path, text: Option<&str>, key: Option<&str>, enter: bool) ->
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chat {
     pub id: String,
-    /// The hub's name for it, else Claude Code's.
+    /// Claude Code's name for it.
     pub title: String,
-    /// Claude Code's name for it, when the hub calls it something else.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claude_title: Option<String>,
     /// Unix seconds of the last write.
     pub modified: u64,
     pub kb: u64,
@@ -1249,15 +1245,8 @@ pub fn chat_list(name: &str) -> Result<Vec<Chat>> {
                         Some(ids) => ids.contains(&id),
                         None => recently_used(&p),
                     });
-            let own = chat_title(&text);
-            let hub = s.chat_names.get(&id).cloned();
-            let claude_title = hub
-                .as_ref()
-                .and(own.clone())
-                .filter(|t| Some(t) != hub.as_ref());
             Some(Chat {
-                title: hub.or(own).unwrap_or_else(|| "(no messages yet)".into()),
-                claude_title,
+                title: chat_title(&text).unwrap_or_else(|| "(no messages yet)".into()),
                 main,
                 window,
                 running,
@@ -1355,22 +1344,6 @@ fn chat_running(s: &Space, id: &str, path: &Path) -> bool {
     }
 }
 
-/// Names a chat on the hub only. Claude Code, and so the Claude app,
-/// keep their own name for it: one the hub gave it when it started there
-/// ("<first 8 of its id> <name>"), else one given in the chat, else
-/// Claude's title. Running or not.
-pub fn chat_rename(name: &str, id: &str, title: &str) -> Result<String> {
-    sys::require_root()?;
-    let title = check_chat_name(title)?;
-    let mut ctx = Ctx::open()?;
-    let key = ctx.state.space(name)?.key.clone();
-    let (id, _) = find_chat(&key, id)?;
-    let sp = ctx.state.spaces.get_mut(name).expect("checked");
-    sp.chat_names.insert(id.clone(), title.to_string());
-    ctx.commit()?;
-    Ok(id)
-}
-
 fn check_chat_name(title: &str) -> Result<&str> {
     let title = title.trim();
     if title.is_empty() || title.chars().count() > 100 || title.chars().any(char::is_control) {
@@ -1412,19 +1385,7 @@ pub fn chat_rm(name: &str, id: &str) -> Result<String> {
     if std::fs::symlink_metadata(&extra).is_ok_and(|m| m.is_dir()) {
         std::fs::remove_dir_all(&extra)?;
     }
-    forget_name(name, &id)?;
     Ok(id)
-}
-
-/// Drops the hub's name for a chat that is gone.
-fn forget_name(name: &str, id: &str) -> Result<()> {
-    let mut ctx = Ctx::open()?;
-    if let Some(sp) = ctx.state.spaces.get_mut(name) {
-        if sp.chat_names.remove(id).is_some() {
-            ctx.commit()?;
-        }
-    }
-    Ok(())
 }
 
 /// What `chat_open` did.
@@ -1569,13 +1530,6 @@ fn open_window(
     args.extend(prefix.iter().map(String::as_str));
     args.extend(l.args.iter().map(String::as_str));
     sys::run("tmux", &args)?;
-    if let (Some(t), false) = (title, resume) {
-        let mut ctx = Ctx::open()?;
-        if let Some(sp) = ctx.state.spaces.get_mut(name) {
-            sp.chat_names.insert(id.clone(), t.to_string());
-            ctx.commit()?;
-        }
-    }
     Ok(ChatOpened {
         id,
         restarted: false,
@@ -1620,9 +1574,6 @@ pub fn chat_open(name: &str, id: Option<&str>, title: Option<&str>) -> Result<Ch
     let sp = ctx.state.spaces.get_mut(name).expect("checked");
     sp.conversation = id.clone();
     sp.title = title.map(|t| claude_name(&id, t));
-    if let Some(t) = title {
-        sp.chat_names.insert(id.clone(), t.to_string());
-    }
     ctx.commit()?;
     drop(ctx);
     let unit = paths::space_unit(&s.key);
@@ -2737,6 +2688,10 @@ pub const SETTINGS: &[(&str, &str)] = &[
         "Where the web UI listens, as address:port, e.g. the hub's tailnet address :7180.",
     ),
     (
+        "web.session_hours",
+        "How long a web login lasts, in hours (1 to 720); it also ends after 30 idle minutes.",
+    ),
+    (
         "ssh_from",
         "The hub's own addresses for from=\"...\" in key lines. Empty: found for each machine.",
     ),
@@ -2778,6 +2733,7 @@ fn setting_value(cfg: &Config, key: &str) -> String {
         "never_manage" => list(&cfg.never_manage),
         "inbound.deny_from" => list(&cfg.inbound.deny_from),
         "web.listen" => list(&cfg.web.listen),
+        "web.session_hours" => cfg.web.session_hours.to_string(),
         "ssh_from" => list(&cfg.ssh_from),
         "egress.https_anywhere" => cfg.egress.https_anywhere.to_string(),
         _ => String::new(),
@@ -2846,6 +2802,14 @@ pub fn config_set(
             "web.listen" => {
                 cfg.web.listen = parse_list::<SocketAddr>(key, value)?;
                 doc["web"]["listen"] = toml_list(&cfg.web.listen);
+            }
+            "web.session_hours" => {
+                cfg.web.session_hours = value
+                    .parse()
+                    .ok()
+                    .filter(|h| (1..=720).contains(h))
+                    .with_context(|| format!("{key} is a number of hours, 1 to 720"))?;
+                doc["web"]["session_hours"] = toml_edit::value(i64::from(cfg.web.session_hours));
             }
             "ssh_from" => {
                 cfg.ssh_from = parse_list(key, value)?;
