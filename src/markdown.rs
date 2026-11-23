@@ -335,7 +335,7 @@ mod tests {
             "{h}"
         );
         assert!(
-            h.contains("<pre class=\"code\" data-lang=\"rust\"><code>fn x() {}\n</code></pre>"),
+            h.contains("<pre class=\"code\" data-lang=\"rust\"><code><span class=\"hl-k\">fn</span> <span class=\"hl-f\">x</span>() {}\n</code></pre>"),
             "{h}"
         );
         assert!(
