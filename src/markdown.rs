@@ -292,8 +292,7 @@ fn emphasis(s: &str) -> String {
 fn links(s: &str) -> String {
     let mut out = String::new();
     let mut rest = s;
-    loop {
-        let Some(a) = rest.find('[') else { break };
+    while let Some(a) = rest.find('[') {
         let Some(close) = rest[a..].find("](").map(|i| a + i) else {
             break;
         };

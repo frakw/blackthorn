@@ -523,7 +523,7 @@ pub fn send(name: &str, id: &str, text: &str) -> Result<()> {
     }
     let sock = paths::tmux_socket(&s.key);
     let sock = sock.to_str().context("socket path")?;
-    let buffer = format!("bt-chat-{}", &t);
+    let buffer = format!("bt-chat-{t}");
     let mut child = Command::new("tmux")
         .args(["-S", sock, "load-buffer", "-b", &buffer, "-"])
         .stdin(Stdio::piped())
