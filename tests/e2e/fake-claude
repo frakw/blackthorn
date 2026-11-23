@@ -20,10 +20,40 @@ case "$1" in
     echo "Login successful."
     exit 0 ;;
 esac
-while true; do
-  for h in t1 t2; do
-    if ssh -o ConnectTimeout=3 "$h" true 2>/dev/null; then r=ok; else r=FAIL; fi
-    echo "$(date +%s) $h $r"
-  done >> "$HOME/reach.log"
-  sleep 1
-done
+reach() {
+  while true; do
+    for h in t1 t2; do
+      if ssh -o ConnectTimeout=3 "$h" true 2>/dev/null; then r=ok; else r=FAIL; fi
+      echo "$(date +%s) $h $r"
+    done >> "$HOME/reach.log"
+    sleep 1
+  done
+}
+# A chat the hub started in a window of its own: it also answers what is
+# typed, writing both to its transcript, and asks a question on "ask".
+case "$1 $*" in
+  "--session-id "*"--remote-control "*|"--resume "*"--remote-control "*)
+    sid=$2
+    reach &
+    dir="$HOME/.claude/projects/$(pwd | sed 's#[^A-Za-z0-9]#-#g')"
+    mkdir -p "$dir"
+    f="$dir/$sid.jsonl"
+    printf '> '
+    while IFS= read -r line; do
+      e=$(printf '%s' "$line" | sed 's/\\/\\\\/g; s/"/\\"/g')
+      if [ "$line" = ask ]; then
+        printf '\nBash command\n  rm -rf /tmp/x\nDo you want to proceed?\n\342\235\257 1. Yes\n  2. No\n'
+        stty -icanon min 1 2>/dev/null
+        a=$(dd bs=1 count=1 2>/dev/null)
+        stty icanon 2>/dev/null
+        clear
+        echo "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"answered $a\"}}" >> "$f"
+      else
+        echo "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"$e\"}}" >> "$f"
+        echo "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"**heard** $e\"}]}}" >> "$f"
+      fi
+      printf '> '
+    done
+    exit 0 ;;
+esac
+reach

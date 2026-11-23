@@ -1196,13 +1196,13 @@ fn user_text(c: &serde_json::Value) -> Option<String> {
     (!t.is_empty() && !t.starts_with('<')).then(|| t.to_string())
 }
 
-fn space_uid(key: &str) -> Result<u32> {
+pub(crate) fn space_uid(key: &str) -> Result<u32> {
     Ok(sys::lookup_user(&paths::unix_user(key))
         .context("the space user is missing")?
         .uid)
 }
 
-fn main_conversation(s: &Space) -> Option<&str> {
+pub(crate) fn main_conversation(s: &Space) -> Option<&str> {
     (s.agent == CLAUDE && (s.mode == Mode::Single || !s.remote_control))
         .then_some(s.conversation.as_str())
 }
@@ -1262,7 +1262,7 @@ pub fn chat_list(name: &str) -> Result<Vec<Chat>> {
 }
 
 /// A chat by its id, or a unique start of it (at least 4 characters).
-fn find_chat(key: &str, id: &str) -> Result<(String, PathBuf)> {
+pub(crate) fn find_chat(key: &str, id: &str) -> Result<(String, PathBuf)> {
     let id = id.trim().to_ascii_lowercase();
     if id.len() < 4 {
         bail!("give at least the first 4 characters of the chat id");
@@ -1326,7 +1326,7 @@ fn session_of(text: &str) -> Option<String> {
 /// window of its own, or one Claude Code lists as live (a chat from the
 /// Claude app). Without that list, one written to in the last ten minutes
 /// counts as running.
-fn chat_running(s: &Space, id: &str, path: &Path) -> bool {
+pub(crate) fn chat_running(s: &Space, id: &str, path: &Path) -> bool {
     let active = sys::unit_state(&paths::space_unit(&s.key)) == "active";
     if !active {
         return false;
@@ -1446,7 +1446,7 @@ fn close_window(key: &str, id: &str) -> Result<bool> {
 }
 
 /// The first 8 characters of the chats running in windows of their own.
-fn chat_windows(key: &str) -> Vec<String> {
+pub(crate) fn chat_windows(key: &str) -> Vec<String> {
     let sock = paths::tmux_socket(key);
     let Some(sock) = sock.to_str().filter(|_| sock.exists()) else {
         return Vec::new();

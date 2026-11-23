@@ -408,6 +408,9 @@ fn route(
             }
         }
         ("POST", ["space", _, action]) => space_post(&c, &name, action, form),
+        ("GET", ["space", _, "chat", id]) => chat_page(&c, &name, id, &flash),
+        ("GET", ["space", _, "chat", id, "feed"]) => chat_feed(&c, &name, id, query),
+        ("POST", ["space", _, "chat", id, action]) => chat_post(&c, &name, id, action, form),
 
         ("GET", ["hosts"]) => hosts_page(&c, &flash),
         ("POST", ["hosts", "scan"]) => host_scan(&c, form),
@@ -1375,7 +1378,7 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
             )
         };
         rows.push_str(&format!(
-            "<li class=\"chat\"><div class=\"chat-main\"><span class=\"chat-title\">{}</span>\
+            "<li class=\"chat\"><div class=\"chat-main\"><a class=\"chat-title\" href=\"/space/{n}/chat/{id}\">{}</a>\
              <span class=\"item-meta\">{} · {} KB · <code>{}</code></span></div>\
              <div class=\"chat-actions\">{side}</div></li>",
             esc(&ch.title),
@@ -1425,6 +1428,328 @@ fn chats_card(c: &Ctx, s: &SpaceView) -> String {
             format!("<ul class=\"chats\">{rows}</ul>")
         }
     )
+}
+
+// ---------------------------------------------------------------- a chat
+
+/// A chat's id as it may appear in a path.
+fn chat_id_ok(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 36 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// The items of a chat, as HTML.
+fn chat_items_html(items: &[crate::chat::Item]) -> String {
+    let mut out = String::new();
+    for it in items {
+        match it.kind.as_str() {
+            "user" => out.push_str(&format!(
+                "<div class=\"msg user\"><div class=\"bubble\">{}</div></div>",
+                esc(&it.text)
+            )),
+            "assistant" => out.push_str(&format!(
+                "<div class=\"msg assistant\">{}</div>",
+                crate::markdown::to_html(&it.text)
+            )),
+            "tool" => {
+                let name = it.name.as_deref().unwrap_or("tool");
+                let body = if matches!(name, "Edit" | "MultiEdit") {
+                    it.text
+                        .lines()
+                        .map(|l| {
+                            let class = if l.starts_with("+ ") {
+                                "add"
+                            } else if l.starts_with("- ") {
+                                "del"
+                            } else {
+                                ""
+                            };
+                            format!("<span class=\"{class}\">{}</span>\n", esc(l))
+                        })
+                        .collect::<String>()
+                } else {
+                    esc(&it.text)
+                };
+                out.push_str(&format!(
+                    "<details class=\"tool\"><summary><span class=\"tool-name\">{}</span> <code>{}</code></summary>\
+                     <pre class=\"code\">{body}</pre></details>",
+                    esc(name),
+                    esc(&it.summary)
+                ));
+            }
+            "result" => {
+                let lines = it.text.lines().count();
+                out.push_str(&format!(
+                    "<details class=\"result{}\"><summary>{}</summary><pre class=\"code\">{}</pre></details>",
+                    if it.error { " err" } else { "" },
+                    if it.error {
+                        "error".to_string()
+                    } else if lines == 0 {
+                        "done".to_string()
+                    } else {
+                        format!("{lines} line{}", if lines == 1 { "" } else { "s" })
+                    },
+                    esc(&it.text)
+                ));
+            }
+            _ => out.push_str(&format!("<div class=\"msg note\">{}</div>", esc(&it.text))),
+        }
+    }
+    out
+}
+
+/// What the chat's terminal is doing, with what can be done about it.
+fn chat_state_html(c: &Ctx, n: &str, id: &str, feed: &crate::chat::Feed) -> String {
+    let key = |k: &str, label: &str, class: &str| {
+        format!(
+            "<form method=\"post\" action=\"/space/{n}/chat/{id}/key\" class=\"inline chat-key\">{}\
+             <input type=\"hidden\" name=\"key\" value=\"{}\"><button class=\"{class}\">{}</button></form>",
+            csrf(c),
+            esc(k),
+            esc(label)
+        )
+    };
+    let sc = &feed.screen;
+    match sc.state.as_str() {
+        "busy" => format!(
+            "<div class=\"chat-state busy\"><span class=\"dot\"></span>Claude is working{}</div>",
+            if c.chat && feed.typing {
+                key("Escape", "Stop", "")
+            } else {
+                String::new()
+            }
+        ),
+        "asking" => {
+            let buttons: String = if c.chat {
+                sc.choices
+                    .iter()
+                    .map(|(k, label)| key(k, &format!("{k}. {label}"), if k == "1" { "primary" } else { "" }))
+                    .collect()
+            } else {
+                String::new()
+            };
+            format!(
+                "<div class=\"chat-state asking\"><b>Claude is asking</b><pre class=\"code\">{}</pre>\
+                 <div class=\"choices\">{buttons}</div>{}</div>",
+                esc(&sc.question),
+                if c.chat {
+                    "<p class=\"hint\">Read it, then pick. Messages wait until it is answered.</p>"
+                } else {
+                    ""
+                }
+            )
+        }
+        "stopped" => format!(
+            "<div class=\"chat-state\">This chat is not running. <form method=\"post\" action=\"/space/{n}/chat-open\" \
+             class=\"inline\">{}<input type=\"hidden\" name=\"id\" value=\"{id}\"><button>Continue it</button></form></div>",
+            csrf(c)
+        ),
+        "elsewhere" => "<div class=\"chat-state\">This chat runs in the Claude app: read along here, type there \
+                        (or end it there and continue it here)."
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+fn chat_page(c: &Ctx, name: &str, id: &str, flash: &Flash) -> Reply {
+    if !chat_id_ok(id) {
+        return Reply::Html(404, page(c, "Not found", "<h1>Not found</h1>", flash));
+    }
+    let n = url_encode(name);
+    let feed = match get::<crate::chat::Feed>(
+        c,
+        Op::ChatFeed {
+            name: name.into(),
+            id: id.into(),
+            from: None,
+        },
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            let body = format!(
+                "<p><a href=\"/space/{n}#chats\">← {}</a></p><section class=\"card\"><p class=\"t-bad\">{}</p></section>",
+                esc(name),
+                esc(&e)
+            );
+            return Reply::Html(404, page(c, "Chat", &body, flash));
+        }
+    };
+    let commands = get::<Vec<crate::chat::SlashCommand>>(c, Op::ChatCommands { name: name.into() })
+        .unwrap_or_default();
+    let slash: String = commands
+        .iter()
+        .map(|x| {
+            format!(
+                "<li><button type=\"button\" data-cmd=\"/{}\"><b>/{}</b> <span>{}</span></button></li>",
+                esc(&x.name),
+                esc(&x.name),
+                esc(&x.about)
+            )
+        })
+        .collect();
+    let composer = if !feed.typing {
+        String::new()
+    } else if !c.chat {
+        format!(
+            "<form method=\"post\" action=\"/space/{n}/chat/{id}/unlock\" class=\"card stack chat-unlock\">{}\
+             <h2>Type into chats from this browser</h2><p class=\"hint\">A message here is a message from you, to a \
+             Claude that can change your machines. Confirm it is you, once for this browser: it stays unlocked as long as \
+             a login lasts (<code>web.session_hours</code>), and the Account page lists it.</p>\
+             <label>Password <input name=\"password\" type=\"password\" autocomplete=\"current-password\" required></label>\
+             {}<div><button class=\"primary\">Unlock</button></div></form>",
+            csrf(c),
+            code_field()
+        )
+    } else {
+        format!(
+            "<form method=\"post\" action=\"/space/{n}/chat/{id}/send\" id=\"composer\" class=\"composer\">{}\
+             <div id=\"attached\" class=\"attached\"></div>\
+             <div class=\"composer-row\">\
+             <div class=\"plus-wrap\"><button type=\"button\" class=\"plus\" id=\"plus\" aria-label=\"Add\" hidden>+</button>\
+             <div class=\"plus-menu\" id=\"plus-menu\" hidden>\
+             <button type=\"button\" data-act=\"file\">Add files or photos</button>\
+             <button type=\"button\" data-act=\"slash\">Slash commands</button></div></div>\
+             <textarea name=\"text\" id=\"chat-text\" rows=\"1\" placeholder=\"Message Claude; / for commands\" required></textarea>\
+             <button class=\"primary send\">Send</button></div>\
+             <input type=\"file\" id=\"chat-file\" multiple hidden>\
+             <ul class=\"slash\" id=\"slash\" hidden>{slash}</ul></form>",
+            csrf(c)
+        )
+    };
+    let body = format!(
+        "<div class=\"chat-page\" data-feed=\"/space/{n}/chat/{id}/feed\" data-offset=\"{}\" data-csrf=\"{}\">\
+         <div class=\"page-head\"><div><p class=\"crumbs\"><a href=\"/space/{n}#chats\">← {}</a></p>\
+         <h1 class=\"chat-h\">{}</h1></div><code class=\"hint\">{}</code></div>\
+         <div class=\"chat-log\" id=\"chat-log\" aria-live=\"polite\">{}{}</div>\
+         <div id=\"chat-state\">{}</div>{composer}</div>",
+        feed.offset,
+        esc(&c.csrf),
+        esc(name),
+        esc(if feed.title.is_empty() { "Chat" } else { feed.title.as_str() }),
+        esc(&id[..8.min(id.len())]),
+        if feed.cut {
+            "<p class=\"hint\">Older messages are not shown.</p>"
+        } else {
+            ""
+        },
+        chat_items_html(&feed.items),
+        chat_state_html(c, &n, id, &feed),
+    );
+    Reply::Html(
+        200,
+        page(
+            c,
+            if feed.title.is_empty() {
+                "Chat"
+            } else {
+                feed.title.as_str()
+            },
+            &body,
+            flash,
+        ),
+    )
+}
+
+fn chat_feed(c: &Ctx, name: &str, id: &str, query: &HashMap<String, String>) -> Reply {
+    if !chat_id_ok(id) {
+        return Reply::Json(404, "{\"error\":\"no such chat\"}".into());
+    }
+    let from = query.get("from").and_then(|f| f.parse().ok());
+    match get::<crate::chat::Feed>(
+        c,
+        Op::ChatFeed {
+            name: name.into(),
+            id: id.into(),
+            from,
+        },
+    ) {
+        Ok(feed) => Reply::Json(
+            200,
+            serde_json::json!({
+                "html": chat_items_html(&feed.items),
+                "offset": feed.offset,
+                "reset": feed.reset,
+                "state": feed.screen.state,
+                "state_html": chat_state_html(c, &url_encode(name), id, &feed),
+                "title": feed.title,
+            })
+            .to_string(),
+        ),
+        Err(e) => Reply::Json(400, serde_json::json!({ "error": e }).to_string()),
+    }
+}
+
+fn chat_post(c: &Ctx, name: &str, id: &str, action: &str, form: &HashMap<String, String>) -> Reply {
+    if !chat_id_ok(id) {
+        return Reply::Json(404, "{\"error\":\"no such chat\"}".into());
+    }
+    let here = format!("/space/{}/chat/{id}", url_encode(name));
+    let js = f(form, "js") == "1";
+    let answer = |r: std::result::Result<serde_json::Value, String>, ok: &str| -> Reply {
+        if js {
+            match r {
+                Ok(v) => Reply::Json(200, serde_json::json!({ "ok": ok, "data": v }).to_string()),
+                Err(e) => Reply::Json(400, serde_json::json!({ "error": e }).to_string()),
+            }
+        } else {
+            back(&here, r.map(|_| ok.to_string()))
+        }
+    };
+    match action {
+        "unlock" => match get::<serde_json::Value>(
+            c,
+            Op::ChatUnlock {
+                password: f(form, "password").into(),
+                code: f(form, "code").into(),
+            },
+        ) {
+            Ok(v) => {
+                let token = v["token"].as_str().unwrap_or("");
+                let age = v["max_age"].as_u64().unwrap_or(24 * 3600);
+                Reply::Redirect(
+                    format!("{here}?ok=unlocked"),
+                    Some(format!(
+                        "{CHAT_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={age}"
+                    )),
+                )
+            }
+            Err(e) => back(&here, Err(e)),
+        },
+        "send" => answer(
+            get(
+                c,
+                Op::ChatSend {
+                    name: name.into(),
+                    id: id.into(),
+                    text: f(form, "text").into(),
+                },
+            ),
+            "sent",
+        ),
+        "key" => answer(
+            get(
+                c,
+                Op::ChatKey {
+                    name: name.into(),
+                    id: id.into(),
+                    key: f(form, "key").into(),
+                },
+            ),
+            "pressed",
+        ),
+        "chat-upload" => answer(
+            get(
+                c,
+                Op::ChatUpload {
+                    name: name.into(),
+                    id: id.into(),
+                    filename: f(form, "filename").into(),
+                    data: f(form, "data").into(),
+                },
+            ),
+            "saved",
+        ),
+        _ => Reply::Json(404, "{\"error\":\"no such action\"}".into()),
+    }
 }
 
 fn access_card(c: &Ctx, s: &SpaceView, h: Option<&HostView>) -> String {
@@ -1697,27 +2022,34 @@ fn space_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>)
                 }
             }),
         ),
-        "chat-new" | "chat-open" => back(
-            &format!("{here}#chats"),
-            get::<ops::ChatOpened>(
+        "chat-new" | "chat-open" => {
+            let r = get::<ops::ChatOpened>(
                 c,
                 Op::ChatOpen {
                     name: name.into(),
                     id: (action == "chat-open").then(|| f(form, "id").to_string()),
                     title: (action == "chat-new").then(|| f(form, "title").to_string()),
                 },
-            )
-            .map(|o| {
-                let what = if action == "chat-new" { "new chat started" } else { "back in that chat" };
-                if o.window {
-                    format!("{what}; open it in the Claude app")
-                } else if o.restarted {
-                    format!("{what}; the space restarted into it")
-                } else {
-                    format!("{what}; it runs when the space starts")
+            );
+            match r {
+                // On to the chat's own page.
+                Ok(o) => {
+                    let what = if action == "chat-new" { "new chat started" } else { "back in that chat" };
+                    let more = if o.window {
+                        "; it shows in the Claude app too"
+                    } else if o.restarted {
+                        "; the space restarted into it"
+                    } else {
+                        "; it runs when the space starts"
+                    };
+                    back(
+                        &format!("{here}/chat/{}", url_encode(&o.id)),
+                        Ok(format!("{what}{more}")),
+                    )
                 }
-            }),
-        ),
+                Err(e) => back(&format!("{here}#chats"), Err(e)),
+            }
+        }
         "start-for" => back(
             &here,
             get::<Option<u64>>(

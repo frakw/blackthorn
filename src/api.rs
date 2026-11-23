@@ -26,7 +26,8 @@ use std::time::Duration;
 const IDLE: u64 = 30 * 60;
 const MAX_FAILURES: u32 = 5;
 const LOCKOUT: u64 = 15 * 60;
-const MAX_REQUEST: u64 = 256 * 1024;
+/// Files for chats come this way too (in base64).
+const MAX_REQUEST: u64 = 16 << 20;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -72,6 +73,36 @@ pub enum Op {
     ChatUnlock {
         password: String,
         code: String,
+    },
+    /// A chat's transcript from an offset (None: its latest part), and
+    /// what its terminal shows.
+    ChatFeed {
+        name: String,
+        id: String,
+        from: Option<u64>,
+    },
+    /// The slash commands a space's chats know.
+    ChatCommands {
+        name: String,
+    },
+    /// Types a message into a chat (needs the chat unlock).
+    ChatSend {
+        name: String,
+        id: String,
+        text: String,
+    },
+    /// Presses Escape, or a choice's number (needs the chat unlock).
+    ChatKey {
+        name: String,
+        id: String,
+        key: String,
+    },
+    /// Saves a file for a chat (base64; needs the chat unlock).
+    ChatUpload {
+        name: String,
+        id: String,
+        filename: String,
+        data: String,
     },
     SpaceNew {
         space: NewSpace,
@@ -311,6 +342,8 @@ impl Op {
                 | Op::Whoami
                 | Op::Overview
                 | Op::SessionList
+                | Op::ChatFeed { .. }
+                | Op::ChatCommands { .. }
                 | Op::SpaceScreen { .. }
                 | Op::HostPubkey { .. }
                 | Op::ConfigShow
@@ -322,6 +355,14 @@ impl Op {
                 | Op::Account
                 | Op::NotifyShow
                 | Op::PasskeyLogin { .. }
+        )
+    }
+
+    /// Typing into a chat needs this browser's chat unlock.
+    fn needs_chat_unlock(&self) -> bool {
+        matches!(
+            self,
+            Op::ChatSend { .. } | Op::ChatKey { .. } | Op::ChatUpload { .. }
         )
     }
 
@@ -685,6 +726,29 @@ fn dispatch(req: Request, server: &Mutex<Server>) -> Out {
             sess.ip = req.client;
         }
         let user = sess.user.clone();
+        if req.op.needs_chat_unlock() {
+            let unlocked = req
+                .chat
+                .as_deref()
+                .and_then(|t| s.unlocks.get_mut(&token_key(t)))
+                .filter(|x| x.user == user);
+            match unlocked {
+                Some(x) => {
+                    x.last_seen = now;
+                    if req.client.is_some() {
+                        x.ip = req.client;
+                    }
+                }
+                None => {
+                    return (
+                        Err(anyhow::anyhow!(
+                            "this browser may not type into chats yet: unlock it with your password and a code"
+                        )),
+                        Some(user),
+                    )
+                }
+            }
+        }
         s.save(now, false);
         user
     };
@@ -1069,6 +1133,22 @@ fn run_op(req: Request, server: &Mutex<Server>, user: &str, now: u64) -> Result<
                 s.save(now, true);
             }
             json(())
+        }
+        Op::ChatFeed { name, id, from } => json(crate::chat::feed(&name, &id, from)?),
+        Op::ChatCommands { name } => json(crate::chat::commands(&name)?),
+        Op::ChatSend { name, id, text } => json(crate::chat::send(&name, &id, &text)?),
+        Op::ChatKey { name, id, key } => json(crate::chat::key(&name, &id, &key)?),
+        Op::ChatUpload {
+            name,
+            id,
+            filename,
+            data,
+        } => {
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data.trim())
+                .context("the file did not arrive whole")?;
+            json(crate::chat::upload(&name, &id, &filename, &bytes)?)
         }
         Op::SessionList => {
             let mut s = server.lock().expect("lock");
@@ -1486,6 +1566,28 @@ pub fn all_op_names() -> Vec<String> {
             password: s(),
             code: s(),
         },
+        Op::ChatFeed {
+            name: s(),
+            id: s(),
+            from: None,
+        },
+        Op::ChatCommands { name: s() },
+        Op::ChatSend {
+            name: s(),
+            id: s(),
+            text: s(),
+        },
+        Op::ChatKey {
+            name: s(),
+            id: s(),
+            key: s(),
+        },
+        Op::ChatUpload {
+            name: s(),
+            id: s(),
+            filename: s(),
+            data: s(),
+        },
         Op::SpaceNew {
             space: NewSpace::default(),
         },
@@ -1657,6 +1759,11 @@ pub fn all_op_names() -> Vec<String> {
             | Op::SessionEnd { .. }
             | Op::SessionEndOthers
             | Op::ChatUnlock { .. }
+            | Op::ChatFeed { .. }
+            | Op::ChatCommands { .. }
+            | Op::ChatSend { .. }
+            | Op::ChatKey { .. }
+            | Op::ChatUpload { .. }
             | Op::SpaceNew { .. }
             | Op::SpaceRm { .. }
             | Op::SpaceRename { .. }

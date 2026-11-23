@@ -332,6 +332,12 @@ pub fn chat_rm(space: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn chat_send(space: &str, id: &str, text: &str) -> Result<()> {
+    crate::chat::send(space, id, text)?;
+    println!("sent");
+    Ok(())
+}
+
 pub fn chat_stop(space: &str, id: &str) -> Result<()> {
     let id = ops::chat_stop(space, id)?;
     println!("stopped chat {}", &id[..8]);

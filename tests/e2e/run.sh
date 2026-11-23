@@ -295,6 +295,48 @@ sleep 2
 thorn chat rm t1-claude "${wid%%-*}" | grep -q "deleted chat" && ok "a running chat from the hub is stopped and deleted" || fail "rm of a window chat"
 hub tmux -S "/run/blackthorn/$k1/tmux.sock" list-windows -F '#{window_name}' | grep -q "^chat-${wid%%-*}" && fail "its window survived the delete" || ok "its window closed with it"
 hub test -e "$dir/$wid.jsonl" && fail "the window chat's transcript is still there" || ok "and its transcript is gone"
+
+say "a chat on the web: read along, unlock, type, answer, files"
+r=$(web_post /space/t1-claude/chat-new --data-urlencode "csrf=$C" --data-urlencode "title=web chat")
+case "$r" in *"/space/t1-claude/chat/"*"?ok=new%20chat"*) ok "a new chat opens its own page";; *) fail "chat-new redirect: $r";; esac
+nid=$(echo "$r" | sed 's#.*/chat/\([0-9a-f-]*\).*#\1#')
+sleep 2
+web_get "/space/t1-claude/chat/$nid" | grep -q "Type into chats from this browser" && ok "typing needs an unlock first" || fail "no unlock form: $(web_get "/space/t1-claude/chat/$nid" | head -c 800)"
+chat_post() { local a=$1; shift; admin curl -s -b /tmp/jar -c /tmp/jar --data-urlencode "csrf=$C" --data-urlencode "js=1" "$@" "http://$HUB:7180/space/t1-claude/chat/$nid/$a"; }
+chat_post send --data-urlencode "text=hi" | grep -q "may not type" && ok "a message is refused before the unlock" || fail "send without unlock"
+r=$(web_post "/space/t1-claude/chat/$nid/unlock" --data-urlencode "csrf=$C" --data-urlencode "password=$PASSWORD" --data-urlencode "code=000000")
+case "$r" in *"err="*) ok "a wrong code does not unlock";; *) fail "unlock with a wrong code: $r";; esac
+r=$(web_post "/space/t1-claude/chat/$nid/unlock" --data-urlencode "csrf=$C" --data-urlencode "password=$PASSWORD" --data-urlencode "code=$(fresh_code $WEB_SECRET)")
+case "$r" in *"ok=unlocked"*) ok "password and code unlock this browser";; *) fail "unlock: $r";; esac
+admin grep -q bt_chat /tmp/jar && ok "kept in a cookie of its own" || fail "no chat cookie"
+web_get "/space/t1-claude/chat/$nid" | grep -q 'id="composer"' && ok "then the page offers a message box" || fail "no composer"
+chat_post send --data-urlencode "text=check the \"disks\" & more" | grep -q '"ok":"sent"' && ok "a message sent from the web" || fail "send: $(chat_post send --data-urlencode 'text=x')"
+sleep 2
+feed=$(web_get "/space/t1-claude/chat/$nid/feed")
+echo "$feed" | grep -q 'check the &quot;disks&quot; &amp; more' && ok "it reached the chat, as typed" || fail "feed: $feed"
+echo "$feed" | grep -q '<strong>heard</strong>' && ok "and Claude's answer reads as Markdown" || fail "answer in feed: $feed"
+thorn chat send t1-claude "${nid%%-*}" ask | grep -q sent && ok "thorn chat send" || fail "thorn chat send"
+sleep 2
+feed=$(web_get "/space/t1-claude/chat/$nid/feed")
+echo "$feed" | grep -q '"state":"asking"' && ok "a question is seen" || fail "asking: $feed"
+echo "$feed" | grep -q 'Do you want to proceed?' && ok "with its text" || fail "question text: $feed"
+chat_post send --data-urlencode "text=yes" | grep -q "answer it first" && ok "nothing is typed while Claude asks" || fail "send while asking"
+chat_post key --data-urlencode "key=7" | grep -q "not asking that" && ok "a choice it does not offer is refused" || fail "key 7"
+chat_post key --data-urlencode "key=C-c" | grep -q "does not press" && ok "and so is any other key" || fail "key C-c"
+chat_post key --data-urlencode "key=1" | grep -q '"ok":"pressed"' && ok "a choice pressed from the web" || fail "key 1"
+sleep 2
+web_get "/space/t1-claude/chat/$nid/feed" | grep -q '"state":"idle"' && ok "and the question is gone" || fail "after the answer: $(web_get "/space/t1-claude/chat/$nid/feed")"
+web_get "/space/t1-claude/chat/$nid/feed" | grep -q 'answered 1' && ok "Claude got that answer" || fail "answer not given"
+r=$(chat_post chat-upload --data-urlencode "filename=../../evil name.txt" --data-urlencode "data=$(printf 'hello file' | base64)")
+up=$(echo "$r" | sed -n 's/.*"data":"\([^"]*\)".*/\1/p')
+case "$up" in .uploads/*-evil-name.txt) ok "a file saved for the chat, its name made safe";; *) fail "upload: $r";; esac
+w="/var/lib/blackthorn/spaces/$k1/t1-claude"
+[ "$(hub cat "$w/$up")" = "hello file" ] && ok "in the chat's folder" || fail "uploaded file: $(hub ls -la "$w/.uploads")"
+[ "$(hub stat -c '%U %a' "$w/$up")" = "bt-$k1 600" ] && ok "owned by the space, private" || fail "upload owner: $(hub stat -c '%U %a' "$w/$up")"
+web_get "/space/t1-claude/chat/$nid" | grep -q 'data-cmd="/compact"' && ok "slash commands offered" || fail "no slash commands"
+web_get /account | grep -q "may type into chats" && ok "the unlock is listed with the logins" || fail "unlock not on the account page"
+web_get "/space/t1-claude/chat/0000aaaa/feed" | grep -q '"error"' && ok "an unknown chat is an error" || fail "unknown chat feed"
+thorn chat stop t1-claude "${nid%%-*}" >/dev/null
 sleep 3
 a=$(hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args")
 case "$a" in "--session-id $old"*) fail "still the old chat: $a";; --session-id*) ok "restarted into a new conversation";; *) fail "chat new: $a";; esac

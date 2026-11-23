@@ -613,3 +613,222 @@ document.querySelectorAll("time[data-local]").forEach(function (t) {
     t.textContent = d.toLocaleString();
   }
 });
+
+// A chat's page: new messages as they come, typing, files, slash commands.
+(function () {
+  "use strict";
+  var pageEl = document.querySelector(".chat-page");
+  if (!pageEl) return;
+  var log = document.getElementById("chat-log");
+  var stateEl = document.getElementById("chat-state");
+  var feedUrl = pageEl.getAttribute("data-feed");
+  var base = feedUrl.replace(/\/feed$/, "");
+  var csrf = pageEl.getAttribute("data-csrf");
+  var offset = pageEl.getAttribute("data-offset");
+  var busy = false;
+  var timer = null;
+
+  var nearBottom = function () {
+    return window.innerHeight + window.scrollY >= document.body.scrollHeight - 120;
+  };
+  var toBottom = function () { window.scrollTo(0, document.body.scrollHeight); };
+  toBottom();
+
+  var post = function (action, fields) {
+    var body = new URLSearchParams();
+    body.set("csrf", csrf);
+    body.set("js", "1");
+    Object.keys(fields).forEach(function (k) { body.set(k, fields[k]); });
+    return fetch(base + "/" + action, { method: "POST", body: body, credentials: "same-origin" })
+      .then(function (r) {
+        if (r.redirected && new URL(r.url).pathname === "/login") {
+          window.location.assign("/login");
+          throw new Error("logged out");
+        }
+        return r.json();
+      })
+      .then(function (j) {
+        if (j.error) throw new Error(j.error);
+        return j;
+      });
+  };
+
+  var showError = function (msg) {
+    var p = document.getElementById("chat-error");
+    if (!p) {
+      p = document.createElement("pre");
+      p.id = "chat-error";
+      p.className = "flash err";
+      stateEl.parentNode.insertBefore(p, stateEl);
+    }
+    p.textContent = msg;
+    p.hidden = !msg;
+  };
+
+  var poll = function () {
+    if (timer) window.clearTimeout(timer);
+    var stick = nearBottom();
+    fetch(feedUrl + "?from=" + encodeURIComponent(offset), { credentials: "same-origin" })
+      .then(function (r) {
+        if (r.redirected && new URL(r.url).pathname === "/login") {
+          window.location.assign("/login");
+          throw new Error("logged out");
+        }
+        return r.json();
+      })
+      .then(function (j) {
+        if (j.error) return;
+        if (j.reset) log.innerHTML = j.html;
+        else if (j.html) log.insertAdjacentHTML("beforeend", j.html);
+        offset = j.offset;
+        if (stateEl.innerHTML !== j.state_html) {
+          stateEl.innerHTML = j.state_html;
+          wireKeys();
+        }
+        busy = j.state === "busy";
+        if (stick && (j.html || j.reset)) toBottom();
+      })
+      .catch(function () { /* try again later */ })
+      .then(function () {
+        if (!document.hidden) timer = window.setTimeout(poll, busy ? 1200 : 2500);
+      });
+  };
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) poll(); });
+
+  // Stop and the answers to a question: without leaving the page.
+  var wireKeys = function () {
+    stateEl.querySelectorAll("form.chat-key").forEach(function (f) {
+      f.addEventListener("submit", function (e) {
+        e.preventDefault();
+        post("key", { key: f.querySelector("[name=key]").value })
+          .then(function () { showError(""); window.setTimeout(poll, 300); })
+          .catch(function (err) { showError(err.message); });
+      });
+    });
+  };
+  wireKeys();
+  timer = window.setTimeout(poll, 1500);
+
+  var form = document.getElementById("composer");
+  if (!form) return;
+  var text = document.getElementById("chat-text");
+  var plus = document.getElementById("plus");
+  var menu = document.getElementById("plus-menu");
+  var file = document.getElementById("chat-file");
+  var slash = document.getElementById("slash");
+  var attached = document.getElementById("attached");
+  plus.hidden = false;
+
+  var grow = function () {
+    text.style.height = "auto";
+    text.style.height = Math.min(text.scrollHeight, window.innerHeight * 0.4) + "px";
+  };
+  text.addEventListener("input", grow);
+
+  var send = function () {
+    var t = text.value;
+    if (!t.trim()) return;
+    var button = form.querySelector(".send");
+    button.disabled = true;
+    post("send", { text: t })
+      .then(function () {
+        text.value = "";
+        attached.innerHTML = "";
+        grow();
+        showError("");
+        window.setTimeout(poll, 400);
+      })
+      .catch(function (err) { showError(err.message); })
+      .then(function () { button.disabled = false; text.focus(); });
+  };
+  form.addEventListener("submit", function (e) { e.preventDefault(); send(); });
+  // Enter sends on a computer (Shift+Enter: a new line); on a phone the
+  // button does. Not while an input method is composing a word.
+  var coarse = window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
+  text.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229 && !coarse && slash.hidden) {
+      e.preventDefault();
+      send();
+    }
+    if (e.key === "Escape") { slash.hidden = true; menu.hidden = true; }
+  });
+
+  var insert = function (s) {
+    var at = text.selectionStart || text.value.length;
+    var before = text.value.slice(0, at);
+    if (before && !/\s$/.test(before)) s = " " + s;
+    text.value = before + s + text.value.slice(at);
+    text.focus();
+    grow();
+  };
+
+  var upload = function (f) {
+    var chip = document.createElement("span");
+    chip.className = "badge";
+    chip.textContent = f.name + " …";
+    attached.appendChild(chip);
+    if (f.size > 10 * 1024 * 1024) {
+      chip.textContent = f.name + ": over 10 MB";
+      return;
+    }
+    var r = new FileReader();
+    r.onload = function () {
+      var data = String(r.result).replace(/^data:[^,]*,/, "");
+      post("chat-upload", { filename: f.name || "pasted.png", data: data })
+        .then(function (j) {
+          chip.textContent = f.name;
+          insert("@" + j.data + " ");
+        })
+        .catch(function (err) { chip.textContent = f.name + ": " + err.message; });
+    };
+    r.readAsDataURL(f);
+  };
+  file.addEventListener("change", function () {
+    Array.prototype.forEach.call(file.files, upload);
+    file.value = "";
+  });
+  // A picture pasted into the box is uploaded too.
+  text.addEventListener("paste", function (e) {
+    var files = e.clipboardData && e.clipboardData.files;
+    if (files && files.length) {
+      e.preventDefault();
+      Array.prototype.forEach.call(files, upload);
+    }
+  });
+
+  plus.addEventListener("click", function () { menu.hidden = !menu.hidden; slash.hidden = true; });
+  menu.addEventListener("click", function (e) {
+    var b = e.target.closest("button");
+    if (!b) return;
+    menu.hidden = true;
+    if (b.getAttribute("data-act") === "file") file.click();
+    else { filterSlash(""); slash.hidden = false; }
+  });
+  var filterSlash = function (q) {
+    var any = false;
+    slash.querySelectorAll("li").forEach(function (li) {
+      var c = li.querySelector("button").getAttribute("data-cmd");
+      var show = c.indexOf("/" + q) === 0 || (q && c.indexOf(q) > 0);
+      li.hidden = !show;
+      if (show) any = true;
+    });
+    return any;
+  };
+  text.addEventListener("input", function () {
+    var m = /^\/([^\s]*)$/.exec(text.value);
+    slash.hidden = !(m && filterSlash(m[1]));
+  });
+  slash.addEventListener("click", function (e) {
+    var b = e.target.closest("button");
+    if (!b) return;
+    var c = b.getAttribute("data-cmd") + " ";
+    if (/^\/[^\s]*$/.test(text.value) || !text.value) text.value = c;
+    else insert(c);
+    slash.hidden = true;
+    text.focus();
+    grow();
+  });
+  document.addEventListener("click", function (e) {
+    if (!form.contains(e.target)) { slash.hidden = true; menu.hidden = true; }
+  });
+})();

@@ -5,7 +5,7 @@ coding agents live. They keep running there, you reach them from your phone
 or laptop, and each one can work on exactly one of your machines, over SSH,
 one way only.
 
-Status: **early (v0.9)**. It works and is tested end to end, but expect
+Status: **early (v0.10)**. It works and is tested end to end, but expect
 changes. Read [THREAT_MODEL.md](THREAT_MODEL.md) before trusting it with
 anything important.
 
@@ -176,7 +176,8 @@ The web UI is the everyday way to run blackthorn, on a laptop or a phone:
   Drag boxes around, pan and zoom; the layout is remembered in your browser.
 - **Spaces**: each one's chats (new, continue, stop, delete; with
   Remote Control a new chat runs next to the others and shows in the Claude
-  app),
+  app), each with its own page to read and type into it (see
+  [Chats on the web](#chats-on-the-web)),
   a live view of its terminal, Claude sign-in, bridges, Remote Control on
   or off, and the name the Claude app lists it by.
 - **Machines**: the key line to install (with a Copy button), checking the
@@ -191,7 +192,8 @@ The web UI is the everyday way to run blackthorn, on a laptop or a phone:
   machine tries to connect to the hub, a space fails or must sign in again,
   a block or bridge ends, or a new release is out.
 - **Account**: rename it, change your password, or move to a new
-  authenticator app.
+  authenticator app; see where it is logged in (browser, system, address,
+  last used) and end any of those logins.
 
 The command line can do everything it can, for when it is down.
 
@@ -277,7 +279,7 @@ restores the old settings at any time.
 | `thorn attach SPACE` | Open the space's terminal |
 | `thorn screen SPACE` / `thorn send SPACE TEXT` | Read or type into the terminal without attaching |
 | `thorn rename OLD NEW [--rc-name N]` | Rename; same chats |
-| `thorn chat ls SPACE` / `chat new SPACE [--name N]` / `chat stop SPACE ID` / `chat rm SPACE ID` | A space's Claude chats |
+| `thorn chat ls SPACE` / `chat new SPACE [--name N]` / `chat send SPACE ID TEXT` / `chat stop SPACE ID` / `chat rm SPACE ID` | A space's Claude chats |
 | `thorn chat new SPACE [--name N]` / `chat open SPACE ID` | Start a new chat, or go back to one |
 | `thorn remote SPACE on\|off` | Remote Control on, or off: one local conversation, only from the hub |
 | `thorn rm SPACE [--purge]` | Delete; files are archived unless `--purge` |
@@ -393,6 +395,30 @@ Changing a Remote Control name moves the folder, so the app gets a new
 environment. The old one stays in its list, offline, until Anthropic clears
 it: Claude Code keeps it on purpose so a restarted space can take its chats
 back, and offers no way to delete it.
+
+### Chats on the web
+
+Each chat has a page (click its name on the space's page): Claude's
+answers as they come, with code, lists and tables; the tools it used and
+what they gave back, folded; edits as lines out and in. A new chat opens
+on its page.
+
+To type into chats from a browser, unlock it once with your password and
+a code; it stays so for `web.session_hours` (24 by default), and the
+Account page lists and ends it like a login. Then:
+
+- **Send** a message (Enter on a computer, Shift+Enter for a new line).
+- **+**: add files or photos (up to 10 MB each, or paste a picture into
+  the box). They are saved in the chat's folder under `.uploads/` and
+  mentioned as `@.uploads/...`, so Claude reads them.
+- **/**: Claude Code's commands, and the space's own commands and skills.
+- **Stop** while Claude works (Escape), and buttons for the choices when it
+  asks a question (allow a command, say). Nothing is typed while it asks.
+
+Typing works for chats the hub runs: those started or continued from the
+hub, and a one-chat space's chat. A chat started in the Claude app can be
+read along; end it there and continue it from the hub to type. `thorn chat
+send SPACE ID TEXT` does the same from the hub.
 
 ## Backup and moving to a new hub
 

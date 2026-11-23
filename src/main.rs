@@ -4,6 +4,7 @@ mod activity;
 mod api;
 mod apply;
 mod backup;
+mod chat;
 mod config;
 mod config_cmd;
 mod ctx;
@@ -14,6 +15,7 @@ mod http;
 mod init_cmd;
 mod keys;
 mod map;
+mod markdown;
 mod notify;
 mod ops;
 mod paths;
@@ -280,6 +282,13 @@ enum ChatCmd {
     Rm { space: String, id: String },
     /// Stop a chat started from the hub in a Remote Control space.
     Stop { space: String, id: String },
+    /// Type a message into a chat the hub runs, and send it (as the chat
+    /// page does). Not while Claude asks a question.
+    Send {
+        space: String,
+        id: String,
+        text: String,
+    },
     /// Start a new chat. A one-conversation space (single mode, Remote
     /// Control off) restarts into it; a Remote Control space runs it in a
     /// window of its own, shown in the Claude app.
@@ -568,6 +577,7 @@ fn run(cli: Cli) -> Result<()> {
             ChatCmd::Ls { space } => s::chat_ls(&space),
             ChatCmd::Rm { space, id } => s::chat_rm(&space, &id),
             ChatCmd::Stop { space, id } => s::chat_stop(&space, &id),
+            ChatCmd::Send { space, id, text } => s::chat_send(&space, &id, &text),
             ChatCmd::New { space, name } => s::chat_open(&space, None, name.as_deref()),
             ChatCmd::Open { space, id } => s::chat_open(&space, Some(&id), None),
         },
@@ -838,6 +848,7 @@ mod tests {
             ("chat_list", &["chat", "ls"]),
             ("chat_rm", &["chat", "rm"]),
             ("chat_stop", &["chat", "stop"]),
+            ("chat_send", &["chat", "send"]),
             ("space_remote", &["remote"]),
             ("update_check", &["update"]),
             ("update", &["update"]),
@@ -871,6 +882,10 @@ mod tests {
             "session_end",
             "session_end_others",
             "chat_unlock",
+            "chat_feed",
+            "chat_commands",
+            "chat_upload",
+            "chat_key",
         ];
         for (op, path) in table {
             assert!(has(path), "{op}: missing thorn {}", path.join(" "));

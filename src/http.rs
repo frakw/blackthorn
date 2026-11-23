@@ -15,6 +15,8 @@ use std::time::Duration;
 const MAX_HEAD: usize = 16 * 1024;
 const MAX_HEADERS: usize = 64;
 const MAX_BODY: usize = 64 * 1024;
+/// A file for a chat (base64, in a form) may be this big.
+const MAX_UPLOAD_BODY: usize = 16 << 20;
 const MAX_CONNECTIONS: usize = 64;
 const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -153,7 +155,7 @@ fn exchange<S: Read + Write, F: Fn(Request) -> Response>(
 }
 
 pub fn read_request<R: Read>(r: BufReader<R>, remote: IpAddr) -> Result<Request> {
-    let mut r = r.take((MAX_HEAD + MAX_BODY) as u64);
+    let mut r = r.take((MAX_HEAD + MAX_UPLOAD_BODY) as u64);
     let mut head_len = 0;
     let mut line = String::new();
     let mut next_line = |r: &mut std::io::Take<BufReader<R>>, line: &mut String| -> Result<()> {
@@ -207,7 +209,17 @@ pub fn read_request<R: Read>(r: BufReader<R>, remote: IpAddr) -> Result<Request>
         Some((_, v)) => v.parse().context("bad content-length")?,
         None => 0,
     };
-    if len > MAX_BODY {
+    let max = if target
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .ends_with("/chat-upload")
+    {
+        MAX_UPLOAD_BODY
+    } else {
+        MAX_BODY
+    };
+    if len > max {
         bail!("body too large");
     }
     let mut body = vec![0u8; len];
