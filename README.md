@@ -275,7 +275,8 @@ restores the old settings at any time.
 | `thorn login SPACE` | Sign a Claude space in, then start it |
 | `thorn start\|stop\|restart SPACE... \| --all` | Control spaces |
 | `thorn access SPACE user\|read-only` | A space's usual login on its machine; applies at once |
-| `thorn root SPACE [--for 8h \| --forever \| --off]` | Give a space root for a time (at most 72h) or until taken back; take it back |
+| `thorn root SPACE [--for 8h \| --forever \| --ask \| --off]` | Give a space root for a time (at most 72h), until taken back, or on approval; take it back |
+| `thorn approvals [--all]` / `thorn approve ID` / `thorn deny ID [--reason R]` | Root commands spaces with root on approval asked for |
 | `thorn log SPACE [-n 50]` | The commands a space ran (recorded by root) |
 | `thorn attach SPACE` | Open the space's terminal |
 | `thorn screen SPACE` / `thorn send SPACE TEXT` | Read or type into the terminal without attaching |
@@ -373,6 +374,18 @@ Then each space gets, with keys of its own (`from="<hub>",restrict`):
   a time, the machine also takes root back by itself, even if the hub
   cannot reach it then. What root did meanwhile (packages, configuration,
   timers) stays: the system log has every command.
+
+**Root on approval** is the careful way to give root: the space logs in
+as its user, and may use sudo for one program alone, `blackthorn-ask`. It
+asks with the whole command (and any script on its standard input, up to
+1 MB); the ask waits on the machine; the hub, which keeps an SSH
+connection open to it (the machine never connects back), shows it under
+*Approvals*, on the chat's page, and in a notification. What you approve
+runs as root exactly as it was shown; what you refuse, or leave for 10
+minutes, does not. Signs worth a second look (a downloaded script, decoded
+text, `rm -rf`, keys) are pointed out, not refused. Deciding needs a browser
+unlocked as for typing into chats, and *manage* on the space; every ask
+and decision goes to the space's log.
 
 A space has a usual login, user or read-only, and root on top for a time.
 Change either at once, on the space's page or with `thorn access` and
