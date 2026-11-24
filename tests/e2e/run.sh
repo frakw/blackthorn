@@ -674,6 +674,10 @@ say "a new chat with a name"
 thorn chat new t2-claude --name "disk check" >/dev/null
 sleep 3
 hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args" | grep -Eq -- "--name [0-9a-f]{8} disk check" && ok "the new chat starts with the id's start and its name" || fail "chat name: $(hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args")"
+web_get /chats | grep -q 'href="/space/t2-claude/chat/' && ok "the Chats page lists chats, with their space" || fail "chats page: $(web_get /chats | head -c 600)"
+web_get /chats | grep -q 'action="/chats"' && ok "and starts new ones" || fail "no new chat form"
+r=$(admin curl -s -o /dev/null -w '%{redirect_url}' -b /tmp/jar "http://$HUB:7180/bridges")
+case "$r" in *"/spaces#bridges") ok "bridges moved to the Spaces page";; *) fail "bridges redirect: $r";; esac
 
 echo "   waiting for t1-dev's root to run out (tick runs every minute)..."
 for _ in $(seq 75); do docker exec "$P-t1" test -e "/etc/sudoers.d/bt-$kd-root" || break; sleep 2; done

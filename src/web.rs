@@ -558,7 +558,16 @@ fn route(
         ("GET", ["account"]) => account_page(&c, &flash),
         ("POST", ["account", action]) => account_post(&c, action, form),
 
-        ("GET", ["bridges"]) => bridges_page(&c, &flash),
+        ("GET", ["bridges"]) => Reply::Redirect("/spaces#bridges".into(), None),
+        ("GET", ["chats"]) => chats_page(&c, &flash),
+        ("POST", ["chats"]) => {
+            let space = f(form, "space").to_string();
+            if space.is_empty() {
+                back("/chats", Err("choose a space".into()))
+            } else {
+                space_post(&c, &space, "chat-new", form)
+            }
+        }
         ("POST", ["bridges"]) => {
             let from = f(form, "from").to_string();
             let r = get::<serde_json::Value>(
@@ -573,7 +582,7 @@ fn route(
             let to = f(form, "back");
             let local = to.starts_with('/') && !to.starts_with("//") && !to.contains('\\');
             back(
-                if local { to } else { "/bridges" },
+                if local { to } else { "/spaces#bridges" },
                 r.map(|_| format!("bridge up from {from}")),
             )
         }
@@ -585,7 +594,7 @@ fn route(
                     to: f(form, "to").into(),
                 },
             );
-            back("/bridges", r.map(|_| "bridge removed".into()))
+            back("/spaces#bridges", r.map(|_| "bridge removed".into()))
         }
         _ => Reply::Html(
             404,
@@ -608,18 +617,17 @@ struct Flash {
 
 const MENU: &[(&str, &str)] = &[
     ("/", "Map"),
-    ("/spaces", "Spaces"),
     ("/hosts", "Machines"),
-    ("/bridges", "Bridges"),
-    ("/settings", "Settings"),
+    ("/spaces", "Spaces"),
+    ("/chats", "Chats"),
 ];
 
 /// Which menu entry a page belongs to.
 fn section(path: &str) -> &'static str {
     match path.trim_start_matches('/').split('/').next().unwrap_or("") {
-        "spaces" | "space" => "/spaces",
+        "spaces" | "space" | "bridges" => "/spaces",
+        "chats" => "/chats",
         "hosts" | "host" => "/hosts",
-        "bridges" => "/bridges",
         "settings" | "update" => "/settings",
         "account" => "/account",
         "approvals" => "/approvals",
@@ -646,7 +654,7 @@ fn page_with(c: &Ctx, title: &str, body: &str, flash: &Flash, head: &str) -> Str
         let here = section(&c.path);
         let links: String = MENU
             .iter()
-            .filter(|(href, _)| c.admin || matches!(*href, "/" | "/spaces"))
+            .filter(|(href, _)| c.admin || matches!(*href, "/" | "/spaces" | "/chats"))
             .map(|(href, label)| {
                 format!(
                     "<a href=\"{href}\"{}>{label}</a>",
@@ -676,8 +684,20 @@ fn page_with(c: &Ctx, title: &str, body: &str, flash: &Flash, head: &str) -> Str
             }
         );
         format!(
-            "<nav class=\"menu\">{links}</nav><div class=\"me\"><a href=\"/account\"{}>{}</a>\
+            "<nav class=\"menu\">{links}</nav><div class=\"me\">{}<a href=\"/account\"{}>{}</a>\
              <form method=\"post\" action=\"/logout\" class=\"inline\">{}<button class=\"link\">Log out</button></form></div>",
+            if c.admin {
+                format!(
+                    "<a href=\"/settings\"{}>Settings</a>",
+                    if here == "/settings" {
+                        " class=\"on\" aria-current=\"page\""
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                String::new()
+            },
             if here == "/account" { " class=\"on\"" } else { "" },
             esc(&c.user),
             csrf(c)
@@ -1237,6 +1257,7 @@ fn spaces_page(c: &Ctx, flash: &Flash) -> Reply {
         }
         b.push_str("</div>");
     }
+    b.push_str(&bridges_section(c, &o));
     Reply::Html(200, page(c, "Spaces", &b, flash))
 }
 
@@ -3863,13 +3884,10 @@ fn settings_post(c: &Ctx, form: &HashMap<String, String>) -> Reply {
     )
 }
 
-fn bridges_page(c: &Ctx, flash: &Flash) -> Reply {
-    let o = match overview_or_error(c, "Bridges", flash) {
-        Ok(o) => o,
-        Err(r) => return r,
-    };
+/// The bridges, and opening one: the lower half of the Spaces page.
+fn bridges_section(c: &Ctx, o: &Overview) -> String {
     let mut b = String::from(
-        "<h1>Bridges</h1><p class=\"hint\">A bridge lets one space reach another space's machine for a while. It is \
+        "<h2 id=\"bridges\">Bridges</h2><p class=\"hint\">A bridge lets one space reach another space's machine for a while. It is \
          one-way: the other space gains nothing. While it lasts, the two machines are one trust zone for the \
          bridged space.</p>",
     );
@@ -3923,7 +3941,95 @@ fn bridges_page(c: &Ctx, flash: &Flash) -> Reply {
             code_field()
         ));
     }
-    Reply::Html(200, page(c, "Bridges", &b, flash))
+    b
+}
+
+/// Every chat of the spaces the account may see: newest first, each with
+/// its space and machine; and a new one, in a space you choose.
+fn chats_page(c: &Ctx, flash: &Flash) -> Reply {
+    let o = match overview_or_error(c, "Chats", flash) {
+        Ok(o) => o,
+        Err(r) => return r,
+    };
+    let claude: Vec<&SpaceView> = o
+        .spaces
+        .iter()
+        .filter(|s| s.agent == crate::config::CLAUDE)
+        .collect();
+    let mut rows: Vec<(&SpaceView, ops::Chat)> = Vec::new();
+    let mut errors = String::new();
+    for s in &claude {
+        match get::<Vec<ops::Chat>>(
+            c,
+            Op::ChatList {
+                name: s.name.clone(),
+            },
+        ) {
+            Ok(v) => rows.extend(v.into_iter().map(|ch| (*s, ch))),
+            Err(e) => errors.push_str(&format!(
+                "<p class=\"t-bad\">{}: {}</p>",
+                esc(&s.name),
+                esc(&e)
+            )),
+        }
+    }
+    rows.sort_by(|a, b| b.1.modified.cmp(&a.1.modified));
+    let mut b = String::from("<h1>Chats</h1>");
+    let usable: String = claude
+        .iter()
+        .filter(|s| s.level.map_or(true, |l| l >= crate::state::Level::Use))
+        .map(|s| {
+            format!(
+                "<option value=\"{}\">{} (on {})</option>",
+                esc(&s.name),
+                esc(&s.name),
+                esc(&s.host)
+            )
+        })
+        .collect();
+    if usable.is_empty() {
+        b.push_str("<p class=\"hint\">No space here can have chats yet: make a Claude space under <a href=\"/spaces\">Spaces</a>.</p>");
+    } else {
+        b.push_str(&format!(
+            "<details class=\"card add\"{}><summary>+ New chat</summary><form method=\"post\" action=\"/chats\" class=\"stack\">{}\
+             <div class=\"fields\"><label>Space <select name=\"space\" required>{usable}</select></label>\
+             <label>Name <input name=\"title\" maxlength=\"80\" placeholder=\"what it is for\"></label></div>\
+             <div><button class=\"primary\">Start chat</button></div></form></details>",
+            if rows.is_empty() { " open" } else { "" },
+            csrf(c)
+        ));
+    }
+    b.push_str(&errors);
+    if rows.is_empty() {
+        b.push_str("<p>No chats yet.</p>");
+    } else {
+        b.push_str("<div class=\"items\">");
+        for (s, ch) in &rows {
+            let title = if ch.title.is_empty() {
+                "(no name yet)".to_string()
+            } else {
+                ch.title.clone()
+            };
+            b.push_str(&format!(
+                "<article class=\"item\"><div class=\"item-head\"><span class=\"dot {}\"></span>\
+                 <a class=\"item-name\" href=\"/space/{}/chat/{}\">{}</a></div>\
+                 <p class=\"item-meta\">on <a href=\"/host/{}\">{}</a> · space <a href=\"/space/{}\">{}</a> · {} · \
+                 last written {}</p></article>",
+                if ch.running { "ok" } else { "idle" },
+                url_encode(&s.name),
+                url_encode(&ch.id),
+                esc(&title),
+                url_encode(&s.host),
+                esc(&s.host),
+                url_encode(&s.name),
+                esc(&s.name),
+                if ch.running { "running" } else { "not running" },
+                when(ch.modified)
+            ));
+        }
+        b.push_str("</div>");
+    }
+    Reply::Html(200, page(c, "Chats", &b, flash))
 }
 
 #[cfg(test)]
