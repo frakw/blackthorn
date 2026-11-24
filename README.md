@@ -5,7 +5,7 @@ coding agents live. They keep running there, you reach them from your phone
 or laptop, and each one can work on exactly one of your machines, over SSH,
 one way only.
 
-Status: **early (v0.11)**. It works and is tested end to end, but expect
+Status: **early (v0.12)**. It works and is tested end to end, but expect
 changes. Read [THREAT_MODEL.md](THREAT_MODEL.md) before trusting it with
 anything important.
 
