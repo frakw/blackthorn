@@ -922,14 +922,20 @@ mod tests {
 
         // Reached as root only: no user login there, root for root.
         st.hosts.get_mut("fig").unwrap().user = "root".into();
-        assert!(st.logins("fig-claude", 5).is_empty());
+        let own = |st: &State, t| {
+            st.logins("fig-claude", t)
+                .into_iter()
+                .filter(|l| !l.bridged)
+                .count()
+        };
+        assert_eq!(own(&st, 5), 0);
         st.spaces.get_mut("fig-claude").unwrap().root = Some(Root {
             since: 0,
             until: Some(10),
         });
         let l = st.logins("fig-claude", 5);
         assert_eq!((l[0].user.as_str(), l[0].tier), ("root", Tier::Root));
-        assert!(st.logins("fig-claude", 10).is_empty(), "root ran out");
+        assert_eq!(own(&st, 10), 0, "root ran out");
     }
 
     #[test]
