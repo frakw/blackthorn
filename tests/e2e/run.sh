@@ -608,6 +608,38 @@ got=$(hub env SSH_AUTH_SOCK="/run/blackthorn-agent/$kr/agent.sock" ssh-add -L | 
 if hub runuser -u "bt-$kr" -- ssh -l "bt-$kr" t1 true 2>/dev/null; then fail "a read-only space logged in as its user login"; else ok "it cannot log in as its user login"; fi
 if hub runuser -u "bt-$kr" -- ssh t1 'touch /root/x' 2>/dev/null; then fail "the read-only space wrote as root"; else ok "it cannot write where root can"; fi
 
+say "root on approval"
+thorn new t1 --name t1-ask --root ask >/dev/null
+ka=$(key_of t1-ask)
+echo good-code | thorni login t1-ask >/dev/null
+docker exec "$P-t1" grep -q "NOPASSWD: /usr/local/libexec/blackthorn-ask" "/etc/sudoers.d/bt-$ka-root" && ok "its sudo is for blackthorn-ask alone" || fail "ask sudo rule: $(docker exec "$P-t1" cat "/etc/sudoers.d/bt-$ka-root" 2>&1)"
+if hub runuser -u "bt-$ka" -- ssh t1 'sudo -n id -u' 2>/dev/null; then fail "plain sudo works"; else ok "plain sudo does not"; fi
+hub grep -q "blackthorn-ask" "/var/lib/blackthorn/spaces/$ka/t1-ask/CLAUDE.md" && ok "its instructions say how to ask" || fail "ask CLAUDE.md"
+ask_id() { local id=""; for _ in $(seq 40); do id=$(thorn approvals | awk -v w="$1" 'index($0, w) {print prev; exit} {prev=$1}'); [ -n "$id" ] && break; sleep 1; done; echo "$id"; }
+docker exec -d "$P-hub" sh -c "runuser -u bt-$ka -- ssh t1 \"sudo -n blackthorn-ask 'id -u >/tmp/asked; echo hi-from-root'\" >/tmp/ask1.out 2>&1; echo \$? >/tmp/ask1.rc"
+id1=$(ask_id "id -u >/tmp/asked")
+[ -n "$id1" ] && ok "the hub sees the ask, with its command" || fail "no ask: $(thorn approvals)"
+web_get /approvals | grep -q "$id1" && ok "on the Approvals page" || fail "approvals page"
+web_get / | grep -q 'class="count">1<' && ok "the menu counts it" || fail "approvals count"
+thorn approve "$id1" | grep -q "approved" && ok "thorn approve" || fail "approve"
+for _ in $(seq 20); do hub test -s /tmp/ask1.rc && break; sleep 1; done
+[ "$(hub cat /tmp/ask1.rc 2>/dev/null)" = 0 ] && hub grep -q hi-from-root /tmp/ask1.out && ok "it ran, and its output came back" || fail "ask 1: rc $(hub cat /tmp/ask1.rc 2>&1), $(hub cat /tmp/ask1.out 2>&1)"
+[ "$(docker exec "$P-t1" cat /tmp/asked 2>/dev/null)" = 0 ] && ok "as root" || fail "not root"
+docker exec -d "$P-hub" sh -c "runuser -u bt-$ka -- ssh t1 \"sudo -n blackthorn-ask 'touch /root/nope'\" >/tmp/ask2.out 2>&1; echo \$? >/tmp/ask2.rc"
+id2=$(ask_id "touch /root/nope")
+thorn deny "$id2" --reason "not now" | grep -q "refused" && ok "thorn deny" || fail "deny: $id2"
+for _ in $(seq 20); do hub test -s /tmp/ask2.rc && break; sleep 1; done
+[ "$(hub cat /tmp/ask2.rc 2>/dev/null)" = 77 ] && hub grep -q "not now" /tmp/ask2.out && ok "a refused ask exits 77, with the reason" || fail "ask 2: rc $(hub cat /tmp/ask2.rc 2>&1), $(hub cat /tmp/ask2.out 2>&1)"
+docker exec "$P-t1" test -e /root/nope && fail "a refused command ran" || ok "and did not run"
+docker exec -d "$P-hub" sh -c "printf 'echo from-a-script\n' | runuser -u bt-$ka -- ssh t1 \"sudo -n blackthorn-ask 'sh -s'\" >/tmp/ask3.out 2>&1; echo \$? >/tmp/ask3.rc"
+id3=$(ask_id "sh -s")
+thorn approvals | grep -q "| echo from-a-script" && ok "a script on standard input is shown with the ask" || fail "stdin not shown: $(thorn approvals)"
+thorn approve "$id3" >/dev/null
+for _ in $(seq 20); do hub test -s /tmp/ask3.rc && break; sleep 1; done
+hub grep -q from-a-script /tmp/ask3.out && ok "and runs as it was shown" || fail "ask 3: $(hub cat /tmp/ask3.out 2>&1)"
+thorn log t1-ask | grep -q "asked for root" && thorn log t1-ask | grep -q "refused root" && ok "the space's log has the asks and who decided" || fail "ask log: $(thorn log t1-ask)"
+thorn rm t1-ask --purge >/dev/null
+
 # The web: going up takes a code, going down does not.
 web_post /login --data-urlencode "user=frakw" --data-urlencode "password=$PASSWORD" --data-urlencode "code=$(fresh_code $WEB_SECRET)" >/dev/null
 C=$(csrf)
