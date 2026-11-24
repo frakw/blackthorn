@@ -580,7 +580,7 @@ if hub runuser -u "bt-$k1" -- ssh t1 'touch /etc/x' 2>/dev/null; then fail "a us
 hub grep -q "/srv/t1-main" "/var/lib/blackthorn/spaces/$k1/ops-box/CLAUDE.md" && ok "its instructions point to its folder" || fail "CLAUDE.md srv: $(hub ls /var/lib/blackthorn/spaces/$k1)"
 
 out=$(thorn new t1 --name t1-dev 2>&1)
-echo "$out" | grep -q "logs in as root" && ok "a new space has root by default" || fail "default root: $out"
+echo "$out" | grep -q "logs in as root" && ok "a new space has root by default" || fail "default root: $(echo "$out" | tr '\n' '|')"
 echo "$out" | grep -q "UTC, then logs in as user" && ok "for a time, then user" || fail "default root time: $out"
 kd=$(key_of t1-dev)
 echo good-code | thorni login t1-dev >/dev/null

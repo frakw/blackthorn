@@ -852,7 +852,7 @@ pub fn space_new(o: NewSpace) -> Result<NewDone> {
     if h.setup.is_some() {
         match crate::logins::make_accounts(&o.host) {
             Ok((_, waiting)) if waiting.contains(&name) => notes.push(format!(
-                "its logins on {} are not made yet (it could not be reached); blackthorn                  keeps trying",
+                "its logins on {} are not made yet (it could not be reached); blackthorn keeps trying",
                 o.host
             )),
             Ok(_) => {
