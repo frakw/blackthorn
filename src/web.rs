@@ -3973,7 +3973,7 @@ fn chats_page(c: &Ctx, flash: &Flash) -> Reply {
             )),
         }
     }
-    rows.sort_by(|a, b| b.1.modified.cmp(&a.1.modified));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1.modified));
     let mut b = String::from("<h1>Chats</h1>");
     let usable: String = claude
         .iter()
