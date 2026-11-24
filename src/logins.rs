@@ -171,7 +171,21 @@ sd() { [ -d /run/systemd/system ] && have "$1"; }
 apt_install() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$@" >/dev/null </dev/null 2>&1 && return 0
   apt-get update -q >/dev/null </dev/null 2>&1 || true
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$@" >/dev/null </dev/null
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$@" >/dev/null </dev/null 2>&1 && return 0
+  # A mirror can list a version it no longer has: Debian 11's security
+  # archive, after its end, still names sudo 1.9.5p2-3+deb11u4 but has
+  # dropped the file. Try each package's other versions, newest first.
+  for _pkg in "$@"; do
+    dpkg-query -W -f='${Status}' "$_pkg" 2>/dev/null | grep -q 'ok installed' && continue
+    _ok=
+    for _ver in $(apt-cache madison "$_pkg" 2>/dev/null | awk -F'|' '{ gsub(/ /, "", $2); if (!seen[$2]++) print $2 }'); do
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$_pkg=$_ver" >/dev/null </dev/null 2>&1 && { _ok=1; break; }
+    done
+    if [ -z "$_ok" ]; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$_pkg" >/dev/null </dev/null
+      return 1
+    fi
+  done
 }
 home_of() { awk -F: -v u="$1" '$1 == u { print $6 }' /etc/passwd; }
 comment_of() { awk -F: -v u="$1" '$1 == u { print $5 }' /etc/passwd; }

@@ -1157,7 +1157,7 @@ fn root_select(default: &str, ask: bool) -> String {
     format!(
         "<label>For <select name=\"root_for\">{o}<option value=\"custom\">custom…</option>\
          <option value=\"forever\">until taken back</option>{ask}</select></label>\
-         <label>Custom: hours (1–72) <input name=\"root_hours\" type=\"number\" min=\"1\" max=\"72\" \
+         <label class=\"root-hours\">Custom: hours (1–72) <input name=\"root_hours\" type=\"number\" min=\"1\" max=\"72\" \
          step=\"1\" placeholder=\"36\"></label>"
     )
 }

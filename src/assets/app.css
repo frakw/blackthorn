@@ -475,3 +475,7 @@ fieldset.login-pick .sub { margin-left: 1.6rem; }
 .menu .count { display: inline-block; min-width: 1.2em; padding: 0 0.35em; border-radius: 999px; background: var(--admin); color: #fff; font-size: 0.8em; text-align: center; }
 .item.ask pre.code { white-space: pre-wrap; word-break: break-word; max-height: 24rem; overflow: auto; }
 .item.ask ul.flags { margin: 0.4rem 0; padding-left: 1.2rem; }
+
+/* The custom hours field shows only when "custom…" is chosen. */
+.root-hours { display: none; }
+label:has(option[value="custom"]:checked) + .root-hours { display: flex; }
