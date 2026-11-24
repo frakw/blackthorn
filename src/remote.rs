@@ -9,7 +9,6 @@
 //! the machine's system log before running it, where a space cannot erase
 //! it (the read-only user cannot; the admin login is root and could).
 
-use crate::paths;
 use crate::state::Host;
 use anyhow::{Context, Result};
 use std::io::Write;

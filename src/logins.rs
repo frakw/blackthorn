@@ -696,6 +696,22 @@ pub fn make_accounts(name: &str) -> Result<(Vec<String>, Vec<String>)> {
         match make_one(&cfg, name, &h, &key, full, &space) {
             Ok(r) => {
                 report.extend(r.into_iter().map(|l| format!("{space}: {l}")));
+                // Root it already has (given before its logins were made, or
+                // before v0.12): now on the machine too.
+                let now = crate::state::now();
+                let root = state
+                    .spaces
+                    .get(&space)
+                    .and_then(|s| s.root.clone())
+                    .filter(|r| full && r.active(now));
+                if let Some(r) = root {
+                    match root_script(&key, r.until.map(|u| u.saturating_sub(now)))
+                        .and_then(|sc| run(name, &h, &sc))
+                    {
+                        Ok(_) => report.push(format!("{space}: root, as it had")),
+                        Err(e) => report.push(format!("{space}: root not given: {e:#}")),
+                    }
+                }
                 let mut ctx = Ctx::open()?;
                 if let Some(x) = ctx.state.hosts.get_mut(name) {
                     x.accounts.insert(
