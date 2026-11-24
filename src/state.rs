@@ -81,6 +81,10 @@ pub struct Host {
     /// setup`). None: its spaces use the machine's own logins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup: Option<u64>,
+    /// Which version of the setup it has (`logins::SETUP_VERSION`); older
+    /// ones are set up again.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub setup_version: u32,
     /// Whether the setup found rootless Docker possible there.
     #[serde(default, skip_serializing_if = "is_false")]
     pub rootless_docker: bool,
@@ -147,6 +151,10 @@ pub struct Problem {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// What an account may do with a space. Hub admins may do everything.
@@ -255,6 +263,10 @@ pub struct Root {
     pub since: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until: Option<u64>,
+    /// Root on approval: it logs in as its user login, and each command it
+    /// wants run as root waits for someone to approve it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ask: bool,
 }
 
 impl Root {
@@ -350,11 +362,16 @@ pub struct Space {
 impl Space {
     /// How far it goes on its machine now.
     pub fn tier(&self, now: u64) -> Tier {
-        if self.root.as_ref().is_some_and(|r| r.active(now)) {
-            Tier::Root
-        } else {
-            self.access.tier()
+        match &self.root {
+            Some(r) if r.active(now) && r.ask => Tier::User,
+            Some(r) if r.active(now) => Tier::Root,
+            _ => self.access.tier(),
         }
+    }
+
+    /// Asks for each root command now (root on approval).
+    pub fn asks(&self, now: u64) -> bool {
+        self.root.as_ref().is_some_and(|r| r.active(now) && r.ask)
     }
 
     /// How far `user` may go with this space (`admin`: a hub admin).
@@ -468,6 +485,7 @@ impl State {
                     s.root = Some(Root {
                         since: s.created,
                         until: Some(u),
+                        ask: false,
                     });
                 }
             } else {
@@ -476,6 +494,7 @@ impl State {
                     s.root = Some(Root {
                         since: s.created,
                         until: None,
+                        ask: false,
                     });
                 }
             }
@@ -766,6 +785,7 @@ mod tests {
             block,
             readonly: None,
             setup: None,
+            setup_version: 0,
             rootless_docker: false,
             accounts: BTreeMap::new(),
             pending: Vec::new(),
@@ -932,6 +952,7 @@ mod tests {
         st.spaces.get_mut("fig-claude").unwrap().root = Some(Root {
             since: 0,
             until: Some(10),
+            ask: false,
         });
         let l = st.logins("fig-claude", 5);
         assert_eq!((l[0].user.as_str(), l[0].tier), ("root", Tier::Root));
@@ -986,6 +1007,7 @@ mod tests {
         st.spaces.get_mut("fig-claude").unwrap().root = Some(Root {
             since: 0,
             until: None,
+            ask: false,
         });
         let l = st.logins("fig-claude", 5);
         assert_eq!(

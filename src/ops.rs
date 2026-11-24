@@ -675,24 +675,42 @@ pub fn logged_in(s: &Space) -> bool {
 pub const ROOT_MAX: u64 = 72 * 3600;
 pub const ROOT_DEFAULT: u64 = 8 * 3600;
 
-/// "8h" (at most 72 hours), "forever", or "no"/"off": Some(Some(secs)),
-/// Some(None), None.
-pub fn parse_root(v: &str) -> Result<Option<Option<u64>>> {
+/// Root to give: for a time (`secs`) or until taken back, and whether each
+/// command waits for approval (`ask`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Grant {
+    pub secs: Option<u64>,
+    pub ask: bool,
+}
+
+/// "8h" (at most 72 hours), "forever", "ask" (root on approval), or
+/// "no"/"off" (None).
+pub fn parse_root(v: &str) -> Result<Option<Grant>> {
     match v.trim() {
         "no" | "off" | "none" | "" => Ok(None),
-        "forever" | "always" | "until-revoked" => Ok(Some(None)),
+        "forever" | "always" | "until-revoked" => Ok(Some(Grant {
+            secs: None,
+            ask: false,
+        })),
+        "ask" | "on-approval" | "approval" => Ok(Some(Grant {
+            secs: None,
+            ask: true,
+        })),
         d => {
             let secs = parse_duration(d)?;
             if !(60..=ROOT_MAX).contains(&secs) {
                 bail!("root is given for 1 minute to 72 hours at a time, or forever");
             }
-            Ok(Some(Some(secs)))
+            Ok(Some(Grant {
+                secs: Some(secs),
+                ask: false,
+            }))
         }
     }
 }
 
 /// A space's usual login and root, by default, on a machine.
-fn default_logins(h: &Host) -> (Access, Option<Option<u64>>) {
+fn default_logins(h: &Host) -> (Access, Option<Grant>) {
     let tiers = h.tiers();
     let access = if tiers.contains(&Tier::User) {
         Access::User
@@ -703,9 +721,15 @@ fn default_logins(h: &Host) -> (Access, Option<Option<u64>>) {
         Access::Readonly
     };
     let root = if h.setup.is_some() {
-        Some(Some(ROOT_DEFAULT))
+        Some(Grant {
+            secs: Some(ROOT_DEFAULT),
+            ask: false,
+        })
     } else if h.root_login() {
-        Some(None)
+        Some(Grant {
+            secs: None,
+            ask: false,
+        })
     } else {
         None
     };
@@ -763,6 +787,15 @@ pub fn space_new(o: NewSpace) -> Result<NewDone> {
         Some(r) => parse_root(r)?,
         None => default_root,
     };
+    if root.is_some_and(|g| g.ask)
+        && (h.setup.is_none() || h.setup_version < crate::logins::SETUP_VERSION)
+    {
+        bail!(
+            "root on approval needs {} set up for it (thorn host setup {})",
+            o.host,
+            o.host
+        );
+    }
     if root.is_some() && !tiers.contains(&Tier::Root) {
         bail!(
             "blackthorn reaches {} as {}, not root, so it has no root to give",
@@ -832,9 +865,10 @@ pub fn space_new(o: NewSpace) -> Result<NewDone> {
         access,
         // On a machine not set up, root is only the state's to give.
         root: match root {
-            Some(until) if h.setup.is_none() => Some(crate::state::Root {
+            Some(g) if h.setup.is_none() && !g.ask => Some(crate::state::Root {
                 since: ctx.now,
-                until: until.map(|s| ctx.now + s),
+                until: g.secs.map(|s| ctx.now + s),
+                ask: false,
             }),
             _ => None,
         },
@@ -856,8 +890,8 @@ pub fn space_new(o: NewSpace) -> Result<NewDone> {
                 o.host
             )),
             Ok(_) => {
-                if let Some(until) = root {
-                    if let Err(e) = crate::logins::grant(&name, until.map(|s| now + s)) {
+                if let Some(g) = root {
+                    if let Err(e) = crate::logins::grant(&name, g.secs.map(|s| now + s), g.ask) {
                         notes.push(format!("root was not given: {e:#}"));
                     }
                 }
@@ -1204,12 +1238,12 @@ pub fn space_login(name: &str, access: Access) -> Result<String> {
     Ok(format!("{name} now logs in as {access} on {}", s.host))
 }
 
-/// Gives a space root on its machine (`Some(secs)`: for that long; `None`:
-/// until taken back), or takes it back (`off`). Returns what happened.
-pub fn space_root(name: &str, root: Option<Option<u64>>) -> Result<String> {
+/// Gives a space root on its machine (for a time, until taken back, or on
+/// approval), or (None) takes it back. Returns what happened.
+pub fn space_root(name: &str, root: Option<Grant>) -> Result<String> {
     let (_, state) = ctx::read_only()?;
     let s = state.space(name)?.clone();
-    let Some(secs) = root else {
+    let Some(Grant { secs, ask }) = root else {
         return Ok(if crate::logins::revoke(name)? {
             format!("{name} has no root on {} any more", s.host)
         } else {
@@ -1222,7 +1256,14 @@ pub fn space_root(name: &str, root: Option<Option<u64>>) -> Result<String> {
         }
     }
     let t = now();
-    crate::logins::grant(name, secs.map(|x| t + x))?;
+    crate::logins::grant(name, secs.map(|x| t + x), ask)?;
+    if ask {
+        return Ok(format!(
+            "{name} logs in to {} as its user; each command it wants as root waits for your \
+             approval (Approvals, or thorn approvals)",
+            s.host
+        ));
+    }
     let beside: Vec<&str> = state
         .spaces
         .iter()
@@ -2545,6 +2586,7 @@ pub fn host_add(
             block: None,
             readonly: None,
             setup: None,
+            setup_version: 0,
             rootless_docker: false,
             accounts: Default::default(),
             pending: Vec::new(),
@@ -3118,6 +3160,7 @@ mod tests {
                 block: None,
                 readonly: None,
                 setup: None,
+                setup_version: 0,
                 rootless_docker: false,
                 accounts: Default::default(),
                 pending: Vec::new(),

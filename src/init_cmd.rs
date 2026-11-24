@@ -126,6 +126,9 @@ pub fn init(opts: InitOpts) -> Result<()> {
         apply::everything(&cfg, &state, now())?;
     }
     sys::systemctl(&["enable", "--now", units::FIREWALL, units::TICK_TIMER])?;
+    // Restarted, so an update runs the new program.
+    sys::systemctl(&["enable", units::ASKS])?;
+    sys::systemctl(&["restart", units::ASKS])?;
 
     // Who may administer the hub, asked while someone is at the terminal
     // and nobody is listed yet.

@@ -29,6 +29,137 @@ export DOCKER_HOST="unix:///run/user/$u/docker.sock" XDG_RUNTIME_DIR="/run/user/
 exec docker "$@"
 "#;
 
+/// What a space with root on approval runs through sudo to ask for a
+/// command as root (and what the hub runs, as root, to watch for asks).
+pub const ASK: &str = "/usr/local/libexec/blackthorn-ask";
+
+/// Where asks wait, root's alone.
+pub const ASK_SPOOL: &str = "/var/lib/blackthorn-ask";
+
+/// The version of the setup a machine gets; machines with an older one are
+/// set up again (2: blackthorn-ask).
+pub const SETUP_VERSION: u32 = 2;
+
+/// blackthorn-ask. Every removal names the spool's full path, so an empty
+/// id cannot widen it.
+const ASK_TEXT: &str = r#"#!/bin/sh
+# Installed by blackthorn (thorn host setup). A space with root on approval
+# runs, through sudo:   blackthorn-ask 'COMMAND'   (a script may come on
+# standard input). The command waits until someone approves it on the hub,
+# then runs as root, exactly as it was asked. Exit 75: still waiting (run
+# blackthorn-ask --wait ID to keep waiting); 77: not approved.
+# The hub (root, never a space) runs blackthorn-ask --watch to see asks.
+set -eu
+umask 077
+b64() { base64 | tr -d '\n'; }
+who=${SUDO_USER:-}
+forget() { case "$1" in [0-9a-f]*) rm -f /var/lib/blackthorn-ask/"$1".* ;; esac; }
+
+watch() {
+  [ "$(id -u)" = 0 ] || exit 2
+  case "$who" in bt-*) echo "blackthorn-ask: not for a space" >&2; exit 2 ;; esac
+  mkdir -p /var/lib/blackthorn-ask
+  chmod 700 /var/lib/blackthorn-ask
+  cd /var/lib/blackthorn-ask
+  seen=" "
+  n=0
+  while :; do
+    now=$(date +%s)
+    for r in *.req; do
+      [ -e "$r" ] || continue
+      id=${r%.req}
+      t=$(cat "$id.time" 2>/dev/null || echo 0)
+      case "$seen" in
+        *" $id "*) ;;
+        *)
+          printf 'REQ %s %s %s %s %s %s ' "$id" "$(cat "$id.user")" "$t" \
+            "$(b64 <"$id.cwd")" "$(b64 <"$id.cmd")" "$(wc -c <"$id.in" | tr -d ' ')"
+          b64 <"$id.in"
+          echo
+          seen="$seen$id "
+          ;;
+      esac
+      if [ ! -e "$id.ok" ] && [ ! -e "$id.no" ] && [ ! -e "$id.run" ] && [ $((now - t)) -gt 600 ]; then
+        echo "nobody approved it within 10 minutes" >"$id.no"
+        printf 'EXPIRED %s\n' "$id"
+      fi
+      if [ ! -e "$id.run" ] && [ $((now - t)) -gt 3600 ]; then forget "$id"; fi
+    done
+    for d in *.done; do
+      [ -e "$d" ] || continue
+      id=${d%.done}
+      printf 'DONE %s %s\n' "$id" "$(cat "$d")"
+      forget "$id"
+    done
+    n=$((n + 1))
+    [ $((n % 30)) != 0 ] || echo TICK
+    sleep 1
+  done
+}
+
+wait_for() {
+  id=$1
+  case "$id" in *[!0-9a-f]* | '') echo "blackthorn-ask: no such ask" >&2; exit 2 ;; esac
+  cd /var/lib/blackthorn-ask
+  [ -e "$id.req" ] && [ "$(cat "$id.user")" = "$who" ] || {
+    echo "blackthorn-ask: no such ask (or it is over)" >&2; exit 2; }
+  i=0
+  while [ $i -lt 110 ]; do
+    if mv "$id.ok" "$id.run" 2>/dev/null; then
+      cmd=$(cat "$id.cmd")
+      dir=$(cat "$id.cwd")
+      cd "$dir" 2>/dev/null || cd /
+      set +e
+      sh -c "$cmd" </var/lib/blackthorn-ask/"$id".in
+      rc=$?
+      set -e
+      echo "$rc" >/var/lib/blackthorn-ask/"$id".done
+      exit $rc
+    fi
+    if [ -e "$id.no" ]; then
+      echo "blackthorn-ask: not approved: $(cat "$id.no"). Do not try another way; ask the user." >&2
+      forget "$id"
+      exit 77
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  echo "blackthorn-ask: still waiting for approval; to keep waiting, run: sudo -n blackthorn-ask --wait $id" >&2
+  exit 75
+}
+
+case "${1:-}" in
+  --watch) watch ;;
+  --wait) wait_for "${2:-}" ;;
+  '' | -h | --help)
+    echo "usage: sudo -n blackthorn-ask 'COMMAND'  (a script may come on standard input)" >&2
+    exit 2 ;;
+esac
+case "$who" in bt-*) ;; *) echo "blackthorn-ask: only a space's login asks" >&2; exit 2 ;; esac
+mkdir -p /var/lib/blackthorn-ask
+chmod 700 /var/lib/blackthorn-ask
+dir=$(pwd)
+cd /var/lib/blackthorn-ask
+id=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+printf '%s' "$*" >"$id.cmd"
+printf '%s' "$who" >"$id.user"
+printf '%s' "$dir" >"$id.cwd"
+date +%s >"$id.time"
+if [ -t 0 ]; then
+  : >"$id.in"
+else
+  head -c 1048577 >"$id.in"
+  if [ "$(wc -c <"$id.in")" -gt 1048576 ]; then
+    forget "$id"
+    echo "blackthorn-ask: standard input is over 1 MB" >&2
+    exit 2
+  fi
+fi
+: >"$id.req"
+echo "blackthorn-ask: asked ($id); waiting for approval on the hub..." >&2
+wait_for "$id"
+"#;
+
 /// The shell functions every script starts with.
 const PRELUDE: &str = r#"set -eu
 [ "$(id -u)" = 0 ] || { echo "this needs root" >&2; exit 1; }
@@ -126,6 +257,12 @@ cat >{rdocker}.tmp <<'BLACKTHORN_RDOCKER'
 {rdocker_text}BLACKTHORN_RDOCKER
 chmod 755 {rdocker}.tmp
 mv -f {rdocker}.tmp {rdocker}
+cat >{ask}.tmp <<'BLACKTHORN_ASK'
+{ask_text}BLACKTHORN_ASK
+chmod 755 {ask}.tmp
+mv -f {ask}.tmp {ask}
+mkdir -p {spool}
+chmod 700 {spool}
 
 # 2. sudo: for the read-only Docker commands, and root when it is given.
 if ! have sudo; then
@@ -228,6 +365,9 @@ echo "bt: done"
         logger_text = remote::LOGGER,
         rdocker = RDOCKER,
         rdocker_text = RDOCKER_TEXT,
+        ask = ASK,
+        ask_text = ASK_TEXT,
+        spool = ASK_SPOOL,
         docker = docker.join(", "),
         rdocker_cmds = rdocker.join(", "),
         keys = paths::REMOTE_KEYS_DIR,
@@ -361,7 +501,13 @@ echo "bt: done"
 /// Gives a space root (sudo for anything) on its machine; with `secs`, the
 /// machine takes it back by itself then too, even if the hub cannot reach
 /// it at that time.
-pub fn root_script(key: &str, secs: Option<u64>) -> Result<String> {
+/// With `ask`: sudo only for blackthorn-ask (root on approval).
+pub fn root_script(key: &str, secs: Option<u64>, ask: bool) -> Result<String> {
+    let rule = if ask {
+        format!("$u ALL=(root) NOPASSWD: {ASK}")
+    } else {
+        "$u ALL=(ALL:ALL) NOPASSWD: ALL".to_string()
+    };
     Ok(format!(
         r#"#!/bin/sh
 # blackthorn: root for space {key}.
@@ -373,7 +519,7 @@ sudoers "bt-$k-root" <<EOF
 # Installed by blackthorn: space $k has root here, until blackthorn takes it
 # back (thorn root SPACE --off).
 Defaults:$u !requiretty, !lecture
-$u ALL=(ALL:ALL) NOPASSWD: ALL
+{rule}
 EOF
 if sd systemctl; then
   systemctl stop "blackthorn-unroot-$k.timer" "blackthorn-unroot-$k.service" 2>/dev/null || true
@@ -653,6 +799,7 @@ pub fn setup(name: &str, run_it: bool) -> Result<SetupDone> {
             .with_context(|| format!("{name} was removed meanwhile"))?;
         x.user = h.user.clone();
         x.setup = Some(ctx.now);
+        x.setup_version = SETUP_VERSION;
         x.rootless_docker = docker;
         x.problem = None;
         ctx.commit()?;
@@ -714,7 +861,7 @@ pub fn make_accounts(name: &str) -> Result<(Vec<String>, Vec<String>)> {
                     .and_then(|s| s.root.clone())
                     .filter(|r| full && r.active(now));
                 if let Some(r) = root {
-                    match root_script(&key, r.until.map(|u| u.saturating_sub(now)))
+                    match root_script(&key, r.until.map(|u| u.saturating_sub(now)), r.ask)
                         .and_then(|sc| run(name, &h, &sc))
                     {
                         Ok(_) => report.push(format!("{space}: root, as it had")),
@@ -800,10 +947,20 @@ fn drop_legacy(name: &str) -> Result<()> {
 
 /// Gives a space root on its machine (set up for it) until `until`, or
 /// until taken back. Through the machine first; the state after.
-pub fn grant(space: &str, until: Option<u64>) -> Result<()> {
+/// With `ask`: root on approval, each root command waiting for someone to
+/// approve it (only on a set-up machine).
+pub fn grant(space: &str, until: Option<u64>, ask: bool) -> Result<()> {
     let (_, state) = ctx::read_only()?;
     let s = state.space(space)?.clone();
     let h = state.host(&s.host)?.clone();
+    if ask && (h.setup.is_none() || h.setup_version < SETUP_VERSION) {
+        bail!(
+            "root on approval needs {} set up for it (thorn host setup {}{})",
+            s.host,
+            s.host,
+            if h.setup.is_some() { ", again" } else { "" }
+        );
+    }
     if h.setup.is_some() {
         if !h.accounts.get(&s.key).is_some_and(|a| a.full) {
             bail!(
@@ -817,7 +974,7 @@ pub fn grant(space: &str, until: Option<u64>) -> Result<()> {
         run(
             &s.host,
             &h,
-            &root_script(&s.key, until.map(|u| u.saturating_sub(now)))?,
+            &root_script(&s.key, until.map(|u| u.saturating_sub(now)), ask)?,
         )?;
     } else if !h.root_login() {
         bail!(
@@ -833,7 +990,11 @@ pub fn grant(space: &str, until: Option<u64>) -> Result<()> {
         .spaces
         .get_mut(space)
         .with_context(|| format!("{space} was removed meanwhile"))?;
-    sp.root = Some(crate::state::Root { since: now, until });
+    sp.root = Some(crate::state::Root {
+        since: now,
+        until,
+        ask,
+    });
     let key = sp.key.clone();
     if let Some(x) = ctx.state.hosts.get_mut(&s.host) {
         x.pending
@@ -1023,17 +1184,24 @@ pub fn tick() -> Result<Vec<String>> {
         if h.blocked(now) {
             continue;
         }
+        let tried = h.problem.as_ref().map_or(0, |p| p.at);
         if h.setup.is_some() {
             if !h.pending.is_empty() {
                 if let Err(e) = do_pending(name) {
                     eprintln!("{name}: {e:#}");
                 }
             }
+            // Set up by an older blackthorn: again, once an hour at most.
+            if h.setup_version < SETUP_VERSION && now.saturating_sub(tried) >= 3600 {
+                match setup(name, true) {
+                    Ok(_) => println!("{name} set up again (setup version {SETUP_VERSION})"),
+                    Err(e) => eprintln!("{name}: setting up again failed: {e:#}"),
+                }
+            }
             continue;
         }
         // Not set up: try once an hour, where blackthorn is root (a user
         // with sudo is set up when you ask, from the machine's page).
-        let tried = h.problem.as_ref().map_or(0, |p| p.at);
         if h.root_login() && h.os == crate::state::Os::Linux && now.saturating_sub(tried) >= 3600 {
             match setup(name, true) {
                 Ok(d) => println!(
@@ -1101,10 +1269,15 @@ mod tests {
         assert!(a.contains("$ro ALL=(root) NOPASSWD: BLACKTHORN_READ"));
         assert!(a.contains("chmod 2750 \"$d\""));
         assert!(!a.contains("NOPASSWD: ALL"), "no root here");
-        let r = root_script("a1b2c3d4", Some(3600)).unwrap();
+        let r = root_script("a1b2c3d4", Some(3600), false).unwrap();
         assert!(r.contains("$u ALL=(ALL:ALL) NOPASSWD: ALL"));
         assert!(r.contains("secs=3600"));
-        assert!(root_script("a1b2c3d4", None).unwrap().contains("secs=\n"));
+        assert!(root_script("a1b2c3d4", None, false)
+            .unwrap()
+            .contains("secs=\n"));
+        let a = root_script("a1b2c3d4", None, true).unwrap();
+        assert!(a.contains("$u ALL=(root) NOPASSWD: /usr/local/libexec/blackthorn-ask\n"));
+        assert!(!a.contains("NOPASSWD: ALL"));
         assert!(revoke_script("a1b2c3d4")
             .unwrap()
             .contains("rm -f \"/etc/sudoers.d/bt-$k-root\""));

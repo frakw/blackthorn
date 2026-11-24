@@ -17,6 +17,7 @@ pub const AGENT_TEMPLATE: &str = "blackthorn-agent@.service";
 pub const SPACE_TEMPLATE: &str = "blackthorn-space@.service";
 pub const API: &str = "blackthorn-api.service";
 pub const WEB: &str = "blackthorn-web.service";
+pub const ASKS: &str = "blackthorn-asks.service";
 
 pub fn all() -> Vec<(&'static str, String)> {
     vec![
@@ -27,6 +28,7 @@ pub fn all() -> Vec<(&'static str, String)> {
         (SPACE_TEMPLATE, space()),
         (API, api()),
         (WEB, web()),
+        (ASKS, asks()),
     ]
 }
 
@@ -44,6 +46,26 @@ Wants=network-pre.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/bin/thorn firewall apply
+
+[Install]
+WantedBy=multi-user.target
+"
+    .to_string()
+}
+
+fn asks() -> String {
+    // Root on the hub, outbound SSH only: it watches the machines with a
+    // space that has root on approval (and does nothing without one).
+    "# Installed by thorn init.
+[Unit]
+Description=blackthorn: watch for root commands waiting for approval
+After=network-online.target blackthorn-firewall.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/thorn _asks
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

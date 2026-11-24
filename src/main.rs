@@ -3,6 +3,7 @@
 mod activity;
 mod api;
 mod apply;
+mod asks;
 mod backup;
 mod chat;
 mod config;
@@ -165,6 +166,23 @@ enum Cmd {
         #[arg(long)]
         no_enter: bool,
     },
+    /// What spaces with root on approval asked to run as root (waiting
+    /// ones; --all: the latest decided too).
+    Approvals {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Approve an ask: the command runs as root on the machine, as asked.
+    Approve { id: String },
+    /// Refuse an ask.
+    Deny {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Watch the machines for asks (run by blackthorn-asks.service).
+    #[command(name = "_asks", hide = true)]
+    AsksWatch,
     /// Set a space's usual login on its machine: read-only or user. It
     /// applies at once; the space and its chats go on.
     Access {
@@ -177,10 +195,14 @@ enum Cmd {
     /// goes back to its usual login; its chats go on.
     Root {
         name: String,
-        #[arg(long = "for", value_name = "DURATION", conflicts_with_all = ["forever", "off"])]
+        #[arg(long = "for", value_name = "DURATION", conflicts_with_all = ["forever", "ask", "off"])]
         duration: Option<String>,
-        #[arg(long, conflicts_with = "off")]
+        #[arg(long, conflicts_with_all = ["ask", "off"])]
         forever: bool,
+        /// Root on approval: it logs in as its user, and each command it
+        /// wants as root waits until you approve it (thorn approvals).
+        #[arg(long, conflicts_with = "off")]
+        ask: bool,
         #[arg(long)]
         off: bool,
     },
@@ -630,8 +652,13 @@ fn run(cli: Cli) -> Result<()> {
             name,
             duration,
             forever,
+            ask,
             off,
-        } => s::root(&name, duration.as_deref(), forever, off),
+        } => s::root(&name, duration.as_deref(), forever, ask, off),
+        Cmd::Approvals { all } => s::approvals(all),
+        Cmd::Approve { id } => s::decide(&id, true, None),
+        Cmd::Deny { id, reason } => s::decide(&id, false, reason.as_deref()),
+        Cmd::AsksWatch => asks::run(),
         Cmd::Log { name, lines } => s::log(&name, lines),
         Cmd::Attach { name } => s::attach(&name),
         Cmd::Screen { name } => s::screen(&name),
@@ -955,6 +982,8 @@ mod tests {
             ("space_access", &["access"]),
             ("space_root", &["root"]),
             ("space_root_off", &["root"]),
+            ("ask_list", &["approvals"]),
+            ("ask_decide", &["approve"]),
             ("host_setup", &["host", "setup"]),
             ("activity", &["log"]),
         ];

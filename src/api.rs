@@ -67,6 +67,19 @@ pub enum Op {
     },
     /// Ends every login and chat unlock of the account but this browser's.
     SessionEndOthers,
+    /// Root commands asked for by spaces with root on approval: those the
+    /// account may decide on (manage), waiting first; `all`: decided too.
+    AskList {
+        #[serde(default)]
+        all: bool,
+    },
+    /// Approves or refuses one (needs the chat unlock, and manage).
+    AskDecide {
+        id: String,
+        approve: bool,
+        #[serde(default)]
+        reason: String,
+    },
     /// Lets this browser type into chats, for the login lifetime: asks the
     /// password and a code again.
     ChatUnlock {
@@ -387,7 +400,7 @@ impl Op {
     fn needs_chat_unlock(&self) -> bool {
         matches!(
             self,
-            Op::ChatSend { .. } | Op::ChatKey { .. } | Op::ChatUpload { .. }
+            Op::ChatSend { .. } | Op::ChatKey { .. } | Op::ChatUpload { .. } | Op::AskDecide { .. }
         )
     }
 
@@ -832,6 +845,8 @@ fn need(op: &Op) -> Need {
         | Op::SessionEnd { .. }
         | Op::SessionEndOthers
         | Op::ChatUnlock { .. }
+        | Op::AskList { .. }
+        | Op::AskDecide { .. }
         | Op::AccountNames
         | Op::Account
         | Op::AccountPassword { .. }
@@ -1321,8 +1336,49 @@ fn run_op(
         } => {
             let mut f = crate::chat::feed(&name, &id, from, before)?;
             let (_, st) = ctx::read_only()?;
-            f.level = st.space(&name)?.level(user, admin);
+            let sp = st.space(&name)?;
+            f.level = sp.level(user, admin);
+            if f.level >= Some(crate::state::Level::Manage) {
+                f.asks = crate::asks::list()
+                    .into_iter()
+                    .filter(|a| a.key == sp.key && a.waiting())
+                    .collect();
+            }
             json(f)
+        }
+        Op::AskList { all } => {
+            let (_, st) = ctx::read_only()?;
+            let may = |a: &crate::asks::Ask| {
+                st.space_by_key(&a.key)
+                    .is_some_and(|(_, s)| s.level(user, admin) >= Some(crate::state::Level::Manage))
+                    || admin
+            };
+            json(
+                crate::asks::list()
+                    .into_iter()
+                    .filter(|a| (all || a.waiting()) && may(a))
+                    .take(if all { 100 } else { usize::MAX })
+                    .collect::<Vec<_>>(),
+            )
+        }
+        Op::AskDecide {
+            id,
+            approve,
+            reason,
+        } => {
+            let a = crate::asks::get(&id).with_context(|| format!("no ask {id}"))?;
+            let (_, st) = ctx::read_only()?;
+            let ok = admin
+                || st.space_by_key(&a.key).is_some_and(|(_, s)| {
+                    s.level(user, admin) >= Some(crate::state::Level::Manage)
+                });
+            if !ok {
+                bail!(
+                    "only who may manage {} decides on its root commands",
+                    a.space
+                );
+            }
+            json(crate::asks::decide(&id, approve, user, &reason)?)
         }
         Op::ChatCommands { name } => json(crate::chat::commands(&name)?),
         Op::ChatSend { name, id, text } => json(crate::chat::send(&name, &id, &text, user)?),
@@ -1959,6 +2015,12 @@ pub fn all_op_names() -> Vec<String> {
             code: s(),
         },
         Op::SpaceRootOff { name: s() },
+        Op::AskList { all: false },
+        Op::AskDecide {
+            id: s(),
+            approve: false,
+            reason: s(),
+        },
         Op::SpaceAccess {
             name: s(),
             access: Default::default(),
@@ -2040,6 +2102,8 @@ pub fn all_op_names() -> Vec<String> {
             | Op::SpaceControl { .. }
             | Op::SpaceRoot { .. }
             | Op::SpaceRootOff { .. }
+            | Op::AskList { .. }
+            | Op::AskDecide { .. }
             | Op::SpaceAccess { .. }
             | Op::HostSetup { .. }
             | Op::Activity { .. }

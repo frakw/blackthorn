@@ -377,6 +377,36 @@ fn route(
             Reply::Redirect("/login".into(), Some(clear_cookie()))
         }
 
+        ("GET", ["approvals"]) => approvals_page(&c, &flash),
+        ("POST", ["approvals", id, action @ ("approve" | "deny")]) => {
+            let back_to = match form.get("back") {
+                Some(b) if b.starts_with("/space/") => b.clone(),
+                _ => "/approvals".to_string(),
+            };
+            let r = get::<crate::asks::Ask>(
+                &c,
+                Op::AskDecide {
+                    id: id.to_string(),
+                    approve: *action == "approve",
+                    reason: f(form, "reason").into(),
+                },
+            );
+            back(
+                &back_to,
+                r.map(|a| {
+                    format!(
+                        "{} on {}: {}",
+                        if a.state == "approved" {
+                            "approved; it runs now"
+                        } else {
+                            "refused"
+                        },
+                        a.host,
+                        a.cmd
+                    )
+                }),
+            )
+        }
         ("GET", ["spaces"]) => spaces_page(&c, &flash),
         ("POST", ["spaces"]) => {
             let space = NewSpace {
@@ -392,11 +422,13 @@ fn route(
                     .collect(),
                 access: match f(form, "login") {
                     "root" => Some(parse_usual(f(form, "then"))),
+                    "ask" => Some(crate::state::Access::User),
                     "" => None,
                     other => Some(parse_usual(other)),
                 },
                 root: match f(form, "login") {
                     "root" => Some(root_value(form)),
+                    "ask" => Some("ask".into()),
                     "" => None,
                     _ => Some("no".into()),
                 },
@@ -590,6 +622,7 @@ fn section(path: &str) -> &'static str {
         "bridges" => "/bridges",
         "settings" | "update" => "/settings",
         "account" => "/account",
+        "approvals" => "/approvals",
         _ => "/",
     }
 }
@@ -625,6 +658,23 @@ fn page_with(c: &Ctx, title: &str, body: &str, flash: &Flash, head: &str) -> Str
                 )
             })
             .collect();
+        // Root commands waiting for this account.
+        let waiting = get::<Vec<crate::asks::Ask>>(c, Op::AskList { all: false })
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let links = format!(
+            "{links}<a href=\"/approvals\"{}>Approvals{}</a>",
+            if here == "/approvals" {
+                " class=\"on\" aria-current=\"page\""
+            } else {
+                ""
+            },
+            if waiting > 0 {
+                format!(" <span class=\"count\">{waiting}</span>")
+            } else {
+                String::new()
+            }
+        );
         format!(
             "<nav class=\"menu\">{links}</nav><div class=\"me\"><a href=\"/account\"{}>{}</a>\
              <form method=\"post\" action=\"/logout\" class=\"inline\">{}<button class=\"link\">Log out</button></form></div>",
@@ -1037,6 +1087,9 @@ fn access_badge(s: &SpaceView) -> String {
     use crate::state::Tier;
     match (s.tier, s.root.as_ref().and_then(|r| r.until)) {
         (Tier::ReadOnly, _) => "<span class=\"badge ro\">read-only</span>".into(),
+        (Tier::User, _) if s.root.as_ref().is_some_and(|r| r.ask) => {
+            "<span class=\"badge user\">user · root on approval</span>".into()
+        }
         (Tier::User, _) => "<span class=\"badge user\">user</span>".into(),
         (Tier::Root, Some(u)) => format!(
             "<span class=\"badge admin\">root · {} left</span>",
@@ -1064,7 +1117,7 @@ fn root_value(form: &HashMap<String, String>) -> String {
 }
 
 /// For how long root is given: presets, a number of hours, or forever.
-fn root_select(default: &str) -> String {
+fn root_select(default: &str, ask: bool) -> String {
     let o: String = [
         "15m", "30m", "1h", "2h", "4h", "8h", "12h", "16h", "20h", "24h",
     ]
@@ -1076,9 +1129,14 @@ fn root_select(default: &str) -> String {
         )
     })
     .collect();
+    let ask = if ask {
+        "<option value=\"ask\">on approval: each command waits for you</option>"
+    } else {
+        ""
+    };
     format!(
         "<label>For <select name=\"root_for\">{o}<option value=\"custom\">custom…</option>\
-         <option value=\"forever\">until taken back</option></select></label>\
+         <option value=\"forever\">until taken back</option>{ask}</select></label>\
          <label>Custom: hours (1–72) <input name=\"root_hours\" type=\"number\" min=\"1\" max=\"72\" \
          step=\"1\" placeholder=\"36\"></label>"
     )
@@ -1137,6 +1195,8 @@ fn spaces_page(c: &Ctx, flash: &Flash) -> Reply {
              <label class=\"check\"><input type=\"radio\" name=\"login\" value=\"root\" checked> <b>root</b>: can change \
              anything there</label><div class=\"fields sub\">{root}<label>Then <select name=\"then\">\
              <option value=\"user\">user</option><option value=\"read-only\">read-only</option></select></label></div>\
+             <label class=\"check\"><input type=\"radio\" name=\"login\" value=\"ask\"> <b>user, root on approval</b>: \
+             each command it wants as root waits for you</label>\
              <label class=\"check\"><input type=\"radio\" name=\"login\" value=\"user\"> <b>user</b>: its own files in \
              /srv/&lt;space&gt; and its own containers</label>\
              <label class=\"check\"><input type=\"radio\" name=\"login\" value=\"read-only\"> <b>read-only</b>: reads logs \
@@ -1151,7 +1211,7 @@ fn spaces_page(c: &Ctx, flash: &Flash) -> Reply {
              </div></details><div><button class=\"primary\">Create space</button></div></form></details>",
             if o.spaces.is_empty() { " open" } else { "" },
             csrf(c),
-            root = root_select("8h"),
+            root = root_select("8h", false),
             offers = esc(&o
                 .hosts
                 .iter()
@@ -1739,7 +1799,9 @@ fn chat_state_html(c: &Ctx, n: &str, id: &str, feed: &crate::chat::Feed) -> Stri
         )
     };
     let sc = &feed.screen;
-    match sc.state.as_str() {
+    let back_to = format!("/space/{n}/chat/{id}");
+    let asks: String = feed.asks.iter().map(|a| ask_card(c, a, &back_to)).collect();
+    let state = match sc.state.as_str() {
         "busy" => format!(
             "<div class=\"chat-state busy\"><span class=\"dot\"></span>Claude is working{}</div>",
             if may && feed.typing {
@@ -1778,7 +1840,121 @@ fn chat_state_html(c: &Ctx, n: &str, id: &str, feed: &crate::chat::Feed) -> Stri
                         (or end it there and continue it here)."
             .to_string(),
         _ => String::new(),
+    };
+    format!("{asks}{state}")
+}
+
+/// One root command asked for: what, where, why to look twice, and (while
+/// it waits, for an unlocked browser) approve and refuse.
+fn ask_card(c: &Ctx, a: &crate::asks::Ask, back_to: &str) -> String {
+    let input = if a.input_len > 0 {
+        format!(
+            "<details open><summary>Its standard input ({} bytes{})</summary><pre class=\"code\">{}</pre></details>",
+            a.input_len,
+            if (a.input.len() as u64) < a.input_len {
+                ", the first 1 MB"
+            } else {
+                ""
+            },
+            esc(&a.input)
+        )
+    } else {
+        String::new()
+    };
+    let flags: String = a
+        .flags
+        .iter()
+        .map(|f| format!("<li>{}</li>", esc(f)))
+        .collect();
+    let flags = if flags.is_empty() {
+        String::new()
+    } else {
+        format!("<ul class=\"flags t-bad\">{flags}</ul>")
+    };
+    let status = match (a.state.as_str(), a.rc) {
+        ("waiting", _) => "waiting".to_string(),
+        ("done", Some(rc)) => format!("ran, exit {rc}; approved by {}", esc(&a.by)),
+        ("done", None) => format!("ran; approved by {}", esc(&a.by)),
+        ("approved", _) => format!("approved by {}", esc(&a.by)),
+        ("denied", _) => format!(
+            "refused by {}{}",
+            esc(&a.by),
+            if a.reason.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", esc(&a.reason))
+            }
+        ),
+        (s, _) => esc(s),
+    };
+    let actions = if !a.waiting() {
+        String::new()
+    } else if !c.chat {
+        "<p class=\"hint\">To approve or refuse, unlock this browser first (as for typing into chats: \
+         open a chat and unlock it).</p>"
+            .to_string()
+    } else {
+        format!(
+            "<div class=\"buttons\"><form method=\"post\" action=\"/approvals/{id}/approve\" class=\"inline\" \
+             data-confirm=\"Run this as root on {host}?\">{csrf}<input type=\"hidden\" name=\"back\" value=\"{back}\">\
+             <button class=\"danger\">Approve: run as root</button></form>\
+             <form method=\"post\" action=\"/approvals/{id}/deny\" class=\"inline\">{csrf}\
+             <input type=\"hidden\" name=\"back\" value=\"{back}\"><input name=\"reason\" placeholder=\"why not (optional)\">\
+             <button>Refuse</button></form></div>",
+            id = esc(&a.id),
+            host = esc(&a.host),
+            csrf = csrf(c),
+            back = esc(back_to)
+        )
+    };
+    format!(
+        "<article class=\"item ask\"><div class=\"item-head\"><a class=\"item-name\" href=\"/space/{}\">{}</a>\
+         <span class=\"badge admin\">root on {}</span><span class=\"badge\">{status}</span></div>\
+         <p class=\"item-meta\">asked {} · in <code>{}</code> · {}</p><pre class=\"code\">{}</pre>{input}{flags}{actions}</article>",
+        url_encode(&a.space),
+        esc(&a.space),
+        esc(&a.host),
+        when_utc(a.time),
+        esc(&a.cwd),
+        esc(&a.id),
+        esc(&a.cmd)
+    )
+}
+
+fn approvals_page(c: &Ctx, flash: &Flash) -> Reply {
+    let asks = match get::<Vec<crate::asks::Ask>>(c, Op::AskList { all: true }) {
+        Ok(v) => v,
+        Err(e) => {
+            return Reply::Html(
+                500,
+                page(
+                    c,
+                    "Approvals",
+                    &format!("<pre class=\"flash err\">{}</pre>", esc(&e)),
+                    flash,
+                ),
+            )
+        }
+    };
+    let (waiting, done): (Vec<_>, Vec<_>) = asks.iter().partition(|a| a.waiting());
+    let mut b = String::from(
+        "<h1>Approvals</h1><p class=\"hint\">Spaces with root on approval ask here for each command they want \
+         run as root. What you approve runs exactly as shown, with the input shown. Unanswered asks lapse after \
+         10 minutes.</p>",
+    );
+    if waiting.is_empty() {
+        b.push_str("<p>Nothing is waiting.</p>");
     }
+    for a in &waiting {
+        b.push_str(&ask_card(c, a, "/approvals"));
+    }
+    if !done.is_empty() {
+        b.push_str("<h2>Earlier</h2>");
+        for a in done.iter().take(50) {
+            b.push_str(&ask_card(c, a, "/approvals"));
+        }
+    }
+    Reply::Html(200, page(c, "Approvals", &b, flash))
 }
 
 /// The account may type into the space's chats.
@@ -2069,6 +2245,9 @@ fn access_card(c: &Ctx, s: &SpaceView, h: Option<&HostView>) -> String {
                     esc(&crate::ops::describe_left(u, crate::state::now())),
                     s.access
                 ),
+                None if r.ask => "on approval: each command it wants as root waits for you \
+                                  (<a href=\"/approvals\">Approvals</a>), until taken back"
+                    .into(),
                 None => "until taken back".into(),
             };
             text.push_str(&format!(
@@ -2139,7 +2318,7 @@ fn access_card(c: &Ctx, s: &SpaceView, h: Option<&HostView>) -> String {
                  login. When the time is up it goes back to its usual login ({}); its chats go on.</p>{}{}",
                 esc(&s.host),
                 s.access,
-                root_select("8h"),
+                root_select("8h", true),
                 code_field()
             ),
             "Give root",

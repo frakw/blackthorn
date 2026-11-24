@@ -113,6 +113,9 @@ pub fn instructions(space_name: &str, state: &State, now: u64) -> String {
                 }
             };
             let level = match (l.tier, &space.root) {
+                (crate::state::Tier::User, Some(r)) if !l.bridged && r.ask && r.active(now) => {
+                    "user, root on approval".to_string()
+                }
                 (crate::state::Tier::Root, Some(r)) if !l.bridged => match r.until {
                     Some(u) => format!(
                         "root through sudo until {} UTC, then {}",
@@ -188,7 +191,24 @@ pub fn instructions(space_name: &str, state: &State, now: u64) -> String {
                 paths::unix_user(&space.key)
             );
         }
-        if own(crate::state::Tier::User) {
+        if space.asks(now) {
+            let _ = write!(
+                out,
+                "### Root on approval on `{}`\n\n\
+                 Each command you need as root there waits until the user approves it. Run it \
+                 as one string: `ssh {} \"sudo -n blackthorn-ask 'systemctl restart nginx'\"`; a \
+                 longer script can come on standard input: `ssh {} 'sudo -n blackthorn-ask \
+                 \"bash -s\"' < script.sh` (at most 1 MB). Plain `sudo` does nothing else. Use \
+                 as few asks as you can, each one clear on its own: the user reads exactly what \
+                 you send. Before asking, say in the chat what the command does and why.\n\n\
+                 It waits up to 110 seconds; exit 75 means still waiting: run the `--wait ID` \
+                 command it prints to keep waiting (asks lapse after 10 minutes). Exit 77 means \
+                 refused: stop, and ask the user; do not look for another way. Otherwise the \
+                 exit status is the command's. A long command is cut off when your SSH \
+                 connection ends: start long work as a service (`systemd-run`).\n\n",
+                space.host, space.host, space.host
+            );
+        } else if own(crate::state::Tier::User) {
             out.push_str(
                 "Hosts marked user give you an ordinary login: no sudo. If the task needs root \
                  (installing a package, changing the machine's configuration), say exactly what \
@@ -342,6 +362,7 @@ mod tests {
                 block: None,
                 readonly: None,
                 setup: None,
+                setup_version: 0,
                 rootless_docker: false,
                 accounts: Default::default(),
                 pending: Vec::new(),
@@ -359,6 +380,7 @@ mod tests {
                 block: None,
                 readonly: Some("blackthorn".into()),
                 setup: None,
+                setup_version: 0,
                 rootless_docker: false,
                 accounts: Default::default(),
                 pending: Vec::new(),
@@ -380,6 +402,7 @@ mod tests {
                 }),
                 readonly: None,
                 setup: None,
+                setup_version: 0,
                 rootless_docker: false,
                 accounts: Default::default(),
                 pending: Vec::new(),
@@ -408,6 +431,7 @@ mod tests {
                     root: Some(crate::state::Root {
                         since: 0,
                         until: None,
+                        ask: false,
                     }),
                     until: None,
                     title: None,

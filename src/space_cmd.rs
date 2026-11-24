@@ -400,13 +400,19 @@ pub fn login_as(name: &str, access: crate::state::Access) -> Result<()> {
     Ok(())
 }
 
-/// thorn root SPACE --for 8h | --forever | --off
-pub fn root(name: &str, duration: Option<&str>, forever: bool, off: bool) -> Result<()> {
-    let root = match (duration, forever, off) {
-        (_, _, true) => None,
-        (_, true, false) => Some(None),
-        (Some(d), false, false) => ops::parse_root(d)?,
-        (None, false, false) => Some(Some(ops::ROOT_DEFAULT)),
+/// thorn root SPACE --for 8h | --forever | --ask | --off
+pub fn root(name: &str, duration: Option<&str>, forever: bool, ask: bool, off: bool) -> Result<()> {
+    let root = if off {
+        None
+    } else if ask {
+        ops::parse_root("ask")?
+    } else if forever {
+        ops::parse_root("forever")?
+    } else {
+        match duration {
+            Some(d) => ops::parse_root(d)?,
+            None => ops::parse_root("8h")?,
+        }
     };
     println!("{}", ops::space_root(name, root)?);
     Ok(())
@@ -420,5 +426,75 @@ pub fn remote(name: &str, on: bool) -> Result<()> {
     } else {
         println!("{name}: Remote Control off{again}; use it with: sudo thorn attach {name}");
     }
+    Ok(())
+}
+
+/// thorn approvals [--all]
+pub fn approvals(all: bool) -> Result<()> {
+    sys::require_root()?;
+    let asks: Vec<crate::asks::Ask> = crate::asks::list()
+        .into_iter()
+        .filter(|a| all || a.waiting())
+        .take(if all { 30 } else { usize::MAX })
+        .collect();
+    if asks.is_empty() {
+        println!(
+            "{}",
+            if all {
+                "no asks yet"
+            } else {
+                "nothing waiting for approval"
+            }
+        );
+        return Ok(());
+    }
+    for a in &asks {
+        println!(
+            "{}  {} on {}  {}  {}",
+            a.id,
+            a.space,
+            a.host,
+            ops::rfc3339(a.time),
+            match (a.state.as_str(), a.rc) {
+                ("done", Some(rc)) => format!("ran (exit {rc}), approved by {}", a.by),
+                ("approved", _) => format!("approved by {}", a.by),
+                ("denied", _) => format!("refused by {}", a.by),
+                (s, _) => s.to_string(),
+            }
+        );
+        println!("    as root, in {}: {}", a.cwd, a.cmd);
+        if a.input_len > 0 {
+            println!("    with {} bytes on its standard input:", a.input_len);
+            for l in a.input.lines().take(40) {
+                println!("    | {l}");
+            }
+        }
+        for f in &a.flags {
+            println!("    ! {f}");
+        }
+    }
+    if !all {
+        println!(
+            "\napprove with: sudo thorn approve ID   refuse with: sudo thorn deny ID [--reason R]"
+        );
+    }
+    Ok(())
+}
+
+/// thorn approve ID / thorn deny ID
+pub fn decide(id: &str, approve: bool, reason: Option<&str>) -> Result<()> {
+    sys::require_root()?;
+    let by = format!(
+        "hub:{}",
+        std::env::var("SUDO_USER").unwrap_or_else(|_| "root".into())
+    );
+    let a = crate::asks::decide(id, approve, &by, reason.unwrap_or(""))?;
+    println!(
+        "{} {}: {} on {}",
+        if approve { "approved" } else { "refused" },
+        a.id,
+        a.space,
+        a.host
+    );
     Ok(())
 }

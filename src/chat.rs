@@ -90,6 +90,10 @@ pub struct Feed {
     /// How far the account asking may go with the space (set by the API).
     #[serde(default)]
     pub level: Option<crate::state::Level>,
+    /// Root commands of the space waiting for approval (set by the API,
+    /// for an account that may decide on them).
+    #[serde(default)]
+    pub asks: Vec<crate::asks::Ask>,
 }
 
 /// The models and effort levels the chat page offers (Claude Code's
@@ -210,6 +214,7 @@ pub fn feed(name: &str, id: &str, from: Option<u64>, before: Option<u64>) -> Res
         model_setting,
         effort,
         level: None,
+        asks: Vec::new(),
     })
 }
 

@@ -68,33 +68,8 @@ pub fn ssh(
     command: &str,
     input: Option<&str>,
 ) -> Result<Output> {
-    let known = PathBuf::from(format!("/run/blackthorn-check-{name}.known_hosts"));
-    let lines: String = h
-        .host_keys
-        .iter()
-        .map(|k| format!("blackthorn-{name} {k}\n"))
-        .collect();
-    crate::sys::write_file(&known, &lines, 0o600, None)?;
-    let child = Command::new("ssh")
-        .args([
-            "-F",
-            "/dev/null",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "IdentitiesOnly=yes",
-            "-o",
-            "IdentityAgent=none",
-        ])
-        .args(["-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10"])
-        .arg("-o")
-        .arg(format!("UserKnownHostsFile={}", known.display()))
-        .arg("-o")
-        .arg(format!("HostKeyAlias=blackthorn-{name}"))
-        .arg("-i")
-        .arg(key)
-        .args(["-p", &h.port.to_string()])
-        .arg(format!("{user}@{}", h.address))
+    let known = known_hosts(name, h)?;
+    let child = ssh_command(name, h, key, user, &known)
         .arg(command)
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -107,6 +82,55 @@ pub fn ssh(
     let out = finish(child, input);
     let _ = std::fs::remove_file(&known);
     out
+}
+
+/// A known_hosts file with the machine's recorded keys, of its own for
+/// each connection (several may be open at once). Remove it afterwards.
+pub fn known_hosts(name: &str, h: &Host) -> Result<PathBuf> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let known = PathBuf::from(format!(
+        "/run/blackthorn-ssh-{name}-{}-{n}.known_hosts",
+        std::process::id()
+    ));
+    let lines: String = h
+        .host_keys
+        .iter()
+        .map(|k| format!("blackthorn-{name} {k}\n"))
+        .collect();
+    crate::sys::write_file(&known, &lines, 0o600, None)?;
+    Ok(known)
+}
+
+/// ssh to the machine with one of root's keys, without the command yet.
+pub fn ssh_command(name: &str, h: &Host, key: &Path, user: &str, known: &Path) -> Command {
+    let mut c = Command::new("ssh");
+    c.args([
+        "-F",
+        "/dev/null",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "IdentityAgent=none",
+    ])
+    .args(["-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10"])
+    .args([
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+    ])
+    .arg("-o")
+    .arg(format!("UserKnownHostsFile={}", known.display()))
+    .arg("-o")
+    .arg(format!("HostKeyAlias=blackthorn-{name}"))
+    .arg("-i")
+    .arg(key)
+    .args(["-p", &h.port.to_string()])
+    .arg(format!("{user}@{}", h.address));
+    c
 }
 
 fn finish(child: std::io::Result<std::process::Child>, input: Option<&str>) -> Result<Output> {

@@ -983,6 +983,7 @@ mod tests {
             root: (n != "fig-claude").then_some(crate::state::Root {
                 since: 0,
                 until: None,
+                ask: false,
             }),
             login: if n == "fig-claude" {
                 "blackthorn"
