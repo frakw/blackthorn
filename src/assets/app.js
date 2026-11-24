@@ -665,8 +665,15 @@ document.querySelectorAll("time[data-local]").forEach(function (t) {
     p.hidden = !msg;
   };
 
+  // One read at a time: two reads from the same offset would both add
+  // the same new messages. A poll asked for meanwhile runs right after.
+  var reading = false, again = false;
   var poll = function () {
     if (timer) window.clearTimeout(timer);
+    timer = null;
+    if (reading) { again = true; return; }
+    reading = true;
+    again = false;
     var stick = nearBottom();
     fetch(feedUrl + "?from=" + encodeURIComponent(offset), { credentials: "same-origin" })
       .then(function (r) {
@@ -691,7 +698,9 @@ document.querySelectorAll("time[data-local]").forEach(function (t) {
       })
       .catch(function () { /* try again later */ })
       .then(function () {
-        if (!document.hidden) timer = window.setTimeout(poll, busy ? 1200 : 2500);
+        reading = false;
+        if (again) poll();
+        else if (!document.hidden) timer = window.setTimeout(poll, busy ? 1200 : 2500);
       });
   };
   document.addEventListener("visibilitychange", function () { if (!document.hidden) poll(); });
