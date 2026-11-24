@@ -1021,3 +1021,96 @@ pub fn tick() -> Result<Vec<String>> {
     }
     Ok(ended)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_script_has_everything() {
+        let s = setup_script(&SetupInput {
+            admin_user: "alice",
+            admin_key: "AAAB",
+            admin_line: "from=\"100.64.0.1\",restrict,command=\"/usr/local/libexec/blackthorn-ssh\" ssh-ed25519 AAAB admin",
+            add_root: true,
+            legacy: Some("blackthorn"),
+        })
+        .unwrap();
+        assert!(s.starts_with("#!/bin/sh\n"));
+        assert!(s.contains("add_root=1"));
+        assert!(s.contains("exec \"${SHELL:-/bin/sh}\" -c \"$c\"\nBLACKTHORN_LOGGER\n"));
+        assert!(s.contains(
+            "Cmnd_Alias BLACKTHORN_READ = $d ps, $d ps *, $d logs *, $d stats --no-stream,"
+        ));
+        assert!(
+            s.contains("Cmnd_Alias BLACKTHORN_RREAD = /usr/local/libexec/blackthorn-rdocker ps,")
+        );
+        assert!(s.contains("blackthorn ALL=(root) NOPASSWD: BLACKTHORN_READ"));
+        assert!(s.contains(
+            "AuthorizedKeysFile .ssh/authorized_keys .ssh/authorized_keys2 /etc/ssh/blackthorn/%u"
+        ));
+        assert!(s.contains("echo \"bt: done\""));
+        for bad in [
+            "exec *",
+            "run *",
+            "inspect",
+            "compose",
+            "usermod -a -G docker",
+        ] {
+            assert!(!s.contains(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn account_and_root_scripts() {
+        let a = accounts_script(&AccountsInput {
+            key: "a1b2c3d4",
+            full: true,
+            srv: Some("fig-claude"),
+            user_line: "restrict ssh-ed25519 AAAA u",
+            ro_line: "restrict ssh-ed25519 AAAB r",
+        })
+        .unwrap();
+        assert!(a.contains("k='a1b2c3d4'"));
+        assert!(a.contains("srv='fig-claude'"));
+        assert!(a.contains("$ro ALL=(root) NOPASSWD: BLACKTHORN_READ"));
+        assert!(a.contains("chmod 2750 \"$d\""));
+        assert!(!a.contains("NOPASSWD: ALL"), "no root here");
+        let r = root_script("a1b2c3d4", Some(3600)).unwrap();
+        assert!(r.contains("$u ALL=(ALL:ALL) NOPASSWD: ALL"));
+        assert!(r.contains("secs=3600"));
+        assert!(root_script("a1b2c3d4", None).unwrap().contains("secs=\n"));
+        assert!(revoke_script("a1b2c3d4")
+            .unwrap()
+            .contains("rm -f \"/etc/sudoers.d/bt-$k-root\""));
+        let rm = remove_script("a1b2c3d4", Some("fig-claude"), false).unwrap();
+        assert!(rm.contains("purge=0"));
+        assert!(q("it's").is_err(), "no quotes inside");
+    }
+
+    #[test]
+    fn logins_wanted_on_a_machine() {
+        let mut st = State::default();
+        let mut s = crate::state::tests_space("fig");
+        s.key = "aaaa".into();
+        st.spaces.insert("fig-claude".into(), s);
+        let mut s = crate::state::tests_space("nas");
+        s.key = "bbbb".into();
+        st.spaces.insert("nas-claude".into(), s);
+        st.bridges.push(crate::state::Bridge {
+            from: "nas-claude".into(),
+            to: "fig-claude".into(),
+            since: 0,
+            until: Some(100),
+        });
+        let w = wanted(&st, "fig", 5);
+        assert_eq!(
+            w,
+            vec![
+                ("aaaa".to_string(), true, "fig-claude".to_string()),
+                ("bbbb".to_string(), false, "nas-claude".to_string())
+            ]
+        );
+        assert_eq!(wanted(&st, "fig", 100).len(), 1, "the bridge ended");
+    }
+}

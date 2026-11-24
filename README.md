@@ -23,15 +23,16 @@ anything important.
    reach the hub at all. To let a space work on a second machine for a
    while, open a **bridge**. Cut a machine off from everything with one
    **block**. All of it is enforced by the kernel, not by asking the model.
-   On the machines themselves, a **read-only login** lets most spaces only
-   look, and keeps admin access for when you need it, for a limited time.
+   On the machines themselves, each space has **logins of its own**: an
+   ordinary user for its project, a read-only one, and root only for a
+   time you choose.
 4. **Keys stay on the hub.** Private keys never leave root-only files; each
    space gets only its own key, through an agent it cannot read. Keys only
    work from the hub's address.
 5. **See everything.** A web UI with a live map of machines, spaces and
    bridges, or the same from the command line. Every command a space runs
-   is recorded on the hub, and on machines with a read-only login, in
-   their own system log too.
+   is recorded on the hub, and on machines set up for logins of each
+   space's own, in their own system log too.
 
 ## How it works
 
@@ -146,13 +147,13 @@ sudo thorn login fig-claude
 sudo thorn status                  # the map, in text
 ```
 
-Give it a read-only login, so spaces only look unless you say otherwise
-(see [Read-only logins](#read-only-logins)):
+A machine blackthorn reaches as root is then set up for logins of each
+space's own by itself (see [Logins](#logins)). What a space may do there:
 
 ```sh
-sudo thorn host readonly fig       # new spaces on fig are read-only
-sudo thorn new fig --access admin  # "fig-admin": runs only when started, for a time
-sudo thorn start fig-admin --for 1h
+sudo thorn access fig-claude user        # its usual login: user or read-only
+sudo thorn root fig-claude --for 8h      # root for a time (or --forever), then back
+sudo thorn root fig-claude --off         # take it back now
 ```
 
 Cut a machine off for an hour, or let `fig-claude` reach `nas` for 30
@@ -270,11 +271,11 @@ restores the old settings at any time.
 | `thorn init [--claude-from PATH] [--no-web]` | Set up the hub (the installer runs it), or update Claude Code |
 | `thorn status [--json]` | The map: machines, spaces, bridges, hub health |
 | `thorn ls` | Spaces: machine, agent, state, what they can reach |
-| `thorn new HOST [--agent A] [--name N] [--access readonly\|admin] [--single] [--local] [--arg A]...` | Create a space on a machine |
+| `thorn new HOST [--agent A] [--name N] [--access user\|read-only] [--root 8h\|forever\|no] [--single] [--local] [--arg A]...` | Create a space on a machine |
 | `thorn login SPACE` | Sign a Claude space in, then start it |
 | `thorn start\|stop\|restart SPACE... \| --all` | Control spaces |
-| `thorn start SPACE --for 1h` | Start an admin space on a machine with a read-only login, for a time |
-| `thorn access SPACE readonly\|admin` | Change what a space may do on its machine |
+| `thorn access SPACE user\|read-only` | A space's usual login on its machine; applies at once |
+| `thorn root SPACE [--for 8h \| --forever \| --off]` | Give a space root for a time (at most 72h) or until taken back; take it back |
 | `thorn log SPACE [-n 50]` | The commands a space ran (recorded by root) |
 | `thorn attach SPACE` | Open the space's terminal |
 | `thorn screen SPACE` / `thorn send SPACE TEXT` | Read or type into the terminal without attaching |
@@ -283,11 +284,11 @@ restores the old settings at any time.
 | `thorn chat ls SPACE` / `chat new SPACE [--name N]` / `chat send SPACE ID TEXT` / `chat stop SPACE ID` / `chat rm SPACE ID` | A space's Claude chats |
 | `thorn chat new SPACE [--name N]` / `chat open SPACE ID` | Start a new chat, or go back to one |
 | `thorn remote SPACE on\|off` | Remote Control on, or off: one local conversation, only from the hub |
-| `thorn rm SPACE [--purge]` | Delete; files are archived unless `--purge` |
+| `thorn rm SPACE [--purge] [--purge-data]` | Delete; files are archived unless `--purge`; its folder on the machine stays unless `--purge-data` |
 | `thorn bridge add FROM TO [--for 1h]` / `bridge rm` / `bridge ls` | Let one space reach another space's machine for a while |
 | `thorn host add NAME USER@IP [--port P]` | Register a machine and create its key |
 | `thorn host ls` / `host check` / `host pubkey` / `host rescan` / `host rename` / `host rm` | Manage machines |
-| `thorn host readonly NAME [--user U] [--print \| --verify]` | Give a Linux machine a read-only login, and log blackthorn's commands there |
+| `thorn host setup NAME [--print \| --verify]` | Set a Linux machine up for logins of each space's own, and log their commands there |
 | `thorn host set-address NAME USER@IP [--port P]` | Move a machine to a new address (e.g. LAN to tailnet); its spaces stay |
 | `thorn host block NAME [--for 30m] [--reason R]` / `host unblock` | Cut a machine off from every space |
 | `thorn web enable\|disable` / `web user add [--admin]\|admin\|rm\|ls\|rename\|passwd\|totp-reset` | The web UI and its accounts |
@@ -331,7 +332,7 @@ instructions = "CONVENTIONS.md"   # where it reads its instructions
 Every space gets an instructions file (`CLAUDE.md`, or the agent's own)
 listing what it can reach, as whom, and the rules of the hub.
 
-### Read-only logins
+### Logins
 
 The hub decides *which* machine a space reaches; what the space may do
 there is up to the login it uses. If that login is root, an agent misled by
@@ -339,38 +340,53 @@ text it read (or simply wrong) runs as root, and from that machine it can
 also reach the internet past the hub's firewall. So the real limit has to
 be on the machine.
 
-`thorn host readonly NAME` gives a Linux machine a second login for spaces.
-blackthorn logs in as the machine's admin login once and:
+`thorn host setup NAME` sets a Linux machine up so that each space has
+logins of its own there. blackthorn logs in as the machine's own login
+(root, or a user with sudo without a password) and:
 
-- creates a user (`blackthorn` by default) with no password, in the `adm`
-  and `systemd-journal` groups, so it reads `/var/log` and `journalctl`
-  (and `systemctl status`) without sudo;
-- gives it a key of its own (`from="<hub>",restrict`), in a home and key
-  file owned by root, so the user cannot replace its own key line;
-- lets it run, with sudo and nothing else, the Docker commands that only
-  read: `docker ps`, `logs`, `stats --no-stream`, `images`, `top`,
-  `system df`, with their output recorded (`log_output`; installs sudo if
-  missing; the rules are checked with `visudo` first);
-- puts a logger in front of both blackthorn keys (`command=` in the key
-  line), so every command they run is in the machine's system log:
-  `journalctl -t blackthorn`.
+- has sshd also read key lines from `/etc/ssh/blackthorn/<user>`, where
+  only root writes, so no space can change its own key line;
+- puts a logger in front of every blackthorn key (`command=` in the key
+  line), so every command is in the machine's system log, under the
+  space's own user: `journalctl -t blackthorn`;
+- installs sudo if missing, and checks for rootless Docker (Debian and
+  Ubuntu with Docker's packages for now).
 
-Not in the read-only list, on purpose, because each amounts to root or
-hands out secrets: the `docker` group, `docker exec`, `run`, `cp`,
-`compose`, `docker inspect` (environment variables hold passwords), `apt`,
-`systemctl restart`.
+Then each space gets, with keys of its own (`from="<hub>",restrict`):
 
-Once a machine has a read-only login, new spaces on it are read-only. An
-**admin** space there (`--access admin`) does not start at boot: start it
-when you need it, for a time (`thorn start SPACE --for 1h`, or *Start as
-admin…* with an authenticator code on the web); it stops by itself, and
-only one admin space per machine runs at a time. Prefer not to give admin
-spaces `--permission-mode bypassPermissions` or auto mode; the web UI warns
-when they have it.
+- **`bt-<id>`**, an ordinary user: its home and `/srv/<space>` are its
+  own, and it runs its own containers (rootless Docker, apart from the
+  machine's) and services (`systemctl --user`, lingering). No sudo. Ports
+  below 1024 are not its to open.
+- **`bt-<id>-ro`**, which only looks: in the `adm` and `systemd-journal`
+  groups, so it reads `/var/log` and `journalctl`; with sudo for the Docker
+  commands that only read (`docker ps`, `logs`, `stats --no-stream`,
+  `images`, `top`, `system df`), of the machine's Docker and of its own
+  user login's; and it reads `/srv/<space>`. Not in the list, on purpose,
+  because each amounts to root or hands out secrets: the `docker` group,
+  `docker exec`, `run`, `cp`, `compose`, `docker inspect` (environment
+  variables hold passwords), `apt`, `systemctl restart`.
+- **root**, only when you give it: `bt-<id>` may then use sudo for
+  anything, for a time (15 minutes to 72 hours) or until you take it back.
+  When it ends, the space goes back to its usual login at once (its open
+  connections are cut, with what they ran as root); its chats go on. With
+  a time, the machine also takes root back by itself, even if the hub
+  cannot reach it then. What root did meanwhile (packages, configuration,
+  timers) stays: the system log has every command.
 
-Rather not let the hub log in as admin to set it up? `thorn host readonly
-NAME --print` prints the script; run it there as root, then `thorn host
-readonly NAME --verify`. Run it again after the machine moves address.
+A space has a usual login, user or read-only, and root on top for a time.
+Change either at once, on the space's page or with `thorn access` and
+`thorn root`; going up needs an authenticator code on the web, going down
+does not. New spaces get root for 8 hours, then user. A space reaching a
+machine through a bridge logs in there read-only.
+
+blackthorn sets up machines it reaches as root by itself (once an hour
+until it works). One it reaches as an ordinary user cannot be set up that
+way: its spaces log in as that user, with all that user can do, and no
+root. To set it up anyway, `thorn host setup NAME --print` prints the
+script; run it there as root (it also lets blackthorn's key log in as
+root), then `thorn host setup NAME --verify`. Run the setup again after
+the machine moves address.
 
 ### What a space did
 

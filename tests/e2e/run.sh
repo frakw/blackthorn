@@ -556,39 +556,71 @@ expect_reach 20 t2-claude t2 ok
 for _ in $(seq 20); do tcp_open "$P-admin" "$HUB" 7180 && break; sleep 1; done
 admin curl -s -o /dev/null -w '%{http_code}' "http://$HUB:7180/login" | grep -q 200 && ok "web UI back after reboot" || fail "web UI back after reboot"
 
-say "a read-only login on t1; admin spaces run for a time"
-out=$(thorn host readonly t1 --print 2>/dev/null | docker exec -i "$P-t1" sh 2>&1)
+say "logins of each space's own on t1; root for a time"
+# blackthorn reaches t1 as alice, who has no sudo: the printed script, run
+# there as root, also lets blackthorn's key in as root.
+out=$(thorn host setup t1 --print 2>/dev/null | docker exec -i "$P-t1" sh 2>&1)
 echo "$out" | grep -q "bt: done" && ok "the printed setup script ran on t1" || fail "setup script: $out"
-thorn host readonly t1 --verify | grep -q "has a read-only login: blackthorn" && ok "thorn host readonly --verify" || fail "readonly verify"
-thorn host ls | grep -q "blackthorn" && ok "host ls shows the read-only login" || fail "host ls"
-docker exec "$P-t1" grep -q 'command="/usr/local/libexec/blackthorn-ssh"' /home/alice/.ssh/authorized_keys && ok "the admin key logs its commands on t1 too" || fail "admin key line"
-[ "$(docker exec "$P-t1" stat -c %U /home/blackthorn/.ssh/authorized_keys)" = root ] && ok "the read-only user cannot change its own key line" || fail "ro key file owner"
-[ "$(hub systemctl is-enabled "blackthorn-space@$k1.service")" = disabled ] && ok "t1-main (admin) no longer starts at boot" || fail "admin space still enabled"
-thorn new t1 --name t1-ro | grep -q "read-only" && ok "new spaces on t1 are read-only" || fail "new read-only space"
+out=$(thorn host setup t1 --verify 2>&1)
+echo "$out" | grep -q "is set up" && ok "thorn host setup --verify" || fail "setup verify: $out"
+thorn host ls | grep "^t1 " | grep -q "their own" && ok "host ls: spaces there have logins of their own" || fail "host ls: $(thorn host ls)"
+thorn host ls | grep "^t1 " | grep -q " root " && ok "blackthorn itself now logs in to t1 as root" || fail "host ls login: $(thorn host ls)"
+docker exec "$P-t1" grep -q 'command="/usr/local/libexec/blackthorn-ssh"' /root/.ssh/authorized_keys && ok "blackthorn's key logs its commands on t1" || fail "root key line"
+docker exec "$P-t1" test -f "/etc/ssh/blackthorn/bt-$k1" && docker exec "$P-t1" test -f "/etc/ssh/blackthorn/bt-$k1-ro" && ok "t1-main got its two logins" || fail "t1-main's key lines"
+[ "$(docker exec "$P-t1" stat -c %U "/etc/ssh/blackthorn/bt-$k1")" = root ] && ok "their key lines are root's" || fail "key line owner"
+hub grep -q "User bt-$k1" "/var/lib/blackthorn/spaces/$k1/.ssh/config" && ok "t1-main logs in as its own user" || fail "t1-main ssh config: $(hub cat /var/lib/blackthorn/spaces/$k1/.ssh/config)"
+want=$(hub cut -d' ' -f2 "/etc/blackthorn/keys/spaces/$k1.pub")
+got=$(hub env SSH_AUTH_SOCK="/run/blackthorn-agent/$k1/agent.sock" ssh-add -L | cut -d' ' -f2)
+[ "$got" = "$want" ] && ok "its agent holds only its own key" || fail "t1-main agent keys: $got"
+[ "$(hub runuser -u "bt-$k1" -- ssh t1 id -un 2>/dev/null)" = "bt-$k1" ] && ok "ssh t1 is bt-$k1" || fail "t1-main login: $(hub runuser -u "bt-$k1" -- ssh t1 id -un 2>&1)"
+[ "$(docker exec "$P-t1" stat -c %U /srv/t1-main)" = "bt-$k1" ] && ok "/srv/t1-main is its own" || fail "/srv/t1-main owner"
+hub runuser -u "bt-$k1" -- ssh t1 'touch /srv/t1-main/x' && ok "it writes there" || fail "write to /srv/t1-main"
+if hub runuser -u "bt-$k1" -- ssh t1 'sudo -n true' 2>/dev/null; then fail "a user login can use sudo"; else ok "a user login has no sudo"; fi
+if hub runuser -u "bt-$k1" -- ssh t1 'touch /etc/x' 2>/dev/null; then fail "a user login wrote to /etc"; else ok "nor writes outside its own"; fi
+hub grep -q "/srv/t1-main" "/var/lib/blackthorn/spaces/$k1/ops-box/CLAUDE.md" && ok "its instructions point to its folder" || fail "CLAUDE.md srv: $(hub ls /var/lib/blackthorn/spaces/$k1)"
+
+out=$(thorn new t1 --name t1-dev 2>&1)
+echo "$out" | grep -q "logs in as root" && ok "a new space has root by default" || fail "default root: $out"
+echo "$out" | grep -q "UTC, then logs in as user" && ok "for a time, then user" || fail "default root time: $out"
+kd=$(key_of t1-dev)
+echo good-code | thorni login t1-dev >/dev/null
+docker exec "$P-t1" test -f "/etc/sudoers.d/bt-$kd-root" && ok "its sudo rule is on t1" || fail "no sudo rule"
+[ "$(hub runuser -u "bt-$kd" -- ssh t1 'sudo -n id -u' 2>/dev/null)" = 0 ] && ok "root through sudo on its own login" || fail "root: $(hub runuser -u "bt-$kd" -- ssh t1 'sudo -n id -u' 2>&1)"
+thorn ls | grep "^t1-dev " | grep -q "root (" && ok "thorn ls shows root and its time" || fail "ls root: $(thorn ls)"
+thorn root t1-dev --off | grep -q "no root" && ok "thorn root --off" || fail "root off"
+docker exec "$P-t1" test -e "/etc/sudoers.d/bt-$kd-root" && fail "the sudo rule stayed" || ok "its sudo rule is gone"
+if hub runuser -u "bt-$kd" -- ssh t1 'sudo -n true' 2>/dev/null; then fail "sudo still works"; else ok "and sudo no longer works"; fi
+thorn access t1-dev read-only | grep -q "now logs in as read-only" && ok "thorn access read-only, at once" || fail "access ro"
+[ "$(hub runuser -u "bt-$kd" -- ssh t1 id -un 2>/dev/null)" = "bt-$kd-ro" ] && ok "ssh t1 is now bt-$kd-ro" || fail "ro login: $(hub runuser -u "bt-$kd" -- ssh t1 id -un 2>&1)"
+hub runuser -u "bt-$kd" -- ssh t1 'ls /srv/t1-dev' >/dev/null 2>&1 && ok "read-only reads its folder" || fail "ro read /srv"
+if hub runuser -u "bt-$kd" -- ssh t1 'touch /srv/t1-dev/y' 2>/dev/null; then fail "read-only wrote to its folder"; else ok "but does not write it"; fi
+[ "$(hub systemctl is-active "blackthorn-space@$kd.service")" = active ] && ok "the space kept running through all that" || fail "t1-dev stopped"
+
+thorn new t1 --name t1-ro --access read-only --root no >/dev/null
 echo good-code | thorni login t1-ro >/dev/null
 kr=$(key_of t1-ro)
-hub grep -q "User blackthorn" "/var/lib/blackthorn/spaces/$kr/.ssh/config" && ok "t1-ro logs in as blackthorn" || fail "ro ssh config"
+hub grep -q "User bt-$kr-ro" "/var/lib/blackthorn/spaces/$kr/.ssh/config" && ok "t1-ro logs in read-only" || fail "ro ssh config"
 hub grep -q "read-only" "/var/lib/blackthorn/spaces/$kr/t1-ro/CLAUDE.md" && ok "and its instructions say so" || fail "ro CLAUDE.md"
 expect_reach 30 t1-ro t1 ok
-want=$(hub cut -d' ' -f2 /etc/blackthorn/keys/t1.ro.pub)
+want=$(hub cut -d' ' -f2 "/etc/blackthorn/keys/spaces/$kr-ro.pub")
 got=$(hub env SSH_AUTH_SOCK="/run/blackthorn-agent/$kr/agent.sock" ssh-add -L | cut -d' ' -f2)
-[ "$got" = "$want" ] && ok "its agent holds only the read-only key" || fail "ro agent keys: $got"
-[ "$(hub runuser -u "bt-$kr" -- ssh t1 id -un 2>/dev/null)" = blackthorn ] && ok "ssh t1 is the read-only user" || fail "ro login"
+[ "$got" = "$want" ] && ok "its agent holds only its read-only key" || fail "ro agent keys: $got"
+if hub runuser -u "bt-$kr" -- ssh -l "bt-$kr" t1 true 2>/dev/null; then fail "a read-only space logged in as its user login"; else ok "it cannot log in as its user login"; fi
 if hub runuser -u "bt-$kr" -- ssh t1 'touch /root/x' 2>/dev/null; then fail "the read-only space wrote as root"; else ok "it cannot write where root can"; fi
-thorn stop t1-main >/dev/null
-thorn start t1-main --for 1m | grep -q "as admin until" && ok "an admin space starts for a time" || fail "start --for"
-thorn new t1 --access admin --name t1-adm2 >/dev/null
-echo good-code | thorni login t1-adm2 | grep -q "start it when you need it" && ok "a new admin space waits to be started" || fail "admin login"
-thorn start t1-adm2 --for 1h 2>&1 | grep -q "already working on t1 as admin" && ok "one admin space per machine at a time" || fail "second admin space started"
-# The reboot ended the web session: log in again.
+
+# The web: going up takes a code, going down does not.
 web_post /login --data-urlencode "user=frakw" --data-urlencode "password=$PASSWORD" --data-urlencode "code=$(fresh_code $WEB_SECRET)" >/dev/null
 C=$(csrf)
-r=$(web_post /space/t1-adm2/start --data-urlencode "csrf=$C")
-case "$r" in *"limited"*) ok "the web's plain Start will not start an admin space";; *) fail "web start: $r";; esac
-thorn access t1-adm2 readonly | grep -q "now read-only" && ok "thorn access" || fail "access change"
-thorn rm t1-adm2 --purge >/dev/null
-web_get /host/t1 | grep -q "Read-only login" && ok "the machine page shows the read-only login" || fail "host page"
+r=$(web_post /space/t1-dev/access --data-urlencode "csrf=$C" --data-urlencode "access=user")
+case "$r" in *"fresh%20code"*) ok "going up to user needs a code";; *) fail "access up without a code: $r";; esac
+r=$(web_post /space/t1-dev/root --data-urlencode "csrf=$C" --data-urlencode "root_for=1h")
+case "$r" in *"fresh%20code"*) ok "root needs a code";; *) fail "root without a code: $r";; esac
+thorn root t1-dev --for 1m | grep -q "has root on t1 until" && ok "thorn root --for" || fail "root for"
+[ "$(hub runuser -u "bt-$kd" -- ssh t1 id -un 2>/dev/null)" = "bt-$kd" ] && ok "root goes through its user login" || fail "root login"
+web_get /space/t1-dev | grep -q "Revoke root" && ok "the space page offers to revoke root" || fail "no revoke button"
+web_get /host/t1 | grep -q "logins of its own" && ok "the machine page lists the spaces' logins" || fail "host page logins"
 web_get /map.svg | grep -q 'class="wire ro"' && ok "the map draws read-only logins" || fail "map ro wire"
+web_get /map.svg | grep -q 'class="wire admin"' && ok "and root" || fail "map root wire"
 
 say "what a space did: its commands, recorded by root"
 d="/var/lib/blackthorn/spaces/$kr/.claude/projects/-var-lib-blackthorn-spaces-$kr-t1-ro"
@@ -611,9 +643,14 @@ thorn chat new t2-claude --name "disk check" >/dev/null
 sleep 3
 hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args" | grep -Eq -- "--name [0-9a-f]{8} disk check" && ok "the new chat starts with the id's start and its name" || fail "chat name: $(hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args")"
 
-echo "   waiting for t1-main's admin time to run out (tick runs every minute)..."
-for _ in $(seq 75); do [ "$(hub systemctl is-active "blackthorn-space@$k1.service")" != active ] && break; sleep 2; done
-[ "$(hub systemctl is-active "blackthorn-space@$k1.service")" != active ] && ok "the admin space stopped by itself when its time was up" || fail "admin time limit"
+echo "   waiting for t1-dev's root to run out (tick runs every minute)..."
+for _ in $(seq 75); do docker exec "$P-t1" test -e "/etc/sudoers.d/bt-$kd-root" || break; sleep 2; done
+docker exec "$P-t1" test -e "/etc/sudoers.d/bt-$kd-root" && fail "root did not end" || ok "root ended by itself when its time was up"
+[ "$(hub runuser -u "bt-$kd" -- ssh t1 id -un 2>/dev/null)" = "bt-$kd-ro" ] && ok "back to its usual login" || fail "after root: $(hub runuser -u "bt-$kd" -- ssh t1 id -un 2>&1)"
+[ "$(hub systemctl is-active "blackthorn-space@$kd.service")" = active ] && ok "still running" || fail "t1-dev stopped when root ended"
+thorn rm t1-dev --purge --purge-data >/dev/null
+docker exec "$P-t1" id "bt-$kd" >/dev/null 2>&1 && fail "bt-$kd is still on t1" || ok "its logins on t1 went with it"
+docker exec "$P-t1" test -e /srv/t1-dev && fail "/srv/t1-dev stayed" || ok "and its folder, as asked"
 
 say "remove a space"
 thorn rm t2-claude >/dev/null

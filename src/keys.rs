@@ -15,14 +15,6 @@ pub fn generate(host: &str) -> Result<()> {
     )
 }
 
-/// The key of the machine's read-only login.
-pub fn generate_ro(host: &str) -> Result<()> {
-    keygen(
-        &paths::ro_key_file(host),
-        &format!("blackthorn@{}:{host}:readonly", crate::sys::hostname()),
-    )
-}
-
 /// A space's own two keys: its user (and root) login and its read-only
 /// one, for the machines set up for logins of each space's own.
 pub fn generate_space(key: &str) -> Result<()> {
@@ -96,10 +88,6 @@ pub fn remove(host: &str) -> Result<()> {
 
 pub fn public_key(host: &str) -> Result<String> {
     read_public(&paths::pubkey_file(host))
-}
-
-pub fn ro_public_key(host: &str) -> Result<String> {
-    read_public(&paths::ro_pubkey_file(host))
 }
 
 fn read_public(p: &Path) -> Result<String> {

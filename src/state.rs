@@ -276,12 +276,6 @@ pub struct Login<'a> {
     pub bridged: bool,
 }
 
-impl Login<'_> {
-    pub fn readonly(&self) -> bool {
-        self.tier == Tier::ReadOnly
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Block {
@@ -752,6 +746,12 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
+/// A space for tests elsewhere.
+#[cfg(test)]
+pub fn tests_space(host: &str) -> Space {
+    tests::space(host)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,7 +912,10 @@ mod tests {
             "a bridge reaches the read-only login"
         );
         let l = st.logins("nas-ro", 5);
-        assert_eq!((l[0].user.as_str(), l[0].readonly()), ("blackthorn", true));
+        assert_eq!(
+            (l[0].user.as_str(), l[0].tier),
+            ("blackthorn", Tier::ReadOnly)
+        );
         assert_eq!(st.logins("nas-user", 5)[0].user, "frakw");
         st.hosts.get_mut("nas").unwrap().readonly = None;
         assert!(st.logins("nas-ro", 5).is_empty(), "no read-only login left");
