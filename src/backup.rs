@@ -299,10 +299,6 @@ pub fn import(file: &Path, replace: bool, password: Option<&str>) -> Result<Impo
     let mut started = Vec::new();
     for (name, s) in &ctx.state.spaces {
         let unit = paths::space_unit(&s.key);
-        if ctx.state.limited(s) {
-            let _ = sys::systemctl(&["disable", &unit]);
-            continue;
-        }
         sys::systemctl(&["enable", &unit])?;
         if s.agent != CLAUDE || crate::ops::logged_in(s) {
             sys::systemctl(&["restart", &unit])?;

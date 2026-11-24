@@ -127,6 +127,9 @@ pub enum Op {
     SpaceRm {
         name: String,
         purge: bool,
+        /// Its folder on its machine (/srv/<name>) too.
+        #[serde(default)]
+        purge_data: bool,
         code: String,
     },
     SpaceRename {
@@ -249,21 +252,25 @@ pub enum Op {
         #[serde(default)]
         title: Option<String>,
     },
-    /// Starts an admin space on a machine with a read-only login, for a
-    /// time.
-    SpaceStartFor {
+    /// Gives a space root on its machine: for a time ("8h") or "forever".
+    SpaceRoot {
         name: String,
         duration: String,
         code: String,
     },
+    /// Takes a space's root back. Needs no code: it only takes away.
+    SpaceRootOff {
+        name: String,
+    },
+    /// A space's usual login. Up (to user) takes a code; down does not.
     SpaceAccess {
         name: String,
         access: crate::state::Access,
+        #[serde(default)]
         code: String,
     },
-    HostReadonly {
+    HostSetup {
         name: String,
-        user: String,
         code: String,
     },
     /// The latest commands a space ran.
@@ -402,14 +409,16 @@ impl Op {
             | Op::NotifySet { code, .. }
             | Op::PasskeyAdd { code, .. }
             | Op::PasskeyRm { code, .. }
-            | Op::SpaceStartFor { code, .. }
-            | Op::SpaceAccess { code, .. }
-            | Op::HostReadonly { code, .. }
+            | Op::SpaceRoot { code, .. }
+            | Op::HostSetup { code, .. }
             | Op::TailscaleInstall { code }
             | Op::TailscaleUp { code }
             | Op::TailscaleWeb { code, .. }
             | Op::SpaceShare { code, .. }
             | Op::SpaceOwner { code, .. } => Some(code),
+            Op::SpaceAccess { access, code, .. } if *access != crate::state::Access::Readonly => {
+                Some(code)
+            }
             _ => None,
         }
     }
@@ -846,7 +855,7 @@ fn need(op: &Op) -> Need {
         | Op::HostMoveScan { .. }
         | Op::HostMove { .. }
         | Op::HostRename { .. }
-        | Op::HostReadonly { .. }
+        | Op::HostSetup { .. }
         | Op::ConfigShow
         | Op::ConfigSet { .. }
         | Op::TailnetPeers
@@ -869,14 +878,22 @@ fn need(op: &Op) -> Need {
         | Op::ChatUpload { name, .. }
         | Op::ChatOpen { name, .. }
         | Op::ChatStop { name, .. }
-        | Op::SpaceSend { name, .. } => one(name, Use),
+        | Op::SpaceSend { name, .. }
+        | Op::SpaceRootOff { name } => one(name, Use),
+        Op::SpaceAccess { name, access, .. } => one(
+            name,
+            if *access == crate::state::Access::Readonly {
+                Use
+            } else {
+                Manage
+            },
+        ),
         Op::SpaceControl { names, .. } => Need::Spaces(names.clone(), Use),
         Op::SpaceRm { name, .. }
         | Op::LoginStart { name }
         | Op::LoginFinish { name, .. }
         | Op::LoginCancel { name }
-        | Op::SpaceStartFor { name, .. }
-        | Op::SpaceAccess { name, .. }
+        | Op::SpaceRoot { name, .. }
         | Op::SpaceRemote { name, .. }
         | Op::ChatRm { name, .. }
         | Op::SpaceShare { name, .. } => one(name, Manage),
@@ -1430,7 +1447,12 @@ fn run_op(
                 .into_keys()
                 .collect::<Vec<_>>(),
         ),
-        Op::SpaceRm { name, purge, .. } => json(ops::space_rm(&name, purge)?),
+        Op::SpaceRm {
+            name,
+            purge,
+            purge_data,
+            ..
+        } => json(ops::space_rm(&name, purge, purge_data)?),
         Op::SpaceRename {
             old, new, rc_name, ..
         } => json(ops::space_rename(
@@ -1442,7 +1464,7 @@ fn run_op(
             if names.is_empty() {
                 bail!("name a space");
             }
-            json(ops::space_control(action, &names, None)?)
+            json(ops::space_control(action, &names)?)
         }
         Op::SpaceScreen { name } => json(ops::space_screen(&name)?),
         Op::SpaceSend {
@@ -1527,19 +1549,16 @@ fn run_op(
         Op::ChatOpen { name, id, title } => {
             json(ops::chat_open(&name, id.as_deref(), title.as_deref())?)
         }
-        Op::SpaceStartFor { name, duration, .. } => {
-            let secs = ops::parse_duration(duration.trim())?;
-            json(ops::start_unit(&name, false, Some(secs))?)
+        Op::SpaceRoot { name, duration, .. } => {
+            let root = ops::parse_root(&duration)?;
+            if root.is_none() {
+                bail!("say for how long, or forever");
+            }
+            json(ops::space_root(&name, root)?)
         }
-        Op::SpaceAccess { name, access, .. } => json(ops::space_access(&name, access)?),
-        Op::HostReadonly { name, user, .. } => {
-            let user = if user.trim().is_empty() {
-                "blackthorn"
-            } else {
-                user.trim()
-            };
-            json(ops::host_readonly(&name, user, true)?)
-        }
+        Op::SpaceRootOff { name } => json(ops::space_root(&name, None)?),
+        Op::SpaceAccess { name, access, .. } => json(ops::space_login(&name, access)?),
+        Op::HostSetup { name, .. } => json(crate::logins::setup(&name, true)?),
         Op::Activity { name, limit } => json(crate::activity::list(&name, limit.min(500))?),
         Op::HostRename { old, new, .. } => json(ops::host_rename(&old, &new)?),
         Op::AccountRename { new, .. } => {
@@ -1841,6 +1860,7 @@ pub fn all_op_names() -> Vec<String> {
         Op::SpaceRm {
             name: s(),
             purge: false,
+            purge_data: false,
             code: s(),
         },
         Op::SpaceRename {
@@ -1933,19 +1953,19 @@ pub fn all_op_names() -> Vec<String> {
             id: None,
             title: None,
         },
-        Op::SpaceStartFor {
+        Op::SpaceRoot {
             name: s(),
             duration: s(),
             code: s(),
         },
+        Op::SpaceRootOff { name: s() },
         Op::SpaceAccess {
             name: s(),
             access: Default::default(),
             code: s(),
         },
-        Op::HostReadonly {
+        Op::HostSetup {
             name: s(),
-            user: s(),
             code: s(),
         },
         Op::Activity {
@@ -2018,9 +2038,10 @@ pub fn all_op_names() -> Vec<String> {
             | Op::SpaceRm { .. }
             | Op::SpaceRename { .. }
             | Op::SpaceControl { .. }
-            | Op::SpaceStartFor { .. }
+            | Op::SpaceRoot { .. }
+            | Op::SpaceRootOff { .. }
             | Op::SpaceAccess { .. }
-            | Op::HostReadonly { .. }
+            | Op::HostSetup { .. }
             | Op::Activity { .. }
             | Op::SpaceScreen { .. }
             | Op::SpaceSend { .. }

@@ -103,6 +103,29 @@ pub fn unix_user(key: &str) -> String {
     format!("bt-{key}")
 }
 
+/// A space's read-only login on the machines set up for logins of each
+/// space's own (its user login there has the same name as its Unix user
+/// here, `unix_user`).
+pub fn remote_ro_user(key: &str) -> String {
+    format!("bt-{key}-ro")
+}
+
+/// The keys of each space's own logins: its user (and root) login, and
+/// its read-only one. Their own folder, so no machine's name can clash.
+pub const SPACE_KEYS_DIR: &str = "/etc/blackthorn/keys/spaces";
+
+pub fn space_key_file(key: &str) -> PathBuf {
+    PathBuf::from(SPACE_KEYS_DIR).join(key)
+}
+
+pub fn space_ro_key_file(key: &str) -> PathBuf {
+    PathBuf::from(SPACE_KEYS_DIR).join(format!("{key}-ro"))
+}
+
+/// Where a machine set up by blackthorn keeps the key lines of the
+/// spaces' logins, out of their reach (sshd's AuthorizedKeysFile).
+pub const REMOTE_KEYS_DIR: &str = "/etc/ssh/blackthorn";
+
 pub fn space_unit(key: &str) -> String {
     format!("blackthorn-space@{key}.service")
 }

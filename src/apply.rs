@@ -27,11 +27,14 @@ pub fn everything(cfg: &Config, state: &State, now: u64) -> Result<()> {
 /// The keys a space's agent holds: one per machine it may reach now, for
 /// the login it uses there.
 pub fn agent_keys(state: &State, space: &str, now: u64) -> Vec<std::path::PathBuf> {
-    state
+    let mut v: Vec<std::path::PathBuf> = state
         .logins(space, now)
-        .iter()
-        .map(keys::login_key)
-        .collect()
+        .into_iter()
+        .map(|l| l.key)
+        .collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// Every address that must never open a connection to the hub.

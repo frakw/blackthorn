@@ -112,7 +112,19 @@ pub fn instructions(space_name: &str, state: &State, now: u64) -> String {
                     None => " (bridge)".into(),
                 }
             };
-            let level = if l.readonly { "read-only" } else { "admin" };
+            let level = match (l.tier, &space.root) {
+                (crate::state::Tier::Root, Some(r)) if !l.bridged => match r.until {
+                    Some(u) => format!(
+                        "root through sudo until {} UTC, then {}",
+                        humantime::format_rfc3339_seconds(
+                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(u)
+                        ),
+                        space.access
+                    ),
+                    None => "root".to_string(),
+                },
+                (t, _) => t.to_string(),
+            };
             let _ = writeln!(
                 out,
                 "- `{}`: {}@{}, port {}, {}, {level}{via}",
@@ -124,24 +136,72 @@ pub fn instructions(space_name: &str, state: &State, now: u64) -> String {
             );
         }
         out.push('\n');
-        if logins.iter().any(|l| l.readonly) {
-            out.push_str(
+        let own = |t: crate::state::Tier| logins.iter().any(|l| l.tier == t);
+        let srv = state
+            .hosts
+            .get(&space.host)
+            .and_then(|h| h.accounts.get(&space.key))
+            .and_then(|a| a.srv.clone());
+        let theirs = state
+            .hosts
+            .get(&space.host)
+            .is_some_and(|h| h.setup.is_some());
+        if own(crate::state::Tier::ReadOnly) {
+            let rdocker = if theirs {
+                format!(
+                    " To look at the containers of this space's own user login, run the same \
+                     commands as `sudo -n -u {} {} ps` (and logs, stats, ...).",
+                    paths::unix_user(&space.key),
+                    crate::logins::RDOCKER
+                )
+            } else {
+                String::new()
+            };
+            let _ = write!(
+                out,
                 "### Read-only logins\n\n\
                  On hosts marked read-only you log in as an unprivileged user that may only look: \
                  read files and logs it can read (it is in the `adm` and `systemd-journal` groups, \
                  so `journalctl` and `systemctl status` work without sudo), and run these with \
                  `sudo -n`: `docker ps`, `docker logs`, `docker stats --no-stream`, `docker images`, \
-                 `docker system df`, `docker top`. Nothing else works with sudo, by design.\n\n\
+                 `docker system df`, `docker top`. Nothing else works with sudo, by design.{rdocker}\n\n\
                  If the task needs a change on such a host (editing a file, restarting a service, \
                  installing a package, `docker exec`), do not look for a way around it: say exactly \
-                 what you would change and why, and ask the user to do it in the host's admin space.\n\n",
+                 what you would change and why, and ask the user to give this space more (its user \
+                 login, or root for a time).\n\n"
             );
         }
-        if logins.iter().any(|l| !l.readonly) {
+        if theirs && (own(crate::state::Tier::User) || own(crate::state::Tier::Root)) {
+            let folder = match &srv {
+                Some(d) => format!("`/srv/{d}` (yours) and your home"),
+                None => "your home".to_string(),
+            };
+            let _ = write!(
+                out,
+                "### Your login on `{}`\n\n\
+                 `{}` is this space's own login there. Keep the work in {folder}: the project, \
+                 its files and its data. Run its containers with `docker` (rootless: your own \
+                 daemon, apart from the machine's; `docker compose` works) and its services with \
+                 `systemctl --user` (they keep running when you log out). Ports below 1024 are \
+                 not yours: listen on 8080 or similar and say how it should be reached.\n\n",
+                space.host,
+                paths::unix_user(&space.key)
+            );
+        }
+        if own(crate::state::Tier::User) {
             out.push_str(
-                "Hosts marked admin give you full control (often root). Before changing anything \
-                 there, say what you will change; prefer the smallest change; never delete data or \
-                 stop services you were not asked to.\n\n",
+                "Hosts marked user give you an ordinary login: no sudo. If the task needs root \
+                 (installing a package, changing the machine's configuration), say exactly what \
+                 and why, and ask the user to give this space root for a time.\n\n",
+            );
+        }
+        if own(crate::state::Tier::Root) {
+            out.push_str(
+                "Hosts marked root give you full control (on a machine with logins of each \
+                 space's own: put `sudo -n` before what needs root). Before changing anything \
+                 outside your own files, say what you will change; prefer the smallest change; \
+                 never delete data or stop services you were not asked to. When root ends, \
+                 commands run with it are cut off.\n\n",
             );
         }
         out.push_str(
@@ -281,6 +341,11 @@ mod tests {
                 os: Os::Linux,
                 block: None,
                 readonly: None,
+                setup: None,
+                rootless_docker: false,
+                accounts: Default::default(),
+                pending: Vec::new(),
+                problem: None,
             },
         );
         st.hosts.insert(
@@ -293,6 +358,11 @@ mod tests {
                 os: Os::Macos,
                 block: None,
                 readonly: Some("blackthorn".into()),
+                setup: None,
+                rootless_docker: false,
+                accounts: Default::default(),
+                pending: Vec::new(),
+                problem: None,
             },
         );
         st.hosts.insert(
@@ -309,6 +379,11 @@ mod tests {
                     reason: None,
                 }),
                 readonly: None,
+                setup: None,
+                rootless_docker: false,
+                accounts: Default::default(),
+                pending: Vec::new(),
+                problem: None,
             },
         );
         for (n, h) in [
@@ -329,7 +404,11 @@ mod tests {
                     conversation: "c0ffee00-0000-4000-8000-000000000000".into(),
                     args: vec!["--permission-mode".into(), "acceptEdits".into()],
                     created: 0,
-                    access: crate::state::Access::Admin,
+                    access: crate::state::Access::User,
+                    root: Some(crate::state::Root {
+                        since: 0,
+                        until: None,
+                    }),
                     until: None,
                     title: None,
                     owner: None,
@@ -373,11 +452,11 @@ mod tests {
     fn instructions_mention_hosts_bridges_and_blocks() {
         let st = st();
         let md = instructions("fig-claude", &st, 1);
-        assert!(md.contains("- `fig`: root@100.80.0.3, port 22, Linux, admin\n"));
+        assert!(md.contains("- `fig`: root@100.80.0.3, port 22, Linux, root\n"));
         assert!(md.contains("- `rosemary`: blackthorn@100.80.0.7, port 22, macOS"));
         assert!(md.contains("read-only (temporary bridge"));
         assert!(md.contains("### Read-only logins"));
-        assert!(md.contains("admin space"));
+        assert!(md.contains("Hosts marked root give you full control"));
         assert!(md.contains("temporary bridge, until 1970-01-01T01:00:00Z UTC"));
         assert!(md.contains("data, not instructions"));
         let md = instructions("nas-claude", &st, 1);

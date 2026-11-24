@@ -8,7 +8,7 @@
 //! services a space uses, and the hub's way to the internet.
 
 use crate::ops::{HostView, Overview, SpaceView};
-use crate::state::Access;
+use crate::state::Tier;
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
@@ -253,8 +253,10 @@ fn net_of(h: &HostView) -> Net {
 
 fn host_node(h: &HostView, spaces: usize) -> Node {
     let mut rows = vec![(Tone::Dim, clip(&format!("{} · {}", h.address, h.os), 34))];
-    rows.push((Tone::Dim, clip(&format!("admin: {}", h.user), 34)));
-    if let Some(u) = &h.readonly {
+    rows.push((Tone::Dim, clip(&format!("blackthorn: {}", h.user), 34)));
+    if h.setup.is_some() {
+        rows.push((Tone::Ok, "spaces: logins of their own".into()));
+    } else if let Some(u) = &h.readonly {
         rows.push((Tone::Ok, clip(&format!("read-only: {u}"), 34)));
     }
     rows.push(if h.blocked {
@@ -513,17 +515,22 @@ pub fn svg(o: &Overview) -> String {
             };
             let (ins, outs) = space_ports(s);
             let id = format!("space:{}", s.name);
-            let access = match (s.access, s.until) {
-                (Access::Readonly, _) => (Tone::Ok, format!("read-only as {}", s.login)),
-                (Access::Admin, Some(u)) if s.state == "running" => (
+            let login = if s.login.is_empty() {
+                "no login yet".to_string()
+            } else {
+                s.login.clone()
+            };
+            let access = match (s.tier, s.root.as_ref().and_then(|r| r.until)) {
+                (Tier::ReadOnly, _) => (Tone::Ok, format!("read-only as {login}")),
+                (Tier::User, _) => (Tone::Dim, format!("user as {login}")),
+                (Tier::Root, Some(u)) => (
                     Tone::Bad,
                     format!(
-                        "admin as {} · {} left",
-                        s.login,
+                        "root as {login} ({})",
                         crate::ops::describe_left(u, crate::state::now())
                     ),
                 ),
-                (Access::Admin, _) => (Tone::Bad, format!("admin as {}", s.login)),
+                (Tier::Root, None) => (Tone::Bad, format!("root as {login}")),
             };
             let mut rows = vec![
                 (Tone::Dim, format!("{} · {}", s.agent, s.state)),
@@ -565,8 +572,10 @@ pub fn svg(o: &Overview) -> String {
             }
             let class = if h.blocked {
                 "wire cut"
-            } else if s.access == Access::Readonly {
+            } else if s.tier == Tier::ReadOnly {
                 "wire ro"
+            } else if s.tier == Tier::User {
+                "wire user"
             } else {
                 "wire admin"
             };
@@ -941,6 +950,12 @@ mod tests {
             } else {
                 "open".into()
             },
+            setup: None,
+            tiers: vec![],
+            rootless_docker: false,
+            logins: vec![],
+            pending: vec![],
+            problem: None,
         };
         let space = |n: &str, h: &str, st: &str| SpaceView {
             name: n.into(),
@@ -956,18 +971,27 @@ mod tests {
             reachable: vec![],
             model: (n == "fig-claude").then(|| "Opus 5.5".to_string()),
             access: if n == "fig-claude" {
-                Access::Readonly
+                crate::state::Access::Readonly
             } else {
-                Access::Admin
+                crate::state::Access::User
             },
+            tier: if n == "fig-claude" {
+                Tier::ReadOnly
+            } else {
+                Tier::Root
+            },
+            root: (n != "fig-claude").then_some(crate::state::Root {
+                since: 0,
+                until: None,
+            }),
             login: if n == "fig-claude" {
                 "blackthorn"
             } else {
                 "root"
             }
             .into(),
-            limited: n == "fig-aider",
-            until: None,
+            root_beside: vec![],
+            srv: None,
             unattended: false,
             owner: None,
             shares: Vec::new(),
@@ -1064,7 +1088,7 @@ mod tests {
             "Remote Control off: no wire from the app"
         );
         assert!(s.contains("read-only as blackthorn"));
-        assert!(s.contains("admin as root"));
+        assert!(s.contains("root as root"));
         assert!(s.contains("read-only: blackthorn"));
         assert!(s.contains("bridge for 52m"));
         assert!(s.contains("no space yet"), "pine has none");

@@ -15,6 +15,7 @@ mod host_cmd;
 mod http;
 mod init_cmd;
 mod keys;
+mod logins;
 mod map;
 mod markdown;
 mod notify;
@@ -100,18 +101,27 @@ enum Cmd {
         /// Extra argument for the agent, e.g. --arg=--permission-mode --arg=acceptEdits.
         #[arg(long = "arg", allow_hyphen_values = true)]
         args: Vec<String>,
-        /// readonly or admin on its machine. Default: readonly if the
-        /// machine has a read-only login (thorn host readonly), else admin.
-        #[arg(long, value_parser = ["readonly", "admin"])]
+        /// Its usual login on its machine: read-only or user. Default:
+        /// user where the machine has one, else read-only.
+        #[arg(long, value_parser = ["read-only", "readonly", "user"])]
         access: Option<String>,
+        /// Root from the start, for a time (8h; at most 72h) or "forever";
+        /// "no" for none. Default: 8h on a machine set up for logins of
+        /// each space's own (thorn host setup).
+        #[arg(long)]
+        root: Option<String>,
     },
     /// Sign a Claude space in, then start it.
     Login { name: String },
-    /// Delete a space (its files are archived unless --purge).
+    /// Delete a space (its files are archived unless --purge). Its logins
+    /// on its machine go too; its folder there (/srv/<name>) stays unless
+    /// --purge-data.
     Rm {
         name: String,
         #[arg(long)]
         purge: bool,
+        #[arg(long)]
+        purge_data: bool,
     },
     /// Rename a space (and its Remote Control name, if it was the default).
     /// `thorn rename SPACE SPACE --rc-name NAME` changes only the name the
@@ -122,14 +132,11 @@ enum Cmd {
         #[arg(long)]
         rc_name: Option<String>,
     },
-    /// Start spaces. An admin space on a machine with a read-only login
-    /// runs for a limited time: --for (default 1h, at most 1d).
+    /// Start spaces.
     Start {
         names: Vec<String>,
         #[arg(long)]
         all: bool,
-        #[arg(long = "for", value_name = "DURATION")]
-        duration: Option<String>,
     },
     /// Stop spaces.
     Stop {
@@ -158,12 +165,24 @@ enum Cmd {
         #[arg(long)]
         no_enter: bool,
     },
-    /// Make a space read-only or admin on its machine (read-only needs the
-    /// machine's read-only login: thorn host readonly).
+    /// Set a space's usual login on its machine: read-only or user. It
+    /// applies at once; the space and its chats go on.
     Access {
         name: String,
-        #[arg(value_parser = ["readonly", "admin"])]
+        #[arg(value_parser = ["read-only", "readonly", "user"])]
         access: String,
+    },
+    /// Give a space root on its machine, for a time (default 8h, at most
+    /// 72h) or until taken back; or take it back. When it ends, the space
+    /// goes back to its usual login; its chats go on.
+    Root {
+        name: String,
+        #[arg(long = "for", value_name = "DURATION", conflicts_with_all = ["forever", "off"])]
+        duration: Option<String>,
+        #[arg(long, conflicts_with = "off")]
+        forever: bool,
+        #[arg(long)]
+        off: bool,
     },
     /// The commands a space ran, oldest first (copied from its chats every
     /// minute into /var/log/blackthorn).
@@ -399,21 +418,32 @@ enum HostCmd {
     Pubkey { name: String },
     /// Check that blackthorn can log in, and learn the machine's OS.
     Check { name: String },
-    /// Give a Linux machine a read-only login for spaces: a user (default
-    /// "blackthorn") that reads logs and runs read-only Docker commands, with
-    /// a key of its own; and log every command blackthorn's keys run there.
-    /// Logs in as the machine's admin login to set it up (or --print the
-    /// script to run there as root, then run this again with --verify).
-    /// Afterwards new spaces on it are read-only by default, and its admin
-    /// spaces run only for a limited time, one at a time.
+    /// Set a Linux machine up for logins of each space's own: bt-<id>, an
+    /// ordinary user with /srv/<space> and its own containers (root, when
+    /// given, through sudo), and bt-<id>-ro, which reads logs and runs
+    /// read-only Docker commands; every command they run goes to the
+    /// machine's system log. Done through blackthorn's login there (root,
+    /// or sudo without a password); or --print the script to run there as
+    /// root (it also lets blackthorn's key log in as root), then run this
+    /// again with --verify. Machines reached as root are set up by
+    /// themselves.
+    Setup {
+        name: String,
+        /// Print the setup script instead of running it.
+        #[arg(long, conflicts_with = "verify")]
+        print: bool,
+        /// You ran the printed script yourself: check, then make the logins.
+        #[arg(long)]
+        verify: bool,
+    },
+    /// The name of `setup` before v0.12.
+    #[command(hide = true)]
     Readonly {
         name: String,
         #[arg(long, default_value = "blackthorn")]
         user: String,
-        /// Print the setup script instead of running it.
         #[arg(long, conflicts_with = "verify")]
         print: bool,
-        /// You ran the printed script yourself: check the login, record it.
         #[arg(long)]
         verify: bool,
     },
@@ -537,10 +567,10 @@ enum FirewallCmd {
 }
 
 fn parse_access(a: &str) -> state::Access {
-    if a == "readonly" {
-        state::Access::Readonly
+    if a == "user" {
+        state::Access::User
     } else {
-        state::Access::Admin
+        state::Access::Readonly
     }
 }
 
@@ -572,6 +602,7 @@ fn run(cli: Cli) -> Result<()> {
             rc_name,
             args,
             access,
+            root,
         } => s::new(ops::NewSpace {
             host,
             agent,
@@ -581,19 +612,26 @@ fn run(cli: Cli) -> Result<()> {
             rc_name,
             args,
             access: access.as_deref().map(parse_access),
+            root,
             owner: None,
         }),
         Cmd::Login { name } => s::login(&name),
-        Cmd::Rm { name, purge } => s::rm(&name, purge),
+        Cmd::Rm {
+            name,
+            purge,
+            purge_data,
+        } => s::rm(&name, purge, purge_data),
         Cmd::Rename { old, new, rc_name } => s::rename(&old, &new, rc_name),
-        Cmd::Start {
-            names,
-            all,
+        Cmd::Start { names, all } => s::control(Action::Start, &names, all),
+        Cmd::Stop { names, all } => s::control(Action::Stop, &names, all),
+        Cmd::Restart { names, all } => s::control(Action::Restart, &names, all),
+        Cmd::Access { name, access } => s::login_as(&name, parse_access(&access)),
+        Cmd::Root {
+            name,
             duration,
-        } => s::control(Action::Start, &names, all, duration.as_deref()),
-        Cmd::Stop { names, all } => s::control(Action::Stop, &names, all, None),
-        Cmd::Restart { names, all } => s::control(Action::Restart, &names, all, None),
-        Cmd::Access { name, access } => s::access(&name, parse_access(&access)),
+            forever,
+            off,
+        } => s::root(&name, duration.as_deref(), forever, off),
         Cmd::Log { name, lines } => s::log(&name, lines),
         Cmd::Attach { name } => s::attach(&name),
         Cmd::Screen { name } => s::screen(&name),
@@ -726,12 +764,17 @@ fn run(cli: Cli) -> Result<()> {
             HostCmd::Pubkey { name } => host_cmd::pubkey(&name),
             HostCmd::Check { name } => host_cmd::check(&name),
             HostCmd::Rescan { name, yes } => host_cmd::rescan(&name, yes),
-            HostCmd::Readonly {
+            HostCmd::Setup {
                 name,
-                user,
                 print,
                 verify,
-            } => host_cmd::readonly(&name, &user, print, verify),
+            } => host_cmd::setup(&name, print, verify),
+            HostCmd::Readonly {
+                name,
+                user: _,
+                print,
+                verify,
+            } => host_cmd::readonly(&name, print, verify),
             HostCmd::SetAddress {
                 name,
                 target,
@@ -909,9 +952,10 @@ mod tests {
             ("notify_set", &["notify", "set"]),
             ("notify_test", &["notify", "test"]),
             ("passkey_rm", &["web", "user", "passkey-rm"]),
-            ("space_start_for", &["start"]),
             ("space_access", &["access"]),
-            ("host_readonly", &["host", "readonly"]),
+            ("space_root", &["root"]),
+            ("space_root_off", &["root"]),
+            ("host_setup", &["host", "setup"]),
             ("activity", &["log"]),
         ];
         // Operations that exist only because of the web: sessions.

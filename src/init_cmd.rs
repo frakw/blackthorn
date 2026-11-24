@@ -446,11 +446,7 @@ pub fn tick() -> Result<()> {
     let mut ctx = Ctx::open()?;
     let lifted = ctx.state.expire_blocks(ctx.now);
     let ended = ctx.state.expire_bridges(ctx.now);
-    let admin_ended = ops::expire_admin(&mut ctx);
-    for s in &admin_ended {
-        println!("admin time up: {s} stopped");
-    }
-    if lifted.is_empty() && ended.is_empty() && admin_ended.is_empty() {
+    if lifted.is_empty() && ended.is_empty() {
         apply::firewall_rules(&ctx.cfg, &ctx.state, ctx.now, false)?;
     } else {
         ctx.commit()?;
@@ -461,13 +457,23 @@ pub fn tick() -> Result<()> {
             println!("bridge ended: {b}");
         }
     }
-    // Notifications go out over the network: not while holding the lock.
-    let state = ctx.state.clone();
-    let cfg = ctx.cfg.clone();
     drop(ctx);
+    // Root whose time is up, and the machines' logins: over the network,
+    // so not while holding the lock.
+    let root_ended = match crate::logins::tick() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("logins: {e:#}");
+            Vec::new()
+        }
+    };
+    for s in &root_ended {
+        println!("root time up: {s} is back to its usual login");
+    }
+    let (cfg, state) = crate::ctx::read_only()?;
     crate::tls::tick(&cfg);
     crate::activity::tick(&state);
-    crate::notify::tick(&state, &lifted, &ended, &admin_ended);
+    crate::notify::tick(&state, &lifted, &ended, &root_ended);
     Ok(())
 }
 

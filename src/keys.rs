@@ -23,6 +23,41 @@ pub fn generate_ro(host: &str) -> Result<()> {
     )
 }
 
+/// A space's own two keys: its user (and root) login and its read-only
+/// one, for the machines set up for logins of each space's own.
+pub fn generate_space(key: &str) -> Result<()> {
+    crate::sys::mkdir(Path::new(paths::SPACE_KEYS_DIR), 0o700)?;
+    let hub = crate::sys::hostname();
+    keygen(
+        &paths::space_key_file(key),
+        &format!("blackthorn@{hub}:space-{key}"),
+    )?;
+    keygen(
+        &paths::space_ro_key_file(key),
+        &format!("blackthorn@{hub}:space-{key}:readonly"),
+    )
+}
+
+pub fn remove_space(key: &str) -> Result<()> {
+    for p in [paths::space_key_file(key), paths::space_ro_key_file(key)] {
+        for f in [p.clone(), p.with_extension("pub")] {
+            match std::fs::remove_file(&f) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("removing {}", f.display())),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The public half of a key file.
+pub fn public_of(file: &Path) -> Result<String> {
+    let mut p = file.as_os_str().to_owned();
+    p.push(".pub");
+    read_public(Path::new(&p))
+}
+
 fn keygen(key: &Path, comment: &str) -> Result<()> {
     if key.exists() {
         return Ok(());
@@ -197,15 +232,6 @@ pub fn sync_agent(key: &str, files: &[std::path::PathBuf]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// The key file for a login.
-pub fn login_key(l: &crate::state::Login) -> std::path::PathBuf {
-    if l.readonly {
-        paths::ro_key_file(l.host)
-    } else {
-        paths::key_file(l.host)
-    }
 }
 
 fn ssh_add(sock: &Path, args: &[&str]) -> Result<()> {

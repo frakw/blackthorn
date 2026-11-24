@@ -25,6 +25,10 @@ pub const LOGGER: &str = r#"#!/bin/sh
 # (tag "blackthorn": journalctl -t blackthorn), then runs it.
 c=${SSH_ORIGINAL_COMMAND:-}
 logger -t blackthorn -p auth.notice -- "$(id -un) from ${SSH_CLIENT%% *}: ${c:-(interactive shell)}" 2>/dev/null || true
+# A user's own services and rootless Docker (thorn host setup).
+r="/run/user/$(id -u)"
+[ -d "$r" ] && export XDG_RUNTIME_DIR="$r"
+[ -S "$r/docker.sock" ] && export DOCKER_HOST="unix://$r/docker.sock"
 case $c in
   '') exec "${SHELL:-/bin/sh}" -l ;;
   internal-sftp | */sftp-server)

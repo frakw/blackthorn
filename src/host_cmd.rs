@@ -21,6 +21,21 @@ pub fn add(name: &str, target: &str, port: u16, yes: bool) -> Result<()> {
     );
     print_line(&line);
     println!("then check it with: sudo thorn host check {name}");
+    if scan.user == "root" {
+        println!(
+            "blackthorn then sets it up for logins of each space's own (within the minute after \
+             the check; or now: sudo thorn host setup {name})"
+        );
+    } else {
+        println!(
+            "\nNote: spaces on {name} log in as {} itself, and can read and change everything \
+             that login can, its SSH keys too. A login made for blackthorn alone is safer. If {} \
+             can use sudo without a password, set {name} up for logins of each space's own: \
+             sudo thorn host setup {name}; or run the setup as root yourself: sudo thorn host \
+             setup {name} --print",
+            scan.user, scan.user
+        );
+    }
     println!("and create a space on it with: sudo thorn new {name}");
     Ok(())
 }
@@ -99,8 +114,8 @@ pub fn ls() -> Result<()> {
     let mut rows = vec![vec![
         "NAME".to_string(),
         "ADDRESS".into(),
-        "ADMIN".into(),
-        "READ-ONLY".into(),
+        "LOGIN".into(),
+        "SPACES' LOGINS".into(),
         "OS".into(),
         "SPACES".into(),
         "STATUS".into(),
@@ -115,7 +130,15 @@ pub fn ls() -> Result<()> {
             h.name.clone(),
             addr,
             h.user.clone(),
-            h.readonly.clone().unwrap_or_else(|| "-".into()),
+            if h.setup.is_some() {
+                "their own".to_string()
+            } else {
+                h.tiers
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            },
             h.os.to_string(),
             if h.spaces.is_empty() {
                 "-".into()
@@ -159,38 +182,41 @@ pub fn check(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn readonly(name: &str, user: &str, print: bool, verify: bool) -> Result<()> {
+/// thorn host setup: logins of each space's own on a machine.
+pub fn setup(name: &str, print: bool, verify: bool) -> Result<()> {
     if print {
-        print!("{}", ops::host_readonly_script(name, user)?);
+        print!("{}", crate::logins::setup_print(name)?);
         eprintln!(
             "\n# Run that as root on {name} (e.g. save it as setup.sh, then: sudo sh setup.sh),\n\
-             # then: sudo thorn host readonly {name} --user {user} --verify"
+             # then: sudo thorn host setup {name} --verify"
         );
         return Ok(());
     }
     if !verify {
-        println!("setting up a read-only login on {name}, as its admin login...");
+        println!("setting {name} up for logins of each space's own...");
     }
-    let done = ops::host_readonly(name, user, !verify)?;
+    let done = crate::logins::setup(name, !verify)?;
     for line in &done.report {
         println!("  {line}");
     }
     println!(
-        "{name} has a read-only login: {}. New spaces on it are read-only by default.",
-        done.user
+        "{name} is set up: each space gets its own logins there, bt-<id> (user; root when \
+         given) and bt-<id>-ro (read-only)."
     );
-    println!(
-        "commands blackthorn's keys run there are in its system log: journalctl -t blackthorn"
-    );
-    if !done.limited.is_empty() {
+    if !done.waiting.is_empty() {
         println!(
-            "admin spaces on {name} ({}) now run only when started, for a time, one at a time; \
-             those running now keep running until stopped. Make one read-only with: \
-             sudo thorn access SPACE readonly",
-            done.limited.join(", ")
+            "not made yet, for: {} (blackthorn keeps trying every minute)",
+            done.waiting.join(", ")
         );
     }
+    println!("commands the spaces run there are in its system log: journalctl -t blackthorn");
     Ok(())
+}
+
+/// thorn host readonly: the v0.7 name of thorn host setup.
+pub fn readonly(name: &str, print: bool, verify: bool) -> Result<()> {
+    eprintln!("note: thorn host readonly is now thorn host setup");
+    setup(name, print, verify)
 }
 
 pub fn rescan(name: &str, yes: bool) -> Result<()> {

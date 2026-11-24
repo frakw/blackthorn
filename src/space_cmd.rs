@@ -8,26 +8,34 @@ use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 pub fn new(o: NewSpace) -> Result<()> {
-    let name = ops::space_new(o)?;
+    let done = ops::space_new(o)?;
+    let name = done.name;
     let (_, state) = ctx::read_only()?;
     let s = state.space(&name)?;
+    let t = crate::state::now();
     println!(
-        "created space {name}: {} on {}, {} (Remote Control name {}, user {})",
+        "created space {name}: {} on {}, logs in as {} (Remote Control name {}, user {})",
         s.agent,
         s.host,
-        s.access,
+        s.tier(t),
         s.rc_name,
         paths::unix_user(&s.key)
     );
-    if state.limited(s) {
-        println!(
-            "it is an admin space on a machine with a read-only login: it runs only when you start it, for a time"
-        );
-        if !ops::logged_in(s) {
-            println!("\nnext: sign it in to Claude (once):\n  sudo thorn login {name}");
-        }
-        println!("then: sudo thorn start {name} --for 1h");
-    } else if ops::logged_in(s) {
+    match &s.root {
+        Some(r) if r.active(t) => match r.until {
+            Some(u) => println!(
+                "it has root there until {} UTC, then logs in as {}",
+                ops::rfc3339(u),
+                s.access
+            ),
+            None => println!("it has root there until taken back: sudo thorn root {name} --off"),
+        },
+        _ => {}
+    }
+    for n in &done.notes {
+        println!("note: {n}");
+    }
+    if ops::logged_in(s) {
         println!("it is running; open it with: sudo thorn attach {name}");
     } else {
         println!("\nnext: sign it in to Claude (once; it starts right after):");
@@ -75,8 +83,8 @@ pub fn login(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn rm(name: &str, purge: bool) -> Result<()> {
-    match ops::space_rm(name, purge)? {
+pub fn rm(name: &str, purge: bool, purge_data: bool) -> Result<()> {
+    match ops::space_rm(name, purge, purge_data)? {
         Some(dest) => println!(
             "removed space {name}; its files (including conversations) are in {}",
             dest.display()
@@ -99,18 +107,11 @@ pub fn rename(old: &str, new: &str, rc_name: Option<String>) -> Result<()> {
     Ok(())
 }
 
-pub fn control(action: Action, names: &[String], all: bool, duration: Option<&str>) -> Result<()> {
+pub fn control(action: Action, names: &[String], all: bool) -> Result<()> {
     if names.is_empty() && !all {
         bail!("name a space, or use --all");
     }
-    // From the command line (root on the hub), an admin space may start
-    // without being told for how long: the default.
-    let admin_for = match duration {
-        Some(d) => Some(ops::parse_duration(d)?),
-        None if !all => Some(ops::ADMIN_DEFAULT),
-        None => None,
-    };
-    for line in ops::space_control(action, names, admin_for)? {
+    for line in ops::space_control(action, names)? {
         println!("{line}");
     }
     Ok(())
@@ -155,7 +156,7 @@ pub fn ls() -> Result<()> {
         "NAME".to_string(),
         "HOST".into(),
         "AGENT".into(),
-        "ACCESS".into(),
+        "LOGIN".into(),
         "STATE".into(),
         "REMOTE CONTROL".into(),
         "CAN REACH".into(),
@@ -166,16 +167,18 @@ pub fn ls() -> Result<()> {
             s.name.clone(),
             s.host.clone(),
             agent_label(&s.agent, s.mode),
-            s.access.to_string(),
-            match s.until {
-                Some(u) if s.state == "running" => {
-                    format!(
-                        "running ({} left)",
-                        ops::describe_left(u, crate::state::now())
-                    )
-                }
-                _ => s.state.clone(),
+            match &s.root {
+                Some(r) => match r.until {
+                    Some(u) => format!(
+                        "root ({} left), then {}",
+                        ops::describe_left(u, crate::state::now()),
+                        s.access
+                    ),
+                    None => "root".into(),
+                },
+                None => s.access.to_string(),
             },
+            s.state.clone(),
             s.rc_name.clone(),
             if s.reachable.is_empty() {
                 "nothing".into()
@@ -392,8 +395,20 @@ pub fn chat_open(space: &str, id: Option<&str>, title: Option<&str>) -> Result<(
     Ok(())
 }
 
-pub fn access(name: &str, access: crate::state::Access) -> Result<()> {
-    println!("{}", ops::space_access(name, access)?);
+pub fn login_as(name: &str, access: crate::state::Access) -> Result<()> {
+    println!("{}", ops::space_login(name, access)?);
+    Ok(())
+}
+
+/// thorn root SPACE --for 8h | --forever | --off
+pub fn root(name: &str, duration: Option<&str>, forever: bool, off: bool) -> Result<()> {
+    let root = match (duration, forever, off) {
+        (_, _, true) => None,
+        (_, true, false) => Some(None),
+        (Some(d), false, false) => ops::parse_root(d)?,
+        (None, false, false) => Some(Some(ops::ROOT_DEFAULT)),
+    };
+    println!("{}", ops::space_root(name, root)?);
     Ok(())
 }
 
