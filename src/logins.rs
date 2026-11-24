@@ -35,6 +35,13 @@ const PRELUDE: &str = r#"set -eu
 have() { command -v "$1" >/dev/null 2>&1; }
 # systemd's tools, where systemd runs the machine (not in every container).
 sd() { [ -d /run/systemd/system ] && have "$1"; }
+# apt-get install, reading the package lists again first if they are too old
+# (a package they name may be gone from the mirror).
+apt_install() {
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$@" >/dev/null </dev/null 2>&1 && return 0
+  apt-get update -q >/dev/null </dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$@" >/dev/null </dev/null
+}
 home_of() { awk -F: -v u="$1" '$1 == u { print $6 }' /etc/passwd; }
 comment_of() { awk -F: -v u="$1" '$1 == u { print $5 }' /etc/passwd; }
 sudoers() {
@@ -122,7 +129,7 @@ mv -f {rdocker}.tmp {rdocker}
 
 # 2. sudo: for the read-only Docker commands, and root when it is given.
 if ! have sudo; then
-  if have apt-get; then DEBIAN_FRONTEND=noninteractive apt-get install -y -q sudo >/dev/null </dev/null || true
+  if have apt-get; then apt_install sudo || true
   elif have dnf; then dnf install -y -q sudo >/dev/null </dev/null || true
   elif have yum; then yum install -y -q sudo >/dev/null </dev/null || true
   elif have apk; then apk add -q sudo </dev/null || true
@@ -176,7 +183,7 @@ if [ -z "$tool" ] && have docker && have apt-get; then
   else pkgs=""
   fi
   if [ -n "$pkgs" ]; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -q $pkgs >/dev/null </dev/null 2>&1 || true
+    apt_install $pkgs 2>/dev/null || true
   fi
   tool=$(command -v dockerd-rootless-setuptool.sh 2>/dev/null || true)
   [ -n "$tool" ] || [ ! -x /usr/share/docker.io/contrib/dockerd-rootless-setuptool.sh ] || tool=/usr/share/docker.io/contrib/dockerd-rootless-setuptool.sh
