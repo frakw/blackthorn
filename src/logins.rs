@@ -33,6 +33,8 @@ exec docker "$@"
 const PRELUDE: &str = r#"set -eu
 [ "$(id -u)" = 0 ] || { echo "this needs root" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+# systemd's tools, where systemd runs the machine (not in every container).
+sd() { [ -d /run/systemd/system ] && have "$1"; }
 home_of() { awk -F: -v u="$1" '$1 == u { print $6 }' /etc/passwd; }
 comment_of() { awk -F: -v u="$1" '$1 == u { print $5 }' /etc/passwd; }
 sudoers() {
@@ -49,7 +51,7 @@ sudoers() {
 end_sessions() {
   # Ends the SSH sessions of user $1, with what they run (through sudo too,
   # where logind keeps sessions).
-  if have loginctl; then
+  if sd loginctl; then
     for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$1" '$3 == u { print $1 }'); do
       loginctl terminate-session "$s" 2>/dev/null || true
     done
@@ -157,8 +159,8 @@ sshd=$(command -v sshd 2>/dev/null || echo /usr/sbin/sshd)
 if "$sshd" -T 2>/dev/null | grep -i '^authorizedkeysfile' | grep -qF "{keys}/%u"; then :; else
   echo "sshd will not read {keys}: another AuthorizedKeysFile comes first in $conf" >&2; exit 1
 fi
-if have systemctl && systemctl is-active -q ssh 2>/dev/null; then systemctl reload ssh
-elif have systemctl && systemctl is-active -q sshd 2>/dev/null; then systemctl reload sshd
+if sd systemctl && systemctl is-active -q ssh 2>/dev/null; then systemctl reload ssh
+elif sd systemctl && systemctl is-active -q sshd 2>/dev/null; then systemctl reload sshd
 elif [ -s /run/sshd.pid ]; then kill -HUP "$(cat /run/sshd.pid)"
 elif [ -s /var/run/sshd.pid ]; then kill -HUP "$(cat /var/run/sshd.pid)"
 else echo "bt: reload sshd yourself"
@@ -179,7 +181,7 @@ if [ -z "$tool" ] && have docker && have apt-get; then
   tool=$(command -v dockerd-rootless-setuptool.sh 2>/dev/null || true)
   [ -n "$tool" ] || [ ! -x /usr/share/docker.io/contrib/dockerd-rootless-setuptool.sh ] || tool=/usr/share/docker.io/contrib/dockerd-rootless-setuptool.sh
 fi
-if [ -n "$tool" ] && have loginctl && have newuidmap; then echo "bt: rootless docker: yes"
+if [ -n "$tool" ] && sd loginctl && have newuidmap; then echo "bt: rootless docker: yes"
 elif ! have docker; then echo "bt: rootless docker: no (Docker is not installed)"
 else echo "bt: rootless docker: no (only Debian and Ubuntu with Docker's packages for now)"
 fi
@@ -307,7 +309,7 @@ if [ "$full" = 1 ]; then
       fi
     fi
   fi
-  if have loginctl; then loginctl enable-linger "$u" 2>/dev/null || true; fi
+  if sd loginctl; then loginctl enable-linger "$u" 2>/dev/null || true; fi
   rule="$ro ALL=($u) NOPASSWD: BLACKTHORN_RREAD"
 else
   rule=""
@@ -325,7 +327,7 @@ if [ "$full" = 1 ]; then
   tool=$(command -v dockerd-rootless-setuptool.sh 2>/dev/null || true)
   [ -n "$tool" ] || [ ! -x /usr/share/docker.io/contrib/dockerd-rootless-setuptool.sh ] || tool=/usr/share/docker.io/contrib/dockerd-rootless-setuptool.sh
   uid=$(id -u "$u")
-  if [ -z "$tool" ] || ! have loginctl; then
+  if [ -z "$tool" ] || ! sd loginctl; then
     echo "bt: rootless docker: not on this machine"
   elif [ -f "$(home_of "$u")/.config/systemd/user/docker.service" ]; then
     echo "bt: rootless docker: ready"
@@ -366,18 +368,18 @@ sudoers "bt-$k-root" <<EOF
 Defaults:$u !requiretty, !lecture
 $u ALL=(ALL:ALL) NOPASSWD: ALL
 EOF
-if have systemctl; then
+if sd systemctl; then
   systemctl stop "blackthorn-unroot-$k.timer" "blackthorn-unroot-$k.service" 2>/dev/null || true
   systemctl reset-failed "blackthorn-unroot-$k.service" 2>/dev/null || true
 fi
 secs={secs}
 if [ -n "$secs" ]; then
-  if have systemd-run; then
+  if sd systemd-run; then
     systemd-run --quiet --unit="blackthorn-unroot-$k" --on-active="${{secs}}s" \
       /bin/sh -c "rm -f /etc/sudoers.d/bt-$k-root; loginctl list-sessions --no-legend 2>/dev/null | awk -v u=$u '\$3 == u {{ print \$1 }}' | xargs -r -n1 loginctl terminate-session; pkill -KILL -u $u -f '^sshd:' || true"
     echo "bt: the machine ends it by itself too"
   else
-    echo "bt: no systemd-run: only blackthorn ends it"
+    echo "bt: no systemd here: only blackthorn ends it"
   fi
 fi
 echo "bt: done"
@@ -396,7 +398,7 @@ pub fn revoke_script(key: &str) -> Result<String> {
 k={key}
 u="bt-$k"
 rm -f "/etc/sudoers.d/bt-$k-root"
-if have systemctl; then
+if sd systemctl; then
   systemctl stop "blackthorn-unroot-$k.timer" "blackthorn-unroot-$k.service" 2>/dev/null || true
   systemctl reset-failed "blackthorn-unroot-$k.service" 2>/dev/null || true
 fi
@@ -417,14 +419,14 @@ k={key}
 srv={srv}
 purge={purge}
 rm -f "/etc/sudoers.d/bt-$k-root" "/etc/sudoers.d/bt-$k-ro"
-if have systemctl; then
+if sd systemctl; then
   systemctl stop "blackthorn-unroot-$k.timer" "blackthorn-unroot-$k.service" 2>/dev/null || true
 fi
 for u in "bt-$k" "bt-$k-ro"; do
   rm -f "{keys}/$u"
   id "$u" >/dev/null 2>&1 || continue
   [ "$(comment_of "$u")" = "blackthorn space $k" ] || {{ echo "bt: $u is not blackthorn's; left alone"; continue; }}
-  if have loginctl; then
+  if sd loginctl; then
     loginctl disable-linger "$u" 2>/dev/null || true
     loginctl terminate-user "$u" 2>/dev/null || true
   fi
