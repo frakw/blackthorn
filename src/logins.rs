@@ -31,7 +31,7 @@ exec docker "$@"
 
 /// What a space with root on approval runs through sudo to ask for a
 /// command as root (and what the hub runs, as root, to watch for asks).
-pub const ASK: &str = "/usr/local/libexec/blackthorn-ask";
+pub const ASK: &str = "/usr/local/bin/blackthorn-ask";
 
 /// Where asks wait, root's alone.
 pub const ASK_SPOOL: &str = "/var/lib/blackthorn-ask";
@@ -1276,7 +1276,7 @@ mod tests {
             .unwrap()
             .contains("secs=\n"));
         let a = root_script("a1b2c3d4", None, true).unwrap();
-        assert!(a.contains("$u ALL=(root) NOPASSWD: /usr/local/libexec/blackthorn-ask\n"));
+        assert!(a.contains("$u ALL=(root) NOPASSWD: /usr/local/bin/blackthorn-ask\n"));
         assert!(!a.contains("NOPASSWD: ALL"));
         assert!(revoke_script("a1b2c3d4")
             .unwrap()

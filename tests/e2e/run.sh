@@ -612,7 +612,7 @@ say "root on approval"
 thorn new t1 --name t1-ask --root ask >/dev/null
 ka=$(key_of t1-ask)
 echo good-code | thorni login t1-ask >/dev/null
-docker exec "$P-t1" grep -q "NOPASSWD: /usr/local/libexec/blackthorn-ask" "/etc/sudoers.d/bt-$ka-root" && ok "its sudo is for blackthorn-ask alone" || fail "ask sudo rule: $(docker exec "$P-t1" cat "/etc/sudoers.d/bt-$ka-root" 2>&1)"
+docker exec "$P-t1" grep -q "NOPASSWD: /usr/local/bin/blackthorn-ask" "/etc/sudoers.d/bt-$ka-root" && ok "its sudo is for blackthorn-ask alone" || fail "ask sudo rule: $(docker exec "$P-t1" cat "/etc/sudoers.d/bt-$ka-root" 2>&1)"
 if hub runuser -u "bt-$ka" -- ssh t1 'sudo -n id -u' 2>/dev/null; then fail "plain sudo works"; else ok "plain sudo does not"; fi
 hub grep -q "blackthorn-ask" "/var/lib/blackthorn/spaces/$ka/t1-ask/CLAUDE.md" && ok "its instructions say how to ask" || fail "ask CLAUDE.md"
 ask_id() { local id=""; for _ in $(seq 40); do id=$(thorn approvals | awk -v w="$1" 'index($0, w) {print prev; exit} {prev=$1}'); [ -n "$id" ] && break; sleep 1; done; echo "$id"; }
