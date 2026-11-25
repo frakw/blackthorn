@@ -5,7 +5,7 @@ coding agents live. They keep running there, you reach them from your phone
 or laptop, and each one can work on exactly one of your machines, over SSH,
 one way only.
 
-Status: **early (v0.13)**. It works and is tested end to end, but expect
+Status: **early (v0.14)**. It works and is tested end to end, but expect
 changes. Read [THREAT_MODEL.md](THREAT_MODEL.md) before trusting it with
 anything important.
 
@@ -89,6 +89,8 @@ from those only.
 - A Claude plan with Remote Control (Pro, Max, Team or Enterprise). Each
   space signs in once; tokens from `claude setup-token` cannot be used,
   because they cannot start Remote Control.
+- For Codex spaces: a ChatGPT plan with Codex (device code sign-in allowed
+  for your account or workspace), or an OpenAI API key.
 - Machines to manage (Linux or macOS), reachable from the hub at a fixed IP
   address. A Tailscale or Headscale tailnet works well.
 
@@ -272,7 +274,8 @@ restores the old settings at any time.
 | `thorn status [--json]` | The map: machines, spaces, bridges, hub health |
 | `thorn ls` | Spaces: machine, agent, state, what they can reach |
 | `thorn new HOST [--agent A] [--name N] [--access user\|read-only] [--root 8h\|forever\|no] [--single] [--local] [--arg A]...` | Create a space on a machine |
-| `thorn login SPACE` | Sign a Claude space in, then start it |
+| `thorn login SPACE [--api-key]` | Sign a Claude or Codex space in, then start it (Codex: a device code, or an API key on standard input) |
+| `thorn codex status` / `install` | OpenAI's Codex on the hub: its version; install or update it |
 | `thorn start\|stop\|restart SPACE... \| --all` | Control spaces |
 | `thorn access SPACE user\|read-only` | A space's usual login on its machine; applies at once |
 | `thorn root SPACE [--for 8h \| --forever \| --ask \| --off]` | Give a space root for a time (at most 72h), until taken back, or on approval; take it back |
@@ -318,6 +321,23 @@ Claude account's session list. Options for Claude Code go after `--arg`:
 ```sh
 sudo thorn new fig --arg=--permission-mode --arg=acceptEdits
 ```
+
+**Codex** (OpenAI's coding agent) runs in a space too: install it once
+(`sudo thorn codex install`, or Settings → Codex; OpenAI's installer, into
+`/opt/codex`, where spaces can run it but not change it), then
+
+```sh
+sudo thorn new fig --agent codex        # creates "fig-codex"
+sudo thorn login fig-codex              # a page and a code to enter there
+echo "$OPENAI_API_KEY" | sudo thorn login fig-codex --api-key   # or a key
+```
+
+A Codex space reads its instructions from `AGENTS.md`, runs Codex without
+Codex's own sandbox (the space already is one: its own user, firewall and
+logins) and with Codex asking before commands it is unsure of. You use it
+through the web UI's terminal view or `thorn attach`; OpenAI's phone
+remote control needs their desktop app, so it is not offered. The commands
+it runs are recorded like Claude's.
 
 Other terminal agents can run in a space too; you use them through
 `thorn attach`, the web UI's terminal view, or `thorn screen`/`send`.

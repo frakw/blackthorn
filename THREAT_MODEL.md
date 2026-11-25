@@ -89,7 +89,10 @@ Know these before you rely on it.
    other spaces through Remote Control, around the firewall. Isolation
    between spaces therefore holds for machines and keys, not for the Claude
    account. Not addressed yet; separate Claude accounts per trust level
-   avoid it.
+   avoid it. Codex spaces are the same with your ChatGPT account, or with
+   the API key they were given (`~/.codex/auth.json`, readable by the
+   space): give each its own key with only the permissions it needs, so it
+   can be revoked alone.
 
 2. **A bridge makes one trust zone.** While space A has a bridge to B's
    machine, injected text from either machine can drive A's actions on the
@@ -178,7 +181,15 @@ Know these before you rely on it.
     any access token, in a root-only file spaces cannot read. A missing
     notification proves nothing: the hub may be down, or its network.
 
-13. **Availability is not protected.** A space can exhaust memory or CPU,
+13. **Codex comes from OpenAI's installer.** `thorn codex install` (and
+    Settings → Codex) runs `https://chatgpt.com/codex/install.sh` as root,
+    which downloads Codex and checks it against OpenAI's own checksums.
+    Whoever can change that script or those releases can run code on your
+    hub, as with Tailscale's installer. Codex runs in its spaces without
+    its own sandbox: the space's user, firewall and logins are the limits,
+    as for Claude Code.
+
+14. **Availability is not protected.** A space can exhaust memory or CPU,
     or kill its own agent. Spaces are separate units, so this affects
     others only through shared resources.
 
