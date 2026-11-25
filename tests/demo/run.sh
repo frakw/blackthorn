@@ -49,6 +49,8 @@ for _ in $(seq 30); do
   sleep 1
 done
 HUB=$(ip_of hub)
+# The browser (Playwright, on this machine) comes from the network's gateway.
+GW=$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' "$NET")
 
 say "install"
 docker cp "$THORN" "$P-hub:/usr/local/bin/thorn"
@@ -59,6 +61,9 @@ hub chmod 755 /usr/local/bin/codex
 thorn init --claude-from /root/fake-claude --no-web >/dev/null
 hubi sh -c "cat > /etc/blackthorn/config.toml" <<EOF
 claude_bin = "/usr/local/bin/claude"
+
+[inbound]
+admin_from = ["$GW"]
 
 [web]
 listen = ["$HUB:7180"]

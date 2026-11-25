@@ -711,8 +711,8 @@ case "$r" in *"ok=signed"*) ok "it finishes once the code is entered";; *) fail 
 sleep 3
 hub grep -q -- "--sandbox danger-full-access --ask-for-approval on-request" "/var/lib/blackthorn/spaces/$kc/fake-codex.args" && ok "Codex runs without its own sandbox, asking first" || fail "codex args: $(hub cat "/var/lib/blackthorn/spaces/$kc/fake-codex.args" 2>&1)"
 thorn new t1 --agent codex --name t1-cx2 --root no >/dev/null
-out=$(echo "not-a-key-but-long-enough-to-pass" | thorn login t1-cx2 --api-key 2>&1) && fail "a bad API key was taken" || ok "a key Codex refuses is refused"
-echo "sk-test-0123456789abcdefghij" | thorn login t1-cx2 --api-key >/dev/null && ok "thorn login --api-key signs a Codex space in" || fail "api key login"
+out=$(echo "not-a-key-but-long-enough-to-pass" | thorni login t1-cx2 --api-key 2>&1) && fail "a bad API key was taken" || ok "a key Codex refuses is refused"
+echo "sk-test-0123456789abcdefghij" | thorni login t1-cx2 --api-key >/dev/null && ok "thorn login --api-key signs a Codex space in" || fail "api key login"
 thorn _tick >/dev/null 2>&1
 thorn log t1-codex | grep -q "ssh t1 uptime" && ok "Codex's commands are recorded" || fail "codex log: $(thorn log t1-codex 2>&1)"
 web_get /space/t1-codex | grep -q "ssh t1 uptime" && ok "and shown under Activity" || fail "codex activity card"

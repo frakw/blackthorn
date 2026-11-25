@@ -30,12 +30,34 @@ def sign_in(page):
     page.wait_for_url(url + "/")
 
 
-def shot(page, path, name, full=False, settle=1500):
+def unlock(page, chat_path):
+    """Unlocks this browser for chats and approvals (password and code)."""
+    page.goto(url + "/spaces")
+    token = page.locator('input[name="csrf"]').first.get_attribute("value")
+    r = page.request.post(url + chat_path + "/unlock",
+                          form={"csrf": token, "password": password, "code": code()},
+                          max_redirects=0)
+    print("unlock:", r.status, r.headers.get("location", ""))
+
+
+def shot(page, path, name, full=False, settle=1500, element=None, before=None):
     page.goto(url + path)
     page.wait_for_load_state("networkidle")
+    if before:
+        before(page)
     page.wait_for_timeout(settle)
-    page.screenshot(path=f"{out}/{name}.png", full_page=full)
+    if element:
+        page.locator(element).first.screenshot(path=f"{out}/{name}.png")
+    else:
+        page.screenshot(path=f"{out}/{name}.png", full_page=full)
     print("saved", name)
+
+
+def fit(page):
+    # A taller map than a laptop screen gives it, for the whole picture.
+    page.add_style_tag(content=".graph-wrap.live { height: 1150px !important; }")
+    page.wait_for_timeout(500)
+    page.locator('button[data-map="fit"]').click()
 
 
 with sync_playwright() as p:
@@ -44,18 +66,19 @@ with sync_playwright() as p:
                                device_scale_factor=2, color_scheme="light")
     page = desk.new_page()
     sign_in(page)
-    shot(page, "/", "map")
+    unlock(page, f"/space/web-claude/chat/{web_chat}")
+    shot(page, "/", "map", element="section.graph-card", before=fit)
     shot(page, "/spaces", "spaces")
     shot(page, f"/space/web-claude/chat/{web_chat}", "chat", settle=2500)
     shot(page, "/approvals", "approvals")
-    shot(page, "/host/nas", "machine")
+    shot(page, "/host/web-01", "machine", element='section.card:has(h2:text-is("Logins"))')
     shot(page, "/chats", "chats")
 
     dark = browser.new_context(viewport={"width": 1360, "height": 860},
                                device_scale_factor=2, color_scheme="dark",
                                storage_state=desk.storage_state())
     page = dark.new_page()
-    shot(page, "/", "map-dark")
+    shot(page, "/", "map-dark", element="section.graph-card", before=fit)
 
     phone = browser.new_context(viewport={"width": 390, "height": 844},
                                 device_scale_factor=3, is_mobile=True, has_touch=True,

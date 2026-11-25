@@ -75,3 +75,16 @@ button.copy {
 
 footer { max-width: 1040px; margin: 40px auto 0; padding: 24px; border-top: 1px solid var(--line); color: var(--dim); }
 footer p { margin: 4px 0; }
+
+.shots figure { margin: 0 0 24px; }
+.shots img {
+  display: block; width: 100%; height: auto;
+  border: 1px solid var(--line); border-radius: 12px; background: var(--card);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.08);
+}
+.shots figcaption { color: var(--dim); font-size: 14px; margin-top: 8px; }
+.shots .pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 20px; }
+.shots .phones { display: flex; gap: 24px; justify-content: center; flex-wrap: wrap; }
+.shots .phones figure { width: 260px; }
+.shots .phones img { border-radius: 24px; }
+@media (max-width: 520px) { .shots .pair { grid-template-columns: 1fr; } }
