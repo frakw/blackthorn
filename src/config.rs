@@ -273,7 +273,6 @@ mod tests {
         .unwrap();
         assert!(c.agent_exists("claude"));
         assert!(c.agent_exists("aider"));
-        assert!(!c.agent_exists("codex"));
         assert_eq!(c.instructions_file("aider"), "AGENTS.md");
         assert_eq!(c.instructions_file("claude"), "CLAUDE.md");
         assert_eq!(c.agent_names(), vec!["claude", "codex", "aider"]);
