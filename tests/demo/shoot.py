@@ -55,14 +55,15 @@ def shot(page, path, name, full=False, settle=1500, element=None, before=None):
 
 def fit(page):
     # A taller map than a laptop screen gives it, for the whole picture.
-    page.evaluate("document.querySelector('.graph-wrap').style.height = '1150px'")
+    page.evaluate("document.querySelector('.graph-wrap').style.height = '1150px';"
+                  "document.querySelector('.top').style.position = 'static'")
     page.wait_for_timeout(500)
     page.locator('button[data-map="fit"]').click()
 
 
 with sync_playwright() as p:
     browser = p.chromium.launch()
-    desk = browser.new_context(viewport={"width": 1360, "height": 860},
+    desk = browser.new_context(viewport={"width": 1440, "height": 900},
                                device_scale_factor=2, color_scheme="light")
     page = desk.new_page()
     sign_in(page)
@@ -74,7 +75,7 @@ with sync_playwright() as p:
     shot(page, "/host/web-01", "machine", element='section.card:has(h2:text-is("Logins"))')
     shot(page, "/chats", "chats")
 
-    dark = browser.new_context(viewport={"width": 1360, "height": 860},
+    dark = browser.new_context(viewport={"width": 1440, "height": 900},
                                device_scale_factor=2, color_scheme="dark",
                                storage_state=desk.storage_state())
     page = dark.new_page()

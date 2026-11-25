@@ -486,4 +486,3 @@ label:has(option[value="custom"]:checked) + .root-hours { display: flex; }
 .link.ok { color: var(--ok); }
 
 .big-code { font-size: 22px; letter-spacing: 2px; padding: 4px 10px; }
-.me button { white-space: nowrap; }

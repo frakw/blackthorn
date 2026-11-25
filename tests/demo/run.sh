@@ -54,10 +54,14 @@ HUB=$(ip_of hub)
 GW=$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' "$NET")
 
 say "install"
+T0=$(mktemp -d)
 docker cp "$THORN" "$P-hub:/usr/local/bin/thorn"
 hub chmod 755 /usr/local/bin/thorn
-docker cp "$E2E/fake-claude" "$P-hub:/root/fake-claude"
-docker cp "$E2E/fake-codex" "$P-hub:/usr/local/bin/codex"
+# The test stand-ins, with believable versions for the pictures.
+sed 's/0.0.0 (fake)/2.4.1 (Claude Code)/' "$E2E/fake-claude" > "$T0/claude"
+sed 's/codex-cli 0.0.0 (fake)/codex-cli 0.172.0/' "$E2E/fake-codex" > "$T0/codex"
+docker cp "$T0/claude" "$P-hub:/root/fake-claude"
+docker cp "$T0/codex" "$P-hub:/usr/local/bin/codex"
 hub chmod 755 /usr/local/bin/codex
 thorn init --claude-from /root/fake-claude --no-web >/dev/null
 hubi sh -c "cat > /etc/blackthorn/config.toml" <<EOF
