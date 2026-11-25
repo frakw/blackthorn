@@ -669,6 +669,8 @@ hubi runuser -u "bt-$kr" -- sh -c "echo '{}' > '$d/$cid.jsonl'"
 thorn _tick >/dev/null 2>&1
 thorn log t1-ro | grep -q "NOTE: transcript got shorter" && ok "a transcript that shrinks is noted" || fail "shrink note"
 thorn log t1-ro | grep -q "df -h" && ok "and what it held stays in the log" || fail "log kept"
+hub test -s /var/lib/blackthorn/reach.json && ok "the tick checks the machines" || fail "no reach.json"
+web_get /spaces | grep -q 'class="link ok"' && ok "a space card shows it reaches its machine" || fail "link icon: $(hub cat /var/lib/blackthorn/reach.json)"
 
 say "a new chat with a name"
 thorn chat new t2-claude --name "disk check" >/dev/null

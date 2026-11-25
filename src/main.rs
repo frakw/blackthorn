@@ -22,6 +22,7 @@ mod markdown;
 mod notify;
 mod ops;
 mod paths;
+mod reach;
 mod remote;
 mod render;
 mod runner;

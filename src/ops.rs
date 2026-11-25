@@ -99,6 +99,12 @@ pub struct SpaceView {
     /// Its folder on its machine (/srv/<name>), on a set-up machine.
     #[serde(default)]
     pub srv: Option<String>,
+    /// It reaches its machine now (the machine answers, the firewall lets
+    /// it through, it has a login there), and why (not), in words.
+    #[serde(default)]
+    pub linked: bool,
+    #[serde(default)]
+    pub link: String,
     /// Its extra arguments skip permission prompts (auto mode): risky with
     /// root.
     #[serde(default)]
@@ -181,6 +187,7 @@ pub fn overview(with_version: bool) -> Result<Overview> {
         memory_available_mb: memory_available_mb(),
         net: net_view(),
     };
+    let reaches = crate::reach::load();
     let spaces = state
         .spaces
         .iter()
@@ -195,6 +202,20 @@ pub fn overview(with_version: bool) -> Result<Overview> {
                     other => other.to_string(),
                 }
             };
+            let login = state
+                .logins(name, t)
+                .into_iter()
+                .find(|l| !l.bridged)
+                .map(|l| l.user)
+                .unwrap_or_default();
+            let blocked = state
+                .hosts
+                .get(&s.host)
+                .and_then(|h| h.block.as_ref())
+                .filter(|b| b.active(t))
+                .map(|b| describe_block(b, t));
+            let (linked, link) =
+                crate::reach::link(reaches.get(&s.host), blocked.as_deref(), &login, t);
             SpaceView {
                 name: name.clone(),
                 host: s.host.clone(),
@@ -218,12 +239,7 @@ pub fn overview(with_version: bool) -> Result<Overview> {
                 access: s.access,
                 tier: s.tier(t),
                 root: s.root.clone().filter(|r| r.active(t)),
-                login: state
-                    .logins(name, t)
-                    .into_iter()
-                    .find(|l| !l.bridged)
-                    .map(|l| l.user)
-                    .unwrap_or_default(),
+                login,
                 root_beside: state
                     .spaces
                     .iter()
@@ -235,6 +251,8 @@ pub fn overview(with_version: bool) -> Result<Overview> {
                     .get(&s.host)
                     .and_then(|h| h.accounts.get(&s.key))
                     .and_then(|a| a.srv.clone()),
+                linked,
+                link,
                 unattended: unattended(&cfg.claude_args) || unattended(&s.args),
                 owner: s.owner.clone(),
                 shares: s.shares.iter().map(|(a, l)| (a.clone(), *l)).collect(),

@@ -479,3 +479,8 @@ fieldset.login-pick .sub { margin-left: 1.6rem; }
 /* The custom hours field shows only when "custom…" is chosen. */
 .root-hours { display: none; }
 label:has(option[value="custom"]:checked) + .root-hours { display: flex; }
+
+/* A space's link to its machine: green when connected, grey when not. */
+.link { display: inline-block; width: 14px; height: 14px; margin-right: 4px; vertical-align: -2px; color: var(--idle); }
+.link svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+.link.ok { color: var(--ok); }

@@ -1162,6 +1162,22 @@ fn root_select(default: &str, ask: bool) -> String {
     )
 }
 
+/// A link symbol before its machine's name: green when the space reaches
+/// its machine now, grey when not, with why in its title.
+fn link_icon(s: &SpaceView) -> String {
+    let (class, word) = if s.linked {
+        ("ok", "connected")
+    } else {
+        ("off", "not connected")
+    };
+    format!(
+        "<span class=\"link {class}\" role=\"img\" aria-label=\"{word}: {why}\" title=\"{word}: {why}\">\
+         <svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71\"/>\
+         <path d=\"M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71\"/></svg></span>",
+        why = esc(&s.link)
+    )
+}
+
 fn space_card(c: &Ctx, s: &SpaceView) -> String {
     let chats = s
         .chats_24h
@@ -1170,12 +1186,13 @@ fn space_card(c: &Ctx, s: &SpaceView) -> String {
     format!(
         "<article class=\"item\"><div class=\"item-head\"><span class=\"dot {}\"></span>\
          <a class=\"item-name\" href=\"/space/{}\">{}</a>{}{}</div>\
-         <p class=\"item-meta\">on {} · {} · {}{chats}</p><div class=\"buttons\">{}</div></article>",
+         <p class=\"item-meta\">on {}{} · {} · {}{chats}</p><div class=\"buttons\">{}</div></article>",
         map::state_class(&s.state),
         url_encode(&s.name),
         esc(&s.name),
         access_badge(s),
         reach_badge(s),
+        link_icon(s),
         esc(&s.host),
         esc(&crate::space_cmd::agent_label(&s.agent, s.mode)),
         esc(&s.state),
@@ -1276,7 +1293,7 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
     let (can_use, can_manage) = (lvl >= Level::Use, lvl >= Level::Manage);
     let mut b = format!(
         "<div class=\"page-head\"><h1><span class=\"dot {}\"></span>{}</h1><div class=\"buttons\">{}{}</div></div>\
-         <p class=\"item-meta\">on <a href=\"/host/{}\">{}</a> as {} · {} · {}{} {}{}{}</p>",
+         <p class=\"item-meta\">on {}<a href=\"/host/{}\">{}</a> as {} · {} · {}{} {}{}{}</p>",
         map::state_class(&s.state),
         esc(&s.name),
         if can_use { space_controls(c, s) } else { String::new() },
@@ -1285,6 +1302,7 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
         } else {
             String::new()
         },
+        link_icon(s),
         url_encode(&s.host),
         esc(&s.host),
         esc(&s.login),

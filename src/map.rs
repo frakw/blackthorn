@@ -993,6 +993,8 @@ mod tests {
             .into(),
             root_beside: vec![],
             srv: None,
+            linked: true,
+            link: String::new(),
             unattended: false,
             owner: None,
             shares: Vec::new(),

@@ -16,6 +16,8 @@ pub const STATE_FILE: &str = "/var/lib/blackthorn/state.toml";
 /// Web logins (their tokens hashed), so an update does not end them.
 pub const WEB_SESSIONS_FILE: &str = "/var/lib/blackthorn/web-sessions.json";
 pub const LOCK_FILE: &str = "/var/lib/blackthorn/state.lock";
+/// Whether each machine answered the last check (see `reach`).
+pub const REACH_FILE: &str = "/var/lib/blackthorn/reach.json";
 /// Space homes: /var/lib/blackthorn/spaces/<key>.
 pub const SPACES_DIR: &str = "/var/lib/blackthorn/spaces";
 /// What `thorn _run` needs to start a space, readable by the space user

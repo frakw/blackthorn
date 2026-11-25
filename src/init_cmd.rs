@@ -476,6 +476,7 @@ pub fn tick() -> Result<()> {
     let (cfg, state) = crate::ctx::read_only()?;
     crate::tls::tick(&cfg);
     crate::activity::tick(&state);
+    crate::reach::tick(&state);
     crate::notify::tick(&state, &lifted, &ended, &root_ended);
     Ok(())
 }
