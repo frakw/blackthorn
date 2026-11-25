@@ -55,7 +55,7 @@ def shot(page, path, name, full=False, settle=1500, element=None, before=None):
 
 def fit(page):
     # A taller map than a laptop screen gives it, for the whole picture.
-    page.add_style_tag(content=".graph-wrap.live { height: 1150px !important; }")
+    page.evaluate("document.querySelector('.graph-wrap').style.height = '1150px'")
     page.wait_for_timeout(500)
     page.locator('button[data-map="fit"]').click()
 
