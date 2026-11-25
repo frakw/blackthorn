@@ -1,0 +1,77 @@
+:root {
+  --bg: #f6f6f3;
+  --card: #ffffff;
+  --ink: #1d2320;
+  --dim: #5c6661;
+  --line: #dfe3df;
+  --accent: #2f6b4f;
+  --sloe: #4a2672;
+  --code: #eef0ec;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #121614;
+    --card: #1a201d;
+    --ink: #e4e9e6;
+    --dim: #9aa59f;
+    --line: #2c3430;
+    --accent: #6fcf9a;
+    --sloe: #9a72d6;
+    --code: #222a26;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+a { color: var(--accent); }
+code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; }
+code { background: var(--code); padding: 1px 5px; border-radius: 4px; }
+
+.top {
+  max-width: 1040px; margin: 0 auto; padding: 18px 24px;
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+}
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 20px; color: var(--ink); text-decoration: none; }
+.top nav { display: flex; gap: 20px; }
+.top nav a { color: var(--dim); text-decoration: none; }
+.top nav a:hover { color: var(--ink); }
+
+main { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+section { padding: 40px 0; }
+h1 { font-size: clamp(32px, 5vw, 52px); line-height: 1.1; margin: 24px 0 16px; letter-spacing: -0.02em; }
+h2 { font-size: 26px; margin: 0 0 14px; }
+h3 { margin: 28px 0 8px; }
+.lead { font-size: 19px; color: var(--dim); max-width: 760px; }
+.small { font-size: 14px; color: var(--dim); }
+
+.install-box {
+  display: flex; align-items: center; gap: 12px; margin: 24px 0 12px;
+  background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 12px 12px 18px;
+  max-width: 760px;
+}
+.install-box code { background: none; padding: 0; flex: 1; overflow-x: auto; white-space: nowrap; font-size: 15px; }
+button.copy {
+  background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 8px 16px;
+  font: inherit; font-weight: 600; cursor: pointer;
+}
+@media (prefers-color-scheme: dark) { button.copy { color: #0e1411; } }
+
+.features { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 16px; }
+.features article { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px 22px; }
+.features h2 { font-size: 18px; margin-bottom: 6px; }
+.features p { margin: 0; color: var(--dim); }
+
+.diagram, .opts {
+  background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  padding: 18px; overflow-x: auto; line-height: 1.35;
+}
+.steps { padding-left: 22px; max-width: 760px; }
+.steps li { margin: 8px 0; }
+.install ul { max-width: 760px; }
+
+footer { max-width: 1040px; margin: 40px auto 0; padding: 24px; border-top: 1px solid var(--line); color: var(--dim); }
+footer p { margin: 4px 0; }

@@ -97,7 +97,7 @@ from those only.
 On the hub (Debian, Ubuntu, Fedora or Arch, with systemd):
 
 ```sh
-curl -fsSL https://github.com/frakw/blackthorn/releases/latest/download/install.sh | sh
+curl -fsSL https://blackthorn.frakw.work/install.sh | sh
 ```
 
 That one line:

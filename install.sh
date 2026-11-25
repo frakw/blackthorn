@@ -1,7 +1,9 @@
 #!/bin/sh
 # Installs or upgrades blackthorn on this machine (Linux with systemd):
 #
-#   curl -fsSL https://github.com/frakw/blackthorn/releases/latest/download/install.sh | sh
+#   curl -fsSL https://blackthorn.frakw.work/install.sh | sh
+#
+# (the same file as https://github.com/frakw/blackthorn/releases/latest/download/install.sh)
 #
 # It installs the few packages blackthorn needs, downloads `thorn` and checks
 # it against the release's SHA256SUMS, installs Claude Code if it is missing,

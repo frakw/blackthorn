@@ -1,0 +1,49 @@
+name: Site
+
+# Publishes site/ to GitHub Pages (blackthorn.frakw.work), with the latest
+# release's install.sh beside it, so
+#   curl -fsSL https://blackthorn.frakw.work/install.sh | sh
+# always runs the installer of the latest release (checked against that
+# release's SHA256SUMS before it is published).
+on:
+  push:
+    branches: [main]
+    paths: ["site/**", ".github/workflows/site.yml"]
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: The latest release's installer
+        run: |
+          base=https://github.com/frakw/blackthorn/releases/latest/download
+          curl -fsSL -o site/install.sh "$base/install.sh"
+          curl -fsSL -o /tmp/SHA256SUMS "$base/SHA256SUMS"
+          want=$(awk '$2 == "install.sh" || $2 == "*install.sh" { print $1 }' /tmp/SHA256SUMS)
+          [ -n "$want" ] || { echo "SHA256SUMS does not list install.sh"; exit 1; }
+          echo "$want  site/install.sh" | sha256sum -c -
+          head -1 site/install.sh | grep -q '^#!/bin/sh' || { echo "not a shell script"; exit 1; }
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4

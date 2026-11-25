@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>blackthorn: a safe home for your AI coding agents</title>
+<meta name="description" content="blackthorn turns one small, isolated machine into the place where your AI coding agents live. Each works on exactly one of your machines, over SSH, one way only.">
+<link rel="icon" href="logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="./"><img src="logo.svg" alt="" width="28" height="28"> blackthorn</a>
+  <nav>
+    <a href="#how">How it works</a>
+    <a href="#install">Install</a>
+    <a href="https://github.com/frakw/blackthorn">GitHub</a>
+  </nav>
+</header>
+
+<main>
+<section class="hero">
+  <h1>A safe home for your AI coding agents.</h1>
+  <p class="lead">blackthorn turns one small, isolated machine into the place where your agents live.
+    They keep running there, you reach them from your phone or laptop, and each one works on
+    exactly one of your machines, over SSH, one way only.</p>
+  <div class="install-box" id="install-top">
+    <code id="cmd">curl -fsSL https://blackthorn.frakw.work/install.sh | sh</code>
+    <button type="button" class="copy" data-copy="cmd">Copy</button>
+  </div>
+  <p class="small">On a dedicated Debian, Ubuntu, Fedora or Arch machine or VM with systemd.
+    Open source, MIT licensed. Works with Claude Code and Codex.</p>
+</section>
+
+<section class="features">
+  <article>
+    <h2>Agents that keep running</h2>
+    <p>Each space runs its agent in the background. Open as many chats as you like from the web UI or,
+      for Claude, from the Claude app. Spaces survive disconnects, restart after crashes and come back
+      after a reboot.</p>
+  </article>
+  <article>
+    <h2>One machine per agent</h2>
+    <p>A space is one machine plus one agent. It can reach that machine and nothing else, enforced by
+      the kernel's firewall, not by asking the model. Your machines cannot connect back to the hub at all.</p>
+  </article>
+  <article>
+    <h2>Read-only, user or root</h2>
+    <p>On your machines each space gets logins of its own: read-only, an ordinary user for its project,
+      and root only for a time you choose, or <em>on approval</em>: each root command waits for you to
+      press Approve.</p>
+  </article>
+  <article>
+    <h2>Keys stay on the hub</h2>
+    <p>Private keys live in root-only files and reach each space only through an agent it cannot read.
+      The keys work only from the hub's address, so a copied key is useless elsewhere.</p>
+  </article>
+  <article>
+    <h2>See everything</h2>
+    <p>A live map of machines, spaces and bridges. Every command a space runs is recorded on the hub,
+      out of the space's reach, and in the machine's own system log too.</p>
+  </article>
+  <article>
+    <h2>Built for your phone</h2>
+    <p>The web UI works on a phone: chat with your agents, approve root commands, open a bridge to a
+      second machine for an hour, or cut a machine off with one tap. Sign-in needs a password and a
+      code, or a passkey.</p>
+  </article>
+</section>
+
+<section id="how" class="how">
+  <h2>How it works</h2>
+<pre class="diagram">
+ your phone / laptop ── web UI over your tailnet, 2FA ──┐
+                                                        ▼
+ ┌──────────────────── blackthorn hub ─────────────────────┐
+ │ space "fig"  = its own Unix user, firewall, ssh-agent   │
+ │   claude or codex ─────────── may reach fig:22 only     │
+ │ space "nas"  = its own Unix user, firewall, ssh-agent   │
+ │   claude or codex ─────────── may reach nas:22 only     │
+ │      └─ bridge for 1h ───────────────────┐              │
+ └──────────────┬──────────────────────────────────────────┘
+                │ outbound SSH only          │
+        ┌───────┴────────┐                   │
+        ▼                ▼                   ▼
+       fig              nas ◄────────────────┘
+   (machines cannot connect to the hub)
+</pre>
+  <ol class="steps">
+    <li><strong>Install</strong> blackthorn on a small dedicated VM. The installer sets up the web UI
+      and, if you like, Tailscale, so only your devices reach it.</li>
+    <li><strong>Add a machine</strong>: paste one line into its <code>authorized_keys</code>, confirm its
+      fingerprint, and let blackthorn set up the logins for its spaces.</li>
+    <li><strong>Make a space</strong>: pick the machine, the agent and how far it may go. Sign the agent
+      in once, then chat.</li>
+  </ol>
+</section>
+
+<section id="install" class="install">
+  <h2>Install</h2>
+  <p>On the hub, as root or with sudo:</p>
+  <div class="install-box">
+    <code id="cmd2">curl -fsSL https://blackthorn.frakw.work/install.sh | sh</code>
+    <button type="button" class="copy" data-copy="cmd2">Copy</button>
+  </div>
+  <p>It installs the few packages blackthorn needs, downloads <code>thorn</code> and checks it against
+    the release's checksums, installs Claude Code, offers Tailscale, and turns on the web UI.
+    Running it again upgrades blackthorn and leaves your settings alone. Options:</p>
+<pre class="opts">curl -fsSL https://blackthorn.frakw.work/install.sh | sh -s -- --help</pre>
+  <p>Prefer to read it first? <a href="install.sh">View the script</a>, or
+    <a href="https://github.com/frakw/blackthorn/releases/latest">download a release</a> and check
+    <code>SHA256SUMS</code> yourself.</p>
+  <h3>Requirements</h3>
+  <ul>
+    <li>A dedicated machine or VM with systemd. Nothing else should run on it.</li>
+    <li>For Claude: a plan with Remote Control (Pro, Max, Team or Enterprise). For Codex: a ChatGPT
+      plan with Codex, or an OpenAI API key.</li>
+    <li>Machines to manage (Linux, for now best supported) reachable from the hub at a fixed address.
+      A Tailscale or Headscale tailnet works well.</li>
+  </ul>
+</section>
+
+<section class="trust">
+  <h2>Before you trust it</h2>
+  <p>blackthorn is young (early versions, changing often) and tested end to end on every change.
+    Read the <a href="https://github.com/frakw/blackthorn/blob/main/THREAT_MODEL.md">threat model</a>:
+    it says plainly what blackthorn protects against and what it does not.</p>
+</section>
+</main>
+
+<footer>
+  <p>blackthorn · MIT License · <a href="https://github.com/frakw/blackthorn">github.com/frakw/blackthorn</a></p>
+  <p class="small">Not affiliated with Anthropic or OpenAI. Claude and Claude Code are trademarks of
+    Anthropic; Codex and ChatGPT are trademarks of OpenAI.</p>
+</footer>
+
+<script>
+document.querySelectorAll("button.copy").forEach(function (b) {
+  b.addEventListener("click", function () {
+    var t = document.getElementById(b.dataset.copy).textContent;
+    navigator.clipboard.writeText(t).then(function () {
+      b.textContent = "Copied";
+      setTimeout(function () { b.textContent = "Copy"; }, 1500);
+    });
+  });
+});
+</script>
+</body>
+</html>
