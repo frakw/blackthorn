@@ -76,3 +76,33 @@ jobs:
           s=${PIPESTATUS[0]}
           grep -E '^error|error:' build.log | head -10 | sed 's/^/::error::/' || true
           exit $s
+
+  # Screenshots of the web UI from a demo hub (tests/demo), on dev branches,
+  # pushed to the screenshots-preview branch to look at before a release.
+  # The website takes its own from the release (site.yml).
+  screenshots:
+    if: startsWith(github.ref, 'refs/heads/dev/')
+    runs-on: ubuntu-24.04
+    needs: check
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build
+      - name: playwright
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install --quiet playwright
+          /tmp/venv/bin/playwright install --with-deps chromium >/dev/null
+          echo /tmp/venv/bin >> "$GITHUB_PATH"
+      - name: demo hub and screenshots
+        run: tests/demo/run.sh target/debug/thorn shots
+      - name: push to screenshots-preview
+        run: |
+          cd shots
+          git init -q -b screenshots-preview
+          git add .
+          git -c user.name="github-actions" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "screenshots from ${GITHUB_SHA::7}"
+          git push -q -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" screenshots-preview

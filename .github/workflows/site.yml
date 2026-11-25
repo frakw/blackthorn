@@ -41,6 +41,20 @@ jobs:
           [ -n "$want" ] || { echo "SHA256SUMS does not list install.sh"; exit 1; }
           echo "$want  site/install.sh" | sha256sum -c -
           head -1 site/install.sh | grep -q '^#!/bin/sh' || { echo "not a shell script"; exit 1; }
+      # Screenshots of the web UI from a demo hub running this release.
+      - name: playwright
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install --quiet playwright
+          /tmp/venv/bin/playwright install --with-deps chromium >/dev/null
+          echo /tmp/venv/bin >> "$GITHUB_PATH"
+      - name: screenshots
+        run: |
+          curl -fsSL -o /tmp/thorn https://github.com/frakw/blackthorn/releases/latest/download/thorn-x86_64-linux
+          want=$(awk '$2 == "thorn-x86_64-linux" { print $1 }' /tmp/SHA256SUMS)
+          echo "$want  /tmp/thorn" | sha256sum -c -
+          chmod 755 /tmp/thorn
+          tests/demo/run.sh /tmp/thorn site/img
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v4
         with:
