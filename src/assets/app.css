@@ -484,3 +484,5 @@ label:has(option[value="custom"]:checked) + .root-hours { display: flex; }
 .link { display: inline-block; width: 14px; height: 14px; margin-right: 4px; vertical-align: -2px; color: var(--idle); }
 .link svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
 .link.ok { color: var(--ok); }
+
+.big-code { font-size: 22px; letter-spacing: 2px; padding: 4px 10px; }

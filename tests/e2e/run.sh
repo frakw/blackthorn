@@ -690,6 +690,34 @@ thorn rm t1-dev --purge --purge-data >/dev/null
 docker exec "$P-t1" id "bt-$kd" >/dev/null 2>&1 && fail "bt-$kd is still on t1" || ok "its logins on t1 went with it"
 docker exec "$P-t1" test -e /srv/t1-dev && fail "/srv/t1-dev stayed" || ok "and its folder, as asked"
 
+say "codex spaces"
+out=$(thorn new t1 --agent codex 2>&1) && fail "a Codex space before Codex is installed: $out" || ok "no Codex space before Codex is installed"
+echo "$out" | grep -q "thorn codex install" && ok "and it says how to install it" || fail "codex hint: $out"
+docker cp "$HERE/fake-codex" "$P-hub:/usr/local/bin/codex"
+hub chmod 755 /usr/local/bin/codex
+thorn codex status | grep -q "installed: codex-cli 0.0.0" && ok "thorn codex status shows its version" || fail "codex status: $(thorn codex status)"
+web_get /settings | grep -q 'action="/codex/install"' && ok "Settings offers to update Codex" || fail "codex card"
+thorn new t1 --agent codex --root no | grep -q "created space t1-codex" && ok "thorn new t1 --agent codex creates t1-codex" || fail "codex space"
+kc=$(key_of t1-codex)
+hub grep -q 'trust_level = "trusted"' "/var/lib/blackthorn/spaces/$kc/.codex/config.toml" && ok "its Codex config trusts its work folder" || fail "codex config"
+hub test -f "/var/lib/blackthorn/spaces/$kc/t1-codex/AGENTS.md" && ok "its instructions are in AGENTS.md" || fail "AGENTS.md"
+web_get /space/t1-codex | grep -q "Sign in to Codex" && ok "the space page offers the Codex sign-in" || fail "codex sign-in card"
+C=$(csrf)
+page=$(admin curl -s -b /tmp/jar -c /tmp/jar --data-urlencode "csrf=$C" "http://$HUB:7180/space/t1-codex/login")
+echo "$page" | grep -q 'FAKE-0042' && ok "web sign-in shows the device code" || fail "device code page: $(echo "$page" | head -c 800)"
+echo "$page" | grep -q 'https://auth.openai.example/codex/device' && ok "and the page to enter it on" || fail "device page link"
+r=$(web_post /space/t1-codex/login-finish --data-urlencode "csrf=$C")
+case "$r" in *"ok=signed"*) ok "it finishes once the code is entered";; *) fail "codex sign-in: $r";; esac
+sleep 3
+hub grep -q -- "--sandbox danger-full-access --ask-for-approval on-request" "/var/lib/blackthorn/spaces/$kc/fake-codex.args" && ok "Codex runs without its own sandbox, asking first" || fail "codex args: $(hub cat "/var/lib/blackthorn/spaces/$kc/fake-codex.args" 2>&1)"
+thorn new t1 --agent codex --name t1-cx2 --root no >/dev/null
+out=$(echo "not-a-key-but-long-enough-to-pass" | thorn login t1-cx2 --api-key 2>&1) && fail "a bad API key was taken" || ok "a key Codex refuses is refused"
+echo "sk-test-0123456789abcdefghij" | thorn login t1-cx2 --api-key >/dev/null && ok "thorn login --api-key signs a Codex space in" || fail "api key login"
+thorn _tick >/dev/null 2>&1
+thorn log t1-codex | grep -q "ssh t1 uptime" && ok "Codex's commands are recorded" || fail "codex log: $(thorn log t1-codex 2>&1)"
+web_get /space/t1-codex | grep -q "ssh t1 uptime" && ok "and shown under Activity" || fail "codex activity card"
+thorn rm t1-cx2 --purge >/dev/null
+
 say "remove a space"
 thorn rm t2-claude >/dev/null
 hub id "bt-$k2" >/dev/null 2>&1 && fail "user bt-$k2 still exists" || ok "t2-claude's user removed"

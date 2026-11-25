@@ -495,6 +495,16 @@ fn route(
             Ok(tag) => updating_page(&c, &tag),
             Err(e) => back("/settings#update", Err(e)),
         },
+        ("POST", ["codex", "install"]) => back(
+            "/settings#codex",
+            get::<serde_json::Value>(
+                &c,
+                Op::CodexInstall {
+                    code: f(form, "code").into(),
+                },
+            )
+            .map(|_| "installing Codex; this takes a minute".into()),
+        ),
         ("POST", ["tailscale", action]) => {
             let code = f(form, "code").to_string();
             let op = match *action {
@@ -1336,7 +1346,20 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
         ));
     }
 
-    if s.state == "needs login" && can_manage {
+    if s.state == "needs login" && can_manage && s.agent == crate::config::CODEX {
+        b.push_str(&format!(
+            "<section class=\"card attention\" id=\"login\"><h2>Sign in to Codex</h2><p>Each space signs in once, \
+             either way.</p><h3>With a ChatGPT account</h3><p class=\"hint\">Start, open the page on any device and \
+             enter the code shown here. Device code sign-in must be allowed for your account or workspace (ChatGPT \
+             settings, Security).</p>{}<h3>With an OpenAI API key</h3><p class=\"hint\">Billed to the key's \
+             organization. Give the space a key of its own, with only the permissions Codex needs, so it can be \
+             revoked alone.</p><form method=\"post\" action=\"/space/{n}/login-key\" class=\"stack\">{}\
+             <label>API key <input name=\"key\" type=\"password\" required autocomplete=\"off\" spellcheck=\"false\"></label>\
+             <div><button>Sign in with the key</button></div></form></section>",
+            button(c, &format!("/space/{n}/login"), "Start sign-in", "primary", ""),
+            csrf(c)
+        ));
+    } else if s.state == "needs login" && can_manage {
         b.push_str(&format!(
             "<section class=\"card attention\" id=\"login\"><h2>Sign in to Claude</h2><p>Each space signs in once. \
              Start, open the link on any device, then paste the code it shows.</p>{}</section>",
@@ -1346,6 +1369,8 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
 
     if claude {
         b.push_str(&chats_card(c, s));
+    }
+    if claude || s.agent == crate::config::CODEX {
         b.push_str(&activity_card(c, s));
     }
 
@@ -2503,8 +2528,33 @@ fn space_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>)
             );
             back(&here, r.map(|_| "sent".into()))
         }
-        "login" => match get::<String>(c, Op::LoginStart { name: name.into() }) {
-            Ok(url) => Reply::Html(
+        "login" => match get::<ops::LoginStarted>(c, Op::LoginStart { name: name.into() }) {
+            Ok(ops::LoginStarted {
+                url,
+                code: Some(code),
+            }) => Reply::Html(
+                200,
+                page(
+                    c,
+                    "Sign in",
+                    &format!(
+                        "<section class=\"card narrow\"><h1>Sign in {}</h1><ol class=\"steps\">\
+                         <li><a class=\"btn primary\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open the sign-in page</a></li>\
+                         <li>Sign in, then enter this code there: <code class=\"big-code\">{}</code></li>\
+                         <li><form method=\"post\" action=\"/space/{}/login-finish\" class=\"stack\">{}\
+                         <button class=\"primary\">I entered it</button></form></li></ol>\
+                         <p class=\"hint\">The code works for a few minutes. Codex finishes by itself once it is entered.</p>{}</section>",
+                        esc(name),
+                        esc(&url),
+                        esc(&code),
+                        url_encode(name),
+                        csrf(c),
+                        button(c, &format!("/space/{}/login-cancel", url_encode(name)), "Cancel", "link", "")
+                    ),
+                    &Flash::default(),
+                ),
+            ),
+            Ok(ops::LoginStarted { url, code: None }) => Reply::Html(
                 200,
                 page(
                     c,
@@ -2532,6 +2582,16 @@ fn space_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>)
                 Op::LoginFinish {
                     name: name.into(),
                     code: f(form, "code").into(),
+                },
+            );
+            back(&here, r.map(|_| "signed in; the space is starting".into()))
+        }
+        "login-key" => {
+            let r = get::<serde_json::Value>(
+                c,
+                Op::LoginApiKey {
+                    name: name.into(),
+                    key: f(form, "key").into(),
                 },
             );
             back(&here, r.map(|_| "signed in; the space is starting".into()))
@@ -3330,8 +3390,9 @@ fn settings_page(c: &Ctx, flash: &Flash) -> Reply {
         )
     };
     let ts = get::<ops::TailscaleView>(c, Op::TailscaleShow).unwrap_or_default();
+    let codex = get::<ops::CodexView>(c, Op::CodexShow).unwrap_or_default();
     let b = format!(
-        "<h1>Settings</h1>{}{}{}<section class=\"card\"><h2>Network and access</h2><p class=\"hint\">Saved to \
+        "<h1>Settings</h1>{}{}{}{}<section class=\"card\"><h2>Network and access</h2><p class=\"hint\">Saved to \
          <code>/etc/blackthorn/config.toml</code> and applied at once.{you} A change that would shut you out is \
          refused.</p>{peers_note}<form method=\"post\" action=\"/settings\" class=\"stack settings\">{}{fields}{}\
          <div><button class=\"primary\">Save</button></div></form></section>\
@@ -3346,6 +3407,7 @@ fn settings_page(c: &Ctx, flash: &Flash) -> Reply {
          one, with the same version of blackthorn ({}).</p><p class=\"hint\">Only from the hub's own terminal: the \
          file holds every secret here.</p></section>",
         update_card(c),
+        codex_card(c, &codex),
         tailscale_card(c, &ts),
         notify_card(c),
         csrf(c),
@@ -3354,12 +3416,47 @@ fn settings_page(c: &Ctx, flash: &Flash) -> Reply {
         crate::backup::version(),
     );
     // Watched while an install or sign-in runs.
-    let head = if ts.busy.is_some() {
+    let head = if codex.running {
+        "<meta http-equiv=\"refresh\" content=\"5;url=/settings#codex\">"
+    } else if ts.busy.is_some() {
         "<meta http-equiv=\"refresh\" content=\"5;url=/settings#tailscale\">"
     } else {
         ""
     };
     Reply::Html(200, page_with(c, "Settings", &b, flash, head))
+}
+
+/// OpenAI's Codex on the hub: installed, which version; install or update.
+fn codex_card(c: &Ctx, v: &ops::CodexView) -> String {
+    let state = if v.running {
+        "<p>Installing Codex right now; this page refreshes until it is done.</p>".to_string()
+    } else {
+        let now = match &v.version {
+            Some(ver) => format!("<p>Installed: <b>{}</b>.</p>", esc(ver)),
+            None => "<p>Not installed. Spaces can run Codex once it is.</p>".to_string(),
+        };
+        let failed = if v.failed {
+            format!(
+                "<p class=\"t-bad\">The last install failed; see <code>journalctl -u {}</code> on the hub.</p>",
+                ops::CODEX_UNIT
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "{now}{failed}<form method=\"post\" action=\"/codex/install\" class=\"stack\">{}{}<div><button{}>{}</button></div></form>",
+            csrf(c),
+            code_field(),
+            if v.version.is_none() { " class=\"primary\"" } else { "" },
+            if v.version.is_some() { "Update Codex" } else { "Install Codex" },
+        )
+    };
+    format!(
+        "<section class=\"card\" id=\"codex\"><h2>Codex</h2><p class=\"hint\">OpenAI's coding agent, for spaces \
+         that run it instead of Claude Code. It is installed with OpenAI's own installer into <code>/opt/codex</code>, \
+         where spaces can run it but not change it; spaces use a new version once restarted. Each Codex space signs in \
+         on its own, with a ChatGPT account or an OpenAI API key.</p>{state}</section>"
+    )
 }
 
 fn tailscale_card(c: &Ctx, v: &ops::TailscaleView) -> String {

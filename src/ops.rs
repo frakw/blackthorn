@@ -3,7 +3,7 @@
 //! things. Functions that change state open (and lock) the context
 //! themselves and never print; they return what happened.
 
-use crate::config::{Config, CLAUDE};
+use crate::config::{Config, CLAUDE, CODEX};
 use crate::ctx::{self, Ctx};
 use crate::state::{
     now, validate_name, validate_rc_name, Access, Block, Bridge, Host, Level, Mode, Os, Space,
@@ -425,6 +425,87 @@ pub fn claude_version(cfg: &Config) -> Option<String> {
         .map(|v| v.trim().to_string())
 }
 
+pub fn codex_version(cfg: &Config) -> Option<String> {
+    if !cfg.codex_bin.exists() {
+        return None;
+    }
+    sys::output("timeout", &["10", cfg.codex_bin.to_str()?, "--version"])
+        .ok()
+        .map(|v| v.trim().to_string())
+}
+
+// ---------------------------------------------------------------- codex
+
+pub const CODEX_UNIT: &str = "blackthorn-codex-install.service";
+const CODEX_INSTALLER: &str = "https://chatgpt.com/codex/install.sh";
+/// Where OpenAI's installer puts Codex for the hub: root-owned, so spaces
+/// run it but cannot change it.
+const CODEX_DIR: &str = "/opt/codex";
+
+/// Codex on the hub, for the Settings page.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CodexView {
+    /// `codex --version`, when installed.
+    pub version: Option<String>,
+    /// An install or update is running.
+    pub running: bool,
+    /// The last one failed (see its journal).
+    pub failed: bool,
+}
+
+pub fn codex_view() -> Result<CodexView> {
+    let (cfg, _) = ctx::read_only()?;
+    let st = sys::unit_state(CODEX_UNIT);
+    Ok(CodexView {
+        version: codex_version(&cfg),
+        running: matches!(st.as_str(), "active" | "activating"),
+        failed: st == "failed",
+    })
+}
+
+/// Installs or updates Codex with OpenAI's installer, in its own systemd
+/// unit, into /opt/codex, and links `codex_bin` to it. Spaces running
+/// Codex pick up the new version when they restart.
+pub fn codex_install() -> Result<()> {
+    sys::require_root()?;
+    let (cfg, _) = ctx::read_only()?;
+    if matches!(
+        sys::unit_state(CODEX_UNIT).as_str(),
+        "active" | "activating"
+    ) {
+        bail!("Codex is already being installed (journalctl -u {CODEX_UNIT})");
+    }
+    let _ = sys::systemctl(&["reset-failed", CODEX_UNIT]);
+    let bin = cfg.codex_bin.to_str().context("codex_bin path")?;
+    if !bin.starts_with('/') || bin.contains(|c: char| c == '\'' || c.is_whitespace()) {
+        bail!("codex_bin must be a plain absolute path");
+    }
+    let script = format!(
+        "set -eu; umask 022; t=$(mktemp -d); trap 'rm -rf \"$t\"' EXIT; \
+         curl -fsSL --proto '=https' -o \"$t/install.sh\" {CODEX_INSTALLER}; \
+         mkdir -p {CODEX_DIR}; \
+         HOME=\"$t\" CODEX_HOME={CODEX_DIR} CODEX_INSTALL_DIR={CODEX_DIR}/bin CODEX_NON_INTERACTIVE=1 \
+         sh \"$t/install.sh\" </dev/null; \
+         chmod -R go+rX,go-w {CODEX_DIR}; \
+         {CODEX_DIR}/bin/codex --version; \
+         ln -sfn {CODEX_DIR}/bin/codex '{bin}.new'; mv -Tf '{bin}.new' '{bin}'"
+    );
+    sys::run(
+        "systemd-run",
+        &[
+            "--unit",
+            CODEX_UNIT,
+            "--quiet",
+            "--description",
+            "blackthorn: install Codex",
+            "/bin/sh",
+            "-c",
+            &script,
+        ],
+    )?;
+    Ok(())
+}
+
 fn memory_available_mb() -> Option<u64> {
     let mem = std::fs::read_to_string("/proc/meminfo").ok()?;
     let line = mem.lines().find(|l| l.starts_with("MemAvailable:"))?;
@@ -683,10 +764,21 @@ pub fn rename_in_shares(old: &str, new: &str) -> Result<()> {
 }
 
 pub fn logged_in(s: &Space) -> bool {
-    s.agent != CLAUDE
-        || paths::space_home(&s.key)
-            .join(".claude/.credentials.json")
-            .exists()
+    match credentials_file(s) {
+        Some(f) => f.exists(),
+        None => true,
+    }
+}
+
+/// Where a space's agent keeps its sign-in, for the agents blackthorn
+/// signs in (Claude Code, Codex).
+fn credentials_file(s: &Space) -> Option<PathBuf> {
+    let home = paths::space_home(&s.key);
+    match s.agent.as_str() {
+        CLAUDE => Some(home.join(".claude/.credentials.json")),
+        CODEX => Some(home.join(".codex/auth.json")),
+        _ => None,
+    }
 }
 
 /// The longest root is given for at a time, and how long by default.
@@ -777,6 +869,12 @@ pub fn space_new(o: NewSpace) -> Result<NewDone> {
             paths::CONFIG_FILE
         );
     }
+    if agent == CODEX && !ctx.cfg.codex_bin.is_file() {
+        bail!(
+            "Codex is not installed on the hub yet: install it under Settings, or with \
+             sudo thorn codex install"
+        );
+    }
     let (default_access, default_root) = default_logins(&h);
     let access = match o.access {
         Some(Access::Admin) => {
@@ -864,6 +962,17 @@ pub fn space_new(o: NewSpace) -> Result<NewDone> {
         sys::write_file(
             &home.join(".claude.json"),
             &render::initial_claude_json(workdir.to_str().context("workdir path")?),
+            0o600,
+            Some((ids.uid, ids.gid)),
+        )?;
+    }
+    if agent == CODEX {
+        let dir = home.join(".codex");
+        sys::mkdir(&dir, 0o700)?;
+        sys::chown(&dir, ids.uid, ids.gid)?;
+        sys::write_file(
+            &dir.join("config.toml"),
+            &render::initial_codex_config(workdir.to_str().context("workdir path")?),
             0o600,
             Some((ids.uid, ids.gid)),
         )?;
@@ -2327,12 +2436,25 @@ fn parse_tailscale_status(s: &str) -> Vec<Peer> {
 
 // ---------------------------------------------------------------- sign-in
 
-/// Starts `claude auth login` for a space in the background and returns the
-/// sign-in link it prints. Finish with `login_finish`.
-pub fn login_start(name: &str) -> Result<String> {
+/// A sign-in started for a space: the page to open, and for Codex the
+/// one-time code to type there (Claude's page shows a code to paste back
+/// instead).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct LoginStarted {
+    pub url: String,
+    #[serde(default)]
+    pub code: Option<String>,
+}
+
+/// Starts the agent's sign-in for a space in the background: `claude auth
+/// login`, or `codex login --device-auth`. Finish with `login_finish`.
+pub fn login_start(name: &str) -> Result<LoginStarted> {
     sys::require_root()?;
     let (cfg, state) = ctx::read_only()?;
     let s = state.space(name)?.clone();
+    if s.agent == CODEX {
+        return codex_login_start(&cfg, &s);
+    }
     if s.agent != CLAUDE {
         bail!(
             "space {name} runs {}, which signs in on its own terminal",
@@ -2368,12 +2490,143 @@ pub fn login_start(name: &str) -> Result<String> {
         std::thread::sleep(Duration::from_millis(500));
         let screen = capture(&sock).unwrap_or_default();
         if let Some(url) = find_login_url(&screen) {
-            return Ok(url);
+            return Ok(LoginStarted { url, code: None });
         }
     }
     let screen = capture(&sock).unwrap_or_default();
     login_cancel(&s.key);
     bail!("claude did not print a sign-in link:\n{}", screen.trim())
+}
+
+/// Starts a sign-in session for a space: `args` run as the space user, in
+/// a tmux of their own (so they outlive this request), in its home.
+fn login_session(s: &Space, bin: &Path, args: &[&str]) -> Result<PathBuf> {
+    login_cancel(&s.key);
+    let user = paths::unix_user(&s.key);
+    let ids = sys::lookup_user(&user).with_context(|| format!("user {user} is missing"))?;
+    let sock = paths::login_socket(&s.key);
+    let dir = sock.parent().expect("socket has a directory");
+    sys::mkdir(Path::new("/run/blackthorn-login"), 0o755)?;
+    sys::mkdir(dir, 0o700)?;
+    sys::chown(dir, ids.uid, ids.gid)?;
+    let home = paths::space_home(&s.key);
+    let status = Command::new("runuser")
+        .args(["-u", &user, "--", "env"])
+        .arg(format!("HOME={}", home.display()))
+        .arg("tmux")
+        .arg("-S")
+        .arg(&sock)
+        .args(["new-session", "-d", "-s", "main", "-x", "200", "-y", "50"])
+        .arg(bin)
+        .args(args)
+        .current_dir(s.workdir())
+        .status()
+        .with_context(|| format!("starting {}", bin.display()))?;
+    if !status.success() {
+        bail!("could not start {}", bin.display());
+    }
+    Ok(sock)
+}
+
+/// `codex login --device-auth`: it prints a page and a one-time code, and
+/// finishes by itself once the code is entered there.
+fn codex_login_start(cfg: &Config, s: &Space) -> Result<LoginStarted> {
+    if !cfg.codex_bin.is_file() {
+        bail!("Codex is not installed on the hub (Settings, or sudo thorn codex install)");
+    }
+    let sock = login_session(s, &cfg.codex_bin, &["login", "--device-auth"])?;
+    for _ in 0..60 {
+        std::thread::sleep(Duration::from_millis(500));
+        let screen = capture(&sock).unwrap_or_default();
+        if let Some(started) = find_device_code(&screen) {
+            return Ok(started);
+        }
+    }
+    let screen = capture(&sock).unwrap_or_default();
+    login_cancel(&s.key);
+    bail!(
+        "codex did not print a sign-in page and code (is device code sign-in turned on for \
+         your ChatGPT account or workspace? An API key works too):\n{}",
+        screen.trim()
+    )
+}
+
+/// The page and the one-time code in what `codex login --device-auth`
+/// prints: an https link, and a code of letters and digits in groups
+/// joined by "-" (such as "ABCD-1234").
+pub fn find_device_code(screen: &str) -> Option<LoginStarted> {
+    let clean = |w: &str| {
+        w.trim_matches(|c: char| {
+            !c.is_ascii_alphanumeric() && c != '/' && c != ':' && c != '-' && c != '.'
+        })
+        .to_string()
+    };
+    let url = screen
+        .split_whitespace()
+        .map(clean)
+        .find(|w| w.starts_with("https://") && w.len() > 12)?;
+    let code = screen.split_whitespace().map(clean).find(|w| {
+        !w.starts_with("http")
+            && w.contains('-')
+            && (7..=20).contains(&w.len())
+            && w.split('-').count() >= 2
+            && w.split('-').all(|p| {
+                p.len() >= 3
+                    && p.chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            })
+    })?;
+    Some(LoginStarted {
+        url,
+        code: Some(code),
+    })
+}
+
+/// Signs a Codex space in with an OpenAI API key (`codex login
+/// --with-api-key`, the key on its standard input), then starts it.
+pub fn login_api_key(name: &str, api_key: &str) -> Result<()> {
+    sys::require_root()?;
+    let (cfg, state) = ctx::read_only()?;
+    let s = state.space(name)?.clone();
+    if s.agent != CODEX {
+        bail!("only Codex spaces sign in with an API key");
+    }
+    let api_key = api_key.trim();
+    if api_key.len() < 20 || api_key.len() > 512 || !api_key.chars().all(|c| c.is_ascii_graphic()) {
+        bail!("that does not look like an OpenAI API key");
+    }
+    if !cfg.codex_bin.is_file() {
+        bail!("Codex is not installed on the hub (Settings, or sudo thorn codex install)");
+    }
+    login_cancel(&s.key);
+    let user = paths::unix_user(&s.key);
+    let home = paths::space_home(&s.key);
+    let mut child = Command::new("runuser")
+        .args(["-u", &user, "--", "env"])
+        .arg(format!("HOME={}", home.display()))
+        .arg(&cfg.codex_bin)
+        .args(["login", "--with-api-key"])
+        .current_dir(s.workdir())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("running codex login")?;
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().context("codex login's input")?;
+        stdin.write_all(api_key.as_bytes())?;
+        stdin.write_all(b"\n")?;
+    }
+    let out = child.wait_with_output()?;
+    if !out.status.success() || !paths::space_home(&s.key).join(".codex/auth.json").exists() {
+        bail!(
+            "codex did not accept the key: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    start_after_login(name)?;
+    Ok(())
 }
 
 pub fn find_login_url(screen: &str) -> Option<String> {
@@ -2393,12 +2646,16 @@ pub fn login_finish(name: &str, code: &str) -> Result<()> {
     if !sock.exists() {
         bail!("no sign-in is in progress for {name}; start one first");
     }
-    let code = code.trim();
-    if code.is_empty() || code.len() > 512 || !code.chars().all(|c| c.is_ascii_graphic()) {
-        bail!("that does not look like a sign-in code");
+    let creds = credentials_file(&s).context("this agent signs in on its own terminal")?;
+    // Codex finishes by itself once its code is entered on the page; the
+    // hub only waits for it.
+    if s.agent != CODEX {
+        let code = code.trim();
+        if code.is_empty() || code.len() > 512 || !code.chars().all(|c| c.is_ascii_graphic()) {
+            bail!("that does not look like a sign-in code");
+        }
+        send_keys(&sock, Some(code), None, true)?;
     }
-    send_keys(&sock, Some(code), None, true)?;
-    let creds = paths::space_home(&s.key).join(".claude/.credentials.json");
     for _ in 0..60 {
         std::thread::sleep(Duration::from_millis(500));
         if creds.exists() {
@@ -2408,7 +2665,11 @@ pub fn login_finish(name: &str, code: &str) -> Result<()> {
         }
     }
     let screen = capture(&sock).unwrap_or_default();
-    bail!("sign-in did not complete; claude says:\n{}", screen.trim())
+    bail!(
+        "sign-in did not complete; {} says:\n{}",
+        s.agent,
+        screen.trim()
+    )
 }
 
 /// Ends a sign-in that is in progress, if any.

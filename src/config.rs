@@ -14,6 +14,9 @@ pub struct Config {
     pub claude_bin: PathBuf,
     /// Arguments added to every Claude Code start, before per-space ones.
     pub claude_args: Vec<String>,
+    /// The Codex binary Codex spaces run (`thorn codex install` puts it
+    /// there). Spaces do not update it themselves.
+    pub codex_bin: PathBuf,
     /// Most chats one server-mode space runs at once.
     pub capacity: u32,
     /// This hub's addresses as managed machines see them. Used for the
@@ -129,6 +132,7 @@ impl Default for Config {
         Config {
             claude_bin: PathBuf::from("/usr/local/bin/claude"),
             claude_args: Vec::new(),
+            codex_bin: PathBuf::from(CODEX_BIN),
             capacity: 8,
             ssh_from: Vec::new(),
             never_manage: Vec::new(),
@@ -161,23 +165,35 @@ impl Default for Egress {
 
 /// Built-in and configured agents.
 pub const CLAUDE: &str = "claude";
+/// OpenAI's Codex CLI, built in since v0.14: run in a terminal, signed in
+/// from the web UI (a device code or an API key).
+pub const CODEX: &str = "codex";
+pub const CODEX_BIN: &str = "/usr/local/bin/codex";
 
 impl Config {
     pub fn agent_exists(&self, name: &str) -> bool {
-        name == CLAUDE || self.agents.contains_key(name)
+        name == CLAUDE || name == CODEX || self.agents.contains_key(name)
+    }
+
+    /// Whether an agent is one of blackthorn's own (Claude Code, Codex),
+    /// rather than one configured under [agents].
+    pub fn built_in(agent: &str) -> bool {
+        agent == CLAUDE || agent == CODEX
     }
 
     /// The file an agent reads its instructions from.
     pub fn instructions_file(&self, agent: &str) -> String {
         match self.agents.get(agent) {
-            Some(a) if agent != CLAUDE => a.instructions.clone(),
-            _ => "CLAUDE.md".into(),
+            _ if agent == CLAUDE => "CLAUDE.md".into(),
+            _ if agent == CODEX => "AGENTS.md".into(),
+            Some(a) => a.instructions.clone(),
+            None => "CLAUDE.md".into(),
         }
     }
 
     pub fn agent_names(&self) -> Vec<String> {
-        let mut v = vec![CLAUDE.to_string()];
-        v.extend(self.agents.keys().filter(|k| *k != CLAUDE).cloned());
+        let mut v = vec![CLAUDE.to_string(), CODEX.to_string()];
+        v.extend(self.agents.keys().filter(|k| !Self::built_in(k)).cloned());
         v
     }
 }
@@ -260,7 +276,9 @@ mod tests {
         assert!(!c.agent_exists("codex"));
         assert_eq!(c.instructions_file("aider"), "AGENTS.md");
         assert_eq!(c.instructions_file("claude"), "CLAUDE.md");
-        assert_eq!(c.agent_names(), vec!["claude", "aider"]);
+        assert_eq!(c.agent_names(), vec!["claude", "codex", "aider"]);
+        assert!(c.agent_exists("codex"));
+        assert_eq!(c.instructions_file("codex"), "AGENTS.md");
         assert_eq!(c.web.listen[0].port(), 7180);
         assert_eq!(c.inbound.admin_from.len(), 1);
     }

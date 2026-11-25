@@ -1,0 +1,36 @@
+#!/bin/sh
+# Stands in for OpenAI's Codex CLI in tests: signs in with a device code
+# (by itself, after a moment) or an API key starting "sk-", and otherwise
+# records how it was started and writes one session transcript with a
+# command in it.
+case "$1 $2" in
+  "--version "*) echo "codex-cli 0.0.0 (fake)"; exit 0 ;;
+  "login --device-auth")
+    echo "Follow these steps to sign in with ChatGPT using device code authorization:"
+    echo ""
+    echo "1. Open this link in your browser and sign in to your account"
+    echo "   https://auth.openai.example/codex/device"
+    echo ""
+    echo "2. Enter this one-time code (expires in 15 minutes)"
+    echo "   FAKE-0042"
+    sleep 3
+    mkdir -p "$HOME/.codex" && echo '{"auth_mode":"chatgpt"}' > "$HOME/.codex/auth.json"
+    echo "Successfully logged in"
+    exit 0 ;;
+  "login --with-api-key")
+    read -r key
+    case "$key" in sk-*) ;; *) echo "Error: invalid API key" >&2; exit 1 ;; esac
+    mkdir -p "$HOME/.codex" && echo '{"auth_mode":"apikey"}' > "$HOME/.codex/auth.json"
+    echo "Successfully logged in"
+    exit 0 ;;
+esac
+echo "$*" >> "$HOME/fake-codex.args"
+d="$HOME/.codex/sessions/2026/11/25"
+mkdir -p "$d"
+f="$d/rollout-2026-11-25T08-00-05-0199a213-81c0-7800-8aa1-bbab2a035a53.jsonl"
+if [ ! -e "$f" ]; then
+  echo '{"timestamp":"2026-11-25T08:00:00.000Z","type":"session_meta","payload":{"id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}}' >> "$f"
+  echo '{"timestamp":"2026-11-25T08:00:05.120Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ssh t1 uptime\"}","call_id":"c1"}}' >> "$f"
+fi
+printf '› '
+while IFS= read -r line; do printf '%s\n› ' "$line"; done

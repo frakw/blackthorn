@@ -8,7 +8,7 @@
 //! a transcript that shrinks is noted as such. The machines themselves keep
 //! their own record (see `remote`).
 
-use crate::config::CLAUDE;
+use crate::config::{CLAUDE, CODEX};
 use crate::paths;
 use crate::state::{now, State};
 use anyhow::{Context, Result};
@@ -90,9 +90,19 @@ fn copy_all(state: &State) -> Result<()> {
         .and_then(|t| toml::from_str(&t).ok())
         .unwrap_or_default();
     let mut live = BTreeMap::new();
-    for s in state.spaces.values().filter(|s| s.agent == CLAUDE) {
+    for s in state
+        .spaces
+        .values()
+        .filter(|s| s.agent == CLAUDE || s.agent == CODEX)
+    {
+        let codex = s.agent == CODEX;
+        let files = if codex {
+            codex_files(&s.key)
+        } else {
+            crate::ops::chat_files(&s.key)
+        };
         let mut new = Vec::new();
-        for (id, path) in crate::ops::chat_files(&s.key) {
+        for (id, path) in files {
             let key = path.display().to_string();
             let from = seen.offsets.get(&key).copied().unwrap_or(0);
             match read_from(&path, from) {
@@ -109,7 +119,11 @@ fn copy_all(state: &State) -> Result<()> {
                             ..Default::default()
                         });
                     }
-                    new.extend(commands(&text, &chat));
+                    new.extend(if codex {
+                        codex_commands(&text, &chat)
+                    } else {
+                        commands(&text, &chat)
+                    });
                     live.insert(key, to);
                 }
                 Err(_) => {
@@ -197,6 +211,115 @@ pub fn commands(text: &str, chat: &str) -> Vec<Entry> {
         }
     }
     out
+}
+
+/// A Codex space's session transcripts ("rollouts"):
+/// ~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<thread id>.jsonl, with the
+/// thread id. Compressed ones (.jsonl.zst, made of old sessions) are not
+/// read: they were read while they were written. Symbolic links are not
+/// followed.
+pub fn codex_files(key: &str) -> Vec<(String, std::path::PathBuf)> {
+    fn walk(dir: &Path, depth: u32, out: &mut Vec<(String, std::path::PathBuf)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let Ok(t) = e.file_type() else { continue };
+            let p = e.path();
+            if t.is_dir() && depth < 3 {
+                walk(&p, depth + 1, out);
+            } else if t.is_file() {
+                if let Some(id) = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(codex_thread_id)
+                {
+                    out.push((id, p));
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&paths::space_home(key).join(".codex/sessions"), 0, &mut out);
+    out
+}
+
+/// The thread id in a rollout file's name, "rollout-2026-11-25T08-00-05-
+/// <uuid>.jsonl" (or "..._<rollout id>.jsonl" after a revert).
+pub fn codex_thread_id(name: &str) -> Option<String> {
+    let core = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    let ids = core.get(20..)?;
+    let thread = ids.split('_').next()?;
+    uuid::Uuid::parse_str(thread).ok()?;
+    Some(thread.to_string())
+}
+
+/// The shell commands in Codex rollout lines: {"timestamp", "type":
+/// "response_item", "payload": a function call (exec_command {cmd},
+/// shell_command {command}, shell {command: [argv]}) or a local shell call
+/// (action.command: [argv])}.
+pub fn codex_commands(text: &str, chat: &str) -> Vec<Entry> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if !line.contains("\"response_item\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v["type"] != "response_item" {
+            continue;
+        }
+        let p = &v["payload"];
+        let cmd = match p["type"].as_str() {
+            Some("function_call") => {
+                let args: serde_json::Value = p["arguments"]
+                    .as_str()
+                    .and_then(|a| serde_json::from_str(a).ok())
+                    .unwrap_or_else(|| p["arguments"].clone());
+                match p["name"].as_str() {
+                    Some("exec_command") => args["cmd"].as_str().map(str::to_string),
+                    Some("shell_command") => args["command"].as_str().map(str::to_string),
+                    Some("shell") => argv_text(&args["command"]),
+                    _ => None,
+                }
+            }
+            Some("local_shell_call") => argv_text(&p["action"]["command"]),
+            _ => None,
+        };
+        let Some(cmd) = cmd else { continue };
+        let t = v["timestamp"]
+            .as_str()
+            .and_then(|s| humantime::parse_rfc3339_weak(s.trim_end_matches('Z')).ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or_else(now, |d| d.as_secs());
+        let mut cmd = cmd.trim().to_string();
+        if cmd.chars().count() > CMD_MAX {
+            cmd = cmd.chars().take(CMD_MAX).collect::<String>() + "…";
+        }
+        out.push(Entry {
+            t,
+            chat: chat.to_string(),
+            cmd,
+            ..Default::default()
+        });
+    }
+    out
+}
+
+/// An argv as one command line: the script of `bash -lc SCRIPT` (how Codex
+/// runs commands), else the words joined.
+fn argv_text(v: &serde_json::Value) -> Option<String> {
+    let a: Vec<&str> = v.as_array()?.iter().filter_map(|x| x.as_str()).collect();
+    match a.as_slice() {
+        [] => None,
+        [sh, flag, script]
+            if sh.ends_with("sh") && flag.starts_with('-') && flag.ends_with('c') =>
+        {
+            Some(script.to_string())
+        }
+        _ => Some(a.join(" ")),
+    }
 }
 
 fn append(key: &str, entries: &[Entry]) -> Result<()> {
@@ -331,5 +454,56 @@ mod tests {
         let link = dir.path().join("link.jsonl");
         std::os::unix::fs::symlink(&p, &link).unwrap();
         assert!(read_from(&link, 0).is_err(), "links are not followed");
+    }
+
+    #[test]
+    fn finds_codex_commands() {
+        let text = concat!(
+            r#"{"timestamp":"2026-11-25T08:00:00.000Z","type":"session_meta","payload":{"id":"x"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-25T08:00:05.120Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ssh fig 'df -h /'\",\"yield_time_ms\":1000}","call_id":"c1"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-25T08:00:06Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"bash\",\"-lc\",\"uptime\"]}","call_id":"c2"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-25T08:00:07Z","type":"response_item","payload":{"type":"local_shell_call","call_id":"c3","status":"completed","action":{"type":"exec","command":["ls","-la"]}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-25T08:00:08Z","type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"{\"command\":\"free -m\"}","call_id":"c4"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-25T08:00:09Z","type":"response_item","payload":{"type":"function_call","name":"apply_patch","arguments":"{}","call_id":"c5"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-25T08:00:10Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"exec_command"}]}}"#,
+            "\n",
+        );
+        let v = codex_commands(text, "0199a213");
+        let cmds: Vec<&str> = v.iter().map(|e| e.cmd.as_str()).collect();
+        assert_eq!(
+            cmds,
+            vec!["ssh fig 'df -h /'", "uptime", "ls -la", "free -m"]
+        );
+        assert_eq!(v[0].host(), Some("fig"));
+        assert_eq!(v[0].t, 1795593605);
+        assert_eq!(v[0].chat, "0199a213");
+    }
+
+    #[test]
+    fn codex_rollout_names() {
+        assert_eq!(
+            codex_thread_id(
+                "rollout-2026-11-25T08-00-05-0199a213-81c0-7800-8aa1-bbab2a035a53.jsonl"
+            )
+            .as_deref(),
+            Some("0199a213-81c0-7800-8aa1-bbab2a035a53")
+        );
+        assert_eq!(
+            codex_thread_id("rollout-2026-11-25T08-00-05-0199a213-81c0-7800-8aa1-bbab2a035a53_0199a214-81c0-7800-8aa1-bbab2a035a53.jsonl").as_deref(),
+            Some("0199a213-81c0-7800-8aa1-bbab2a035a53")
+        );
+        assert_eq!(
+            codex_thread_id(
+                "rollout-2026-11-25T08-00-05-0199a213-81c0-7800-8aa1-bbab2a035a53.jsonl.zst"
+            ),
+            None
+        );
+        assert_eq!(codex_thread_id("history.jsonl"), None);
     }
 }

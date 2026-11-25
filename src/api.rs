@@ -174,6 +174,17 @@ pub enum Op {
     LoginCancel {
         name: String,
     },
+    /// Signs a Codex space in with an OpenAI API key.
+    LoginApiKey {
+        name: String,
+        key: String,
+    },
+    /// Codex on the hub: its version, an install running.
+    CodexShow,
+    /// Installs or updates Codex on the hub.
+    CodexInstall {
+        code: String,
+    },
     BridgeAdd {
         from: String,
         to: String,
@@ -390,6 +401,7 @@ impl Op {
                 | Op::ChatList { .. }
                 | Op::Activity { .. }
                 | Op::UpdateCheck { .. }
+                | Op::CodexShow
                 | Op::Account
                 | Op::NotifyShow
                 | Op::PasskeyLogin { .. }
@@ -414,6 +426,7 @@ impl Op {
             | Op::HostMove { code, .. }
             | Op::ConfigSet { code, .. }
             | Op::Update { code, .. }
+            | Op::CodexInstall { code }
             | Op::AccountPassword { code, .. }
             | Op::AccountTotpBegin { code }
             | Op::SpaceRename { code, .. }
@@ -882,7 +895,9 @@ fn need(op: &Op) -> Need {
         | Op::NotifySet { .. }
         | Op::NotifyTest
         | Op::UpdateCheck { .. }
-        | Op::Update { .. } => Need::Admin,
+        | Op::Update { .. }
+        | Op::CodexShow
+        | Op::CodexInstall { .. } => Need::Admin,
         Op::ChatFeed { name, .. }
         | Op::ChatCommands { name }
         | Op::SpaceScreen { name }
@@ -908,6 +923,7 @@ fn need(op: &Op) -> Need {
         | Op::LoginStart { name }
         | Op::LoginFinish { name, .. }
         | Op::LoginCancel { name }
+        | Op::LoginApiKey { name, .. }
         | Op::SpaceRoot { name, .. }
         | Op::SpaceRemote { name, .. }
         | Op::ChatRm { name, .. }
@@ -1545,6 +1561,9 @@ fn run_op(
         }
         Op::LoginStart { name } => json(ops::login_start(&name)?),
         Op::LoginFinish { name, code } => json(ops::login_finish(&name, &code)?),
+        Op::LoginApiKey { name, key } => json(ops::login_api_key(&name, &key)?),
+        Op::CodexShow => json(ops::codex_view()?),
+        Op::CodexInstall { .. } => json(ops::codex_install()?),
         Op::LoginCancel { name } => {
             let (_, state) = ctx::read_only()?;
             ops::login_cancel(&state.space(&name)?.key);
@@ -2068,6 +2087,12 @@ pub fn all_op_names() -> Vec<String> {
         },
         Op::UpdateCheck { refresh: false },
         Op::Update { code: s() },
+        Op::LoginApiKey {
+            name: s(),
+            key: s(),
+        },
+        Op::CodexShow,
+        Op::CodexInstall { code: s() },
         Op::Account,
         Op::AccountPassword {
             current: s(),
@@ -2138,6 +2163,9 @@ pub fn all_op_names() -> Vec<String> {
             | Op::SpaceRemote { .. }
             | Op::UpdateCheck { .. }
             | Op::Update { .. }
+            | Op::LoginApiKey { .. }
+            | Op::CodexShow
+            | Op::CodexInstall { .. }
             | Op::Account
             | Op::AccountPassword { .. }
             | Op::AccountTotpBegin { .. }

@@ -38,16 +38,31 @@ pub fn new(o: NewSpace) -> Result<()> {
     if ops::logged_in(s) {
         println!("it is running; open it with: sudo thorn attach {name}");
     } else {
-        println!("\nnext: sign it in to Claude (once; it starts right after):");
-        println!("  sudo thorn login {name}");
+        if s.agent == crate::config::CODEX {
+            println!(
+                "\nnext: sign it in to Codex (once; it starts right after), with a device code:"
+            );
+            println!("  sudo thorn login {name}");
+            println!("or an OpenAI API key, read from standard input:");
+            println!("  sudo thorn login {name} --api-key");
+        } else {
+            println!("\nnext: sign it in to Claude (once; it starts right after):");
+            println!("  sudo thorn login {name}");
+        }
     }
     Ok(())
 }
 
-pub fn login(name: &str) -> Result<()> {
+pub fn login(name: &str, api_key: bool) -> Result<()> {
     sys::require_root()?;
     let (cfg, state) = ctx::read_only()?;
     let s = state.space(name)?.clone();
+    if s.agent == crate::config::CODEX {
+        return codex_login(name, &s, &cfg, api_key);
+    }
+    if api_key {
+        bail!("only Codex spaces sign in with an API key");
+    }
     if s.agent != crate::config::CLAUDE {
         bail!(
             "space {name} runs {}; sign it in on its own terminal: sudo thorn attach {name}",
@@ -80,6 +95,41 @@ pub fn login(name: &str) -> Result<()> {
              sudo thorn start {name} --for 1h"
         );
     }
+    Ok(())
+}
+
+/// Codex: `codex login --device-auth` at this terminal (it prints a page
+/// and a code), or an API key read from standard input.
+fn codex_login(
+    name: &str,
+    s: &crate::state::Space,
+    cfg: &crate::config::Config,
+    api_key: bool,
+) -> Result<()> {
+    if api_key {
+        let key = crate::seal::read_password("OpenAI API key (not shown): ")?;
+        ops::login_api_key(name, &key)?;
+        println!("signed in; space {name} is starting");
+        return Ok(());
+    }
+    let user = paths::unix_user(&s.key);
+    let home = paths::space_home(&s.key);
+    println!(
+        "Signing in space {name}: open the page it prints on any device and enter the code.\n"
+    );
+    let status = Command::new("runuser")
+        .args(["-u", &user, "--", "env"])
+        .arg(format!("HOME={}", home.display()))
+        .arg(&cfg.codex_bin)
+        .args(["login", "--device-auth"])
+        .current_dir(s.workdir())
+        .status()
+        .context("running codex login")?;
+    if !status.success() {
+        bail!("sign-in did not complete");
+    }
+    ops::start_after_login(name)?;
+    println!("\nspace {name} is running");
     Ok(())
 }
 

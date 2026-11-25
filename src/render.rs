@@ -287,6 +287,12 @@ pub fn launch(name: &str, space: &Space, cfg: &Config) -> Launch {
             cfg.claude_bin.display().to_string(),
             cfg.claude_args.clone(),
         )
+    } else if space.agent == crate::config::CODEX {
+        (
+            LaunchKind::Command,
+            cfg.codex_bin.display().to_string(),
+            CODEX_ARGS.iter().map(|a| a.to_string()).collect(),
+        )
     } else {
         match cfg.agents.get(&space.agent) {
             Some(a) => (
@@ -312,6 +318,29 @@ pub fn launch(name: &str, space: &Space, cfg: &Config) -> Launch {
         workdir: space.workdir().display().to_string(),
         title: space.title.clone().unwrap_or_default(),
     }
+}
+
+/// Codex runs without its own sandbox (the space is the sandbox: its own
+/// user, firewall and logins) and asks before commands it is unsure of.
+pub const CODEX_ARGS: [&str; 4] = [
+    "--sandbox",
+    "danger-full-access",
+    "--ask-for-approval",
+    "on-request",
+];
+
+/// ~/.codex/config.toml for a new Codex space: no update checks (the hub
+/// updates Codex), sign-in kept in a file in its home, its work folder
+/// trusted.
+pub fn initial_codex_config(workdir: &str) -> String {
+    format!(
+        "# Written by blackthorn for this space.\n\
+         check_for_update_on_startup = false\n\
+         cli_auth_credentials_store = \"file\"\n\n\
+         [projects.{}]\n\
+         trust_level = \"trusted\"\n",
+        json_string(workdir)
+    )
 }
 
 pub fn yes() -> bool {
@@ -525,6 +554,35 @@ mod tests {
         assert_eq!(l.kind, LaunchKind::Command);
         assert_eq!(l.bin, "/usr/local/bin/aider");
         assert_eq!(l.args, vec!["--no-auto-commits"]);
+
+        let mut codex = s.clone();
+        codex.agent = crate::config::CODEX.into();
+        codex.args = vec!["-m".into(), "gpt-6.1".into()];
+        let l = launch("x", &codex, &cfg);
+        assert_eq!(l.kind, LaunchKind::Command);
+        assert_eq!(l.bin, crate::config::CODEX_BIN);
+        assert_eq!(
+            l.args,
+            vec![
+                "--sandbox",
+                "danger-full-access",
+                "--ask-for-approval",
+                "on-request",
+                "-m",
+                "gpt-6.1"
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_config_is_toml() {
+        let t = initial_codex_config("/var/lib/blackthorn/spaces/a1b2c3d4/work \"x\"");
+        let v: toml::Value = toml::from_str(&t).unwrap();
+        assert_eq!(v["check_for_update_on_startup"].as_bool(), Some(false));
+        assert_eq!(
+            v["projects"]["/var/lib/blackthorn/spaces/a1b2c3d4/work \"x\""]["trust_level"].as_str(),
+            Some("trusted")
+        );
     }
 
     #[test]

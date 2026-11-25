@@ -81,7 +81,7 @@ enum Cmd {
     New {
         /// The machine it works on.
         host: String,
-        /// claude (default) or an agent from config.toml.
+        /// claude (default), codex, or an agent from config.toml.
         #[arg(long)]
         agent: Option<String>,
         /// Default: <host>-<agent>.
@@ -113,8 +113,14 @@ enum Cmd {
         #[arg(long)]
         root: Option<String>,
     },
-    /// Sign a Claude space in, then start it.
-    Login { name: String },
+    /// Sign a Claude or Codex space in, then start it. Codex: a device code
+    /// (a page and a code to enter there), or --api-key.
+    Login {
+        name: String,
+        /// Codex: read an OpenAI API key from standard input instead.
+        #[arg(long)]
+        api_key: bool,
+    },
     /// Delete a space (its files are archived unless --purge). Its logins
     /// on its machine go too; its folder there (/srv/<name>) stays unless
     /// --purge-data.
@@ -284,6 +290,9 @@ enum Cmd {
     /// Tailscale on the hub: install it, sign in, its web interface.
     #[command(subcommand)]
     Tailscale(TailscaleCmd),
+    /// OpenAI's Codex on the hub, for Codex spaces.
+    #[command(subcommand)]
+    Codex(CodexCmd),
     /// Show or change the settings the web UI can change too.
     #[command(subcommand)]
     Config(ConfigCmd),
@@ -363,6 +372,15 @@ enum ChatCmd {
     },
     /// Go back to an earlier chat, the same way.
     Open { space: String, id: String },
+}
+
+#[derive(Subcommand)]
+enum CodexCmd {
+    /// Its version, and whether an install is running.
+    Status,
+    /// Install or update it with OpenAI's installer (into /opt/codex).
+    /// Codex spaces use the new version once restarted.
+    Install,
 }
 
 #[derive(Subcommand)]
@@ -638,7 +656,7 @@ fn run(cli: Cli) -> Result<()> {
             root,
             owner: None,
         }),
-        Cmd::Login { name } => s::login(&name),
+        Cmd::Login { name, api_key } => s::login(&name, api_key),
         Cmd::Rm {
             name,
             purge,
@@ -744,6 +762,10 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Update { check } => config_cmd::update(check),
+        Cmd::Codex(c) => match c {
+            CodexCmd::Status => config_cmd::codex_status(),
+            CodexCmd::Install => config_cmd::codex_install(),
+        },
         Cmd::Tailscale(t) => match t {
             TailscaleCmd::Status => config_cmd::tailscale_status(),
             TailscaleCmd::Install => config_cmd::tailscale_install(),
@@ -987,6 +1009,9 @@ mod tests {
             ("ask_decide", &["approve"]),
             ("host_setup", &["host", "setup"]),
             ("activity", &["log"]),
+            ("login_api_key", &["login"]),
+            ("codex_show", &["codex", "status"]),
+            ("codex_install", &["codex", "install"]),
         ];
         // Operations that exist only because of the web: sessions.
         // Passkeys are made and used in a browser.

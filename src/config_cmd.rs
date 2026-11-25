@@ -111,6 +111,32 @@ pub fn tailscale_status() -> Result<()> {
     Ok(())
 }
 
+pub fn codex_status() -> Result<()> {
+    let v = ops::codex_view()?;
+    match &v.version {
+        Some(ver) => println!("installed: {ver}"),
+        None => println!("not installed (sudo thorn codex install)"),
+    }
+    if v.running {
+        println!(
+            "an install is running: journalctl -u {} -f",
+            ops::CODEX_UNIT
+        );
+    } else if v.failed {
+        println!("the last install failed: journalctl -u {}", ops::CODEX_UNIT);
+    }
+    Ok(())
+}
+
+pub fn codex_install() -> Result<()> {
+    ops::codex_install()?;
+    println!(
+        "installing Codex; follow it with: journalctl -u {} -f",
+        ops::CODEX_UNIT
+    );
+    Ok(())
+}
+
 pub fn tailscale_install() -> Result<()> {
     println!(
         "{}; follow it with: journalctl -u {} -f",
