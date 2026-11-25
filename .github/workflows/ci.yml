@@ -97,7 +97,11 @@ jobs:
           /tmp/venv/bin/playwright install --with-deps chromium >/dev/null
           echo /tmp/venv/bin >> "$GITHUB_PATH"
       - name: demo hub and screenshots
-        run: tests/demo/run.sh target/debug/thorn shots
+        run: |
+          tests/demo/run.sh target/debug/thorn shots 2>&1 | tee demo.log
+          s=${PIPESTATUS[0]}
+          [ "$s" = 0 ] || tail -25 demo.log | sed 's/^/::error::/'
+          exit $s
       - name: push to screenshots-preview
         run: |
           cd shots

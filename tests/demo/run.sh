@@ -8,7 +8,8 @@
 #
 # Needs Docker (a privileged container, for systemd in the hub) and Python
 # with Playwright (pip install playwright && playwright install chromium).
-set -eu
+set -Eeu
+trap 'echo "failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 E2E=$HERE/../e2e
