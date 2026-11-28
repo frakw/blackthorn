@@ -56,18 +56,19 @@ impl Os {
         matches!(self, Os::Windows | Os::WindowsPowershell)
     }
 
-    /// What `cmd /c ver` and then `echo %OS%` print on a Windows machine:
-    /// Windows, and which shell its SSH server runs commands in (cmd.exe
-    /// expands %OS%; PowerShell does not).
-    pub fn from_windows(ver: &str, echo: &str) -> Option<Os> {
-        if !ver.contains("Windows") {
-            return None;
-        }
-        Some(if echo.trim() == "Windows_NT" {
-            Os::Windows
+    /// What `echo %OS%` and `echo $env:OS` print: on Windows, the shell
+    /// its SSH server runs commands in expands one of them to
+    /// "Windows_NT" (cmd.exe the first, PowerShell the second). Windows'
+    /// sshd already wraps a command in `cmd /c "..."`, so nothing here may
+    /// start another cmd with quotes of its own.
+    pub fn from_windows(cmd_echo: &str, ps_echo: &str) -> Option<Os> {
+        if cmd_echo.trim() == "Windows_NT" {
+            Some(Os::Windows)
+        } else if ps_echo.trim() == "Windows_NT" {
+            Some(Os::WindowsPowershell)
         } else {
-            Os::WindowsPowershell
-        })
+            None
+        }
     }
 
     /// From the output of `uname -s`.
@@ -1213,13 +1214,16 @@ since = 1
         assert_eq!(Os::from_uname("Linux\n"), Some(Os::Linux));
         assert_eq!(Os::from_uname("Darwin"), Some(Os::Macos));
         assert_eq!(Os::from_uname("MINGW64_NT"), None);
-        let ver = "\r\nMicrosoft Windows [Version 10.0.26100.2314]\r\n";
-        assert_eq!(Os::from_windows(ver, "Windows_NT\r\n"), Some(Os::Windows));
+        // As a Windows 10 LTSC machine answered, in cmd.exe.
         assert_eq!(
-            Os::from_windows(ver, "%OS%\r\n"),
+            Os::from_windows("Windows_NT\r\n", "$env:OS\r\n"),
+            Some(Os::Windows)
+        );
+        assert_eq!(
+            Os::from_windows("%OS%\r\n", "Windows_NT\r\n"),
             Some(Os::WindowsPowershell)
         );
-        assert_eq!(Os::from_windows("bash: cmd: command not found", ""), None);
+        assert_eq!(Os::from_windows("%OS%\n", ":OS\n"), None, "a POSIX shell");
         assert!(Os::WindowsPowershell.windows() && !Os::Macos.windows());
     }
 

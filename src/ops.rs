@@ -3107,11 +3107,11 @@ pub fn host_check(name: &str) -> Result<Os> {
         Some(os) if out.status.success() => os,
         _ => {
             // No uname: Windows, in cmd.exe or PowerShell?
-            let ver = run("cmd /c ver")?;
-            let echo = run("echo %OS%")?;
+            let cmd = run("echo %OS%")?;
+            let ps = run("echo $env:OS")?;
             Os::from_windows(
-                &String::from_utf8_lossy(&ver.stdout),
-                &String::from_utf8_lossy(&echo.stdout),
+                &String::from_utf8_lossy(&cmd.stdout),
+                &String::from_utf8_lossy(&ps.stdout),
             )
             .with_context(|| {
                 format!(

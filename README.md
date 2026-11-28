@@ -470,13 +470,25 @@ spaces need.
 - **macOS**: turn on Remote Login (System Settings → General → Sharing),
   then add blackthorn's key line to that account's
   `~/.ssh/authorized_keys`. Spaces are told it is macOS (zsh, BSD tools).
-- **Windows**: install OpenSSH Server (Settings → System → Optional
-  features), start the `sshd` service and set it to start automatically.
-  For an administrator account the key line goes in
+- **Windows**: install OpenSSH Server and start it, in PowerShell as
+  administrator (the install can take several minutes; where it cannot use
+  Windows Update, install the MSI from
+  [Win32-OpenSSH's releases](https://github.com/PowerShell/Win32-OpenSSH/releases)
+  instead):
+
+  ```powershell
+  Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+  Start-Service sshd; Set-Service sshd -StartupType Automatic
+  # only your tailnet may reach port 22
+  New-NetFirewallRule -Name sshd-tailnet -DisplayName 'OpenSSH (tailnet)' -Direction Inbound -Protocol TCP -LocalPort 22 -RemoteAddress 100.64.0.0/10 -Action Allow
+  ```
+
+  Then, for an administrator account, the key line goes in
   `C:\ProgramData\ssh\administrators_authorized_keys`, which only
   Administrators and SYSTEM may change; for another account, in its
-  `%USERPROFILE%\.ssh\authorized_keys`. The machine's page in the web UI
-  has the PowerShell commands for both.
+  `%USERPROFILE%\.ssh\authorized_keys` (both exist only once sshd has
+  started). The machine's page in the web UI has the PowerShell commands.
+  Tested on Windows 10 IoT LTSC with Win32-OpenSSH 10.4, and on macOS 26.4.
 
 `thorn host check NAME` (or Check login on its page) finds out which it is,
 and on Windows whether its SSH server runs commands in cmd.exe or

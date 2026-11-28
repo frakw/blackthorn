@@ -3044,14 +3044,25 @@ fn host_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
     let others = format!(
         "<details class=\"more\"{}><summary>On macOS or Windows</summary>\
          <p><b>macOS</b>: turn on Remote Login (System Settings → General → Sharing), then add the line as \
-         above.</p><p><b>Windows</b>: install OpenSSH Server (Settings → System → Optional features), start the \
-         <code>sshd</code> service and set it to start automatically. If {user} is an administrator, its key \
-         goes in a file of its own: run this in PowerShell as administrator:</p>{}\
+         above.</p><p><b>Windows</b>: first install OpenSSH Server and start it, in PowerShell as administrator \
+         (the install can take several minutes; the last part lets only your tailnet reach port 22):</p>{}\
+         <p class=\"hint\">Where that fails (no Windows Update), install the MSI from \
+         <a href=\"https://github.com/PowerShell/Win32-OpenSSH/releases\" target=\"_blank\" \
+         rel=\"noopener noreferrer\">Win32-OpenSSH's releases</a> instead.</p>\
+         <p>Then, if {user} is an administrator, its key goes in a file of its own (made when sshd first \
+         starts): run this in PowerShell as administrator:</p>{}\
          <p class=\"hint\">Otherwise, as {user}, in PowerShell:</p>{}\
          <p class=\"hint\">On macOS and Windows its spaces log in as {user}, with all it may do: logins of each \
          space's own are for Linux machines. Check login tells blackthorn which it is (and on Windows, whether \
          commands run in cmd.exe or PowerShell).</p></details>",
         if h.os == crate::state::Os::Linux { "" } else { " open" },
+        copyable(
+            "keywinsshd",
+            "Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0; Start-Service sshd; \
+             Set-Service sshd -StartupType Automatic; New-NetFirewallRule -Name sshd-tailnet -DisplayName \
+             'OpenSSH (tailnet)' -Direction Inbound -Protocol TCP -LocalPort 22 -RemoteAddress 100.64.0.0/10 \
+             -Action Allow"
+        ),
         copyable("keywinadmin", &win_admin),
         copyable("keywinuser", &win_user),
         user = esc(&h.user)
