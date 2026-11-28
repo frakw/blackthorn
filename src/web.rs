@@ -498,6 +498,31 @@ fn route(
             Ok(tag) => updating_page(&c, &tag),
             Err(e) => back("/settings#update", Err(e)),
         },
+        ("POST", ["ca", "recovery"]) => match get::<String>(
+            &c,
+            Op::CaRecovery {
+                replace: f(form, "replace") == "1",
+                code: f(form, "code").into(),
+            },
+        ) {
+            Ok(key) => Reply::Html(
+                200,
+                page(
+                    &c,
+                    "Recovery key",
+                    &format!(
+                        "<h1>The recovery key</h1><section class=\"card\"><p>Save it now, away from this hub: in a \
+                         password manager, or on paper. <b>It is shown only this once</b> and not kept here.</p>\
+                         <pre class=\"secret\">{}</pre><p class=\"hint\">After a break-in: on a new hub, \
+                         <code>sudo thorn ca rotate --recovery-key FILE</code> makes a new hub CA and gets every machine \
+                         to trust it instead of the old one.</p><p><a href=\"/settings#ca\">Done</a></p></section>",
+                        esc(&key)
+                    ),
+                    &Flash::default(),
+                ),
+            ),
+            Err(e) => back("/settings#ca", Err(e)),
+        },
         ("POST", ["codex", "install"]) => back(
             "/settings#codex",
             get::<serde_json::Value>(
@@ -3147,6 +3172,38 @@ fn host_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
 
 /// The logins of the machine's spaces, and setting the machine up for
 /// logins of each space's own.
+/// Certificates on a set-up machine: whether it takes them, and removing
+/// blackthorn's key line once it does.
+fn ca_html(c: &Ctx, h: &HostView) -> String {
+    if !h.ca {
+        return format!(
+            "<p class=\"hint\">SSH certificates: not here{}. The spaces log in with keys of their own.</p>",
+            h.ca_problem
+                .as_ref()
+                .map(|p| format!(" ({})", esc(p)))
+                .unwrap_or_default()
+        );
+    }
+    let key = if h.key_dropped {
+        "Only certificates open it: blackthorn's key line is gone.".to_string()
+    } else {
+        format!(
+            "blackthorn's own key line is still in <b>{}</b>'s <code>authorized_keys</code>. Once you remove it, \
+             only certificates, good for minutes, open this machine, and nothing kept on the hub does by itself.\
+             <form method=\"post\" action=\"/host/{}/drop-key\" class=\"stack\">{}{}\
+             <div><button>Remove the key line</button></div></form>",
+            esc(&h.user),
+            url_encode(&h.name),
+            csrf(c),
+            code_field()
+        )
+    };
+    format!(
+        "<p>SSH certificates: <span class=\"badge ok\">yes</span>. The spaces log in with a key that exists only in \
+         memory and a certificate good for ten minutes (<a href=\"/settings#ca\">Settings</a>). {key}</p>"
+    )
+}
+
 fn logins_card(c: &Ctx, h: &HostView) -> String {
     let n = url_encode(&h.name);
     let setup_dialog = |label: &str, class: &str| {
@@ -3200,6 +3257,7 @@ fn logins_card(c: &Ctx, h: &HostView) -> String {
                     "no (only Debian and Ubuntu with Docker's packages for now)"
                 }
             ));
+            b.push_str(&ca_html(c, h));
             if !h.logins.is_empty() {
                 let rows: String = h
                     .logins
@@ -3292,6 +3350,17 @@ fn host_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>) 
                 }
                 m
             }),
+        ),
+        "drop-key" => back(
+            &here,
+            get::<serde_json::Value>(
+                c,
+                Op::HostDropKey {
+                    name: name.into(),
+                    code: f(form, "code").into(),
+                },
+            )
+            .map(|_| format!("{name} now takes only certificates from blackthorn")),
         ),
         "check" => back(
             &here,
@@ -3544,8 +3613,9 @@ fn settings_page(c: &Ctx, flash: &Flash) -> Reply {
     };
     let ts = get::<ops::TailscaleView>(c, Op::TailscaleShow).unwrap_or_default();
     let codex = get::<ops::CodexView>(c, Op::CodexShow).unwrap_or_default();
+    let ca = ca_card(c);
     let b = format!(
-        "<h1>Settings</h1>{}{}{}{}<section class=\"card\"><h2>Network and access</h2><p class=\"hint\">Saved to \
+        "<h1>Settings</h1>{}{}{}{}{ca}<section class=\"card\"><h2>Network and access</h2><p class=\"hint\">Saved to \
          <code>/etc/blackthorn/config.toml</code> and applied at once.{you} A change that would shut you out is \
          refused.</p>{peers_note}<form method=\"post\" action=\"/settings\" class=\"stack settings\">{}{fields}{}\
          <div><button class=\"primary\">Save</button></div></form></section>\
@@ -3577,6 +3647,68 @@ fn settings_page(c: &Ctx, flash: &Flash) -> Reply {
         ""
     };
     Reply::Html(200, page_with(c, "Settings", &b, flash, head))
+}
+
+/// SSH certificates: the hub CA, the recovery key, the machines.
+fn ca_card(c: &Ctx) -> String {
+    let st = match get::<crate::ca::Status>(c, Op::CaShow) {
+        Ok(s) => s,
+        Err(e) => return format!("<section class=\"card\" id=\"ca\"><h2>SSH certificates</h2><p class=\"t-bad\">{}</p></section>", esc(&e)),
+    };
+    let machines = if st.trusting.is_empty() && st.not.is_empty() {
+        "<p>No machine is set up yet.</p>".to_string()
+    } else {
+        let mut m = String::new();
+        if !st.trusting.is_empty() {
+            m.push_str(&format!(
+                "<p>Trusted by {}.</p>",
+                esc(&st.trusting.join(", "))
+            ));
+        }
+        for (n, why) in &st.not {
+            m.push_str(&format!(
+                "<p class=\"hint\">Not on <a href=\"/host/{}\">{}</a>: {}.</p>",
+                url_encode(n),
+                esc(n),
+                esc(why)
+            ));
+        }
+        m
+    };
+    let recovery = match &st.recovery {
+        Some(fp) => format!(
+            "<p>Recovery key: <code>{}</code>. Keep it away from this hub. Making a new one retires it.</p>\
+             <form method=\"post\" action=\"/ca/recovery\" class=\"stack\">{}<input type=\"hidden\" name=\"replace\" value=\"1\">{}\
+             <div><button>Make a new recovery key</button></div></form>",
+            esc(fp),
+            csrf(c),
+            code_field()
+        ),
+        None => format!(
+            "<p class=\"t-warn\">No recovery key yet. Without one, a hub that was broken into can only be replaced \
+             by setting up each machine again by hand.</p>\
+             <form method=\"post\" action=\"/ca/recovery\" class=\"stack\">{}{}\
+             <div><button class=\"primary\">Make the recovery key</button></div></form>",
+            csrf(c),
+            code_field()
+        ),
+    };
+    let latest = if st.latest.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<details><summary>Latest certificates</summary><pre>{}</pre></details>",
+            esc(&st.latest.join("\n"))
+        )
+    };
+    format!(
+        "<section class=\"card\" id=\"ca\"><h2>SSH certificates</h2><p class=\"hint\">Set-up machines trust \
+         blackthorn's certificate authority instead of each of its keys. A space's key exists only in memory, with a \
+         certificate good for ten minutes, renewed while it may work there; each certificate's serial is in the \
+         machine's sshd log and in <code>{}</code>.</p><p>Hub CA: <code>{}</code></p>{machines}{recovery}{latest}</section>",
+        crate::ca::CERT_LOG,
+        esc(&st.hub),
+    )
 }
 
 /// OpenAI's Codex on the hub: installed, which version; install or update.

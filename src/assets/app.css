@@ -295,6 +295,8 @@ svg.map .wire-label { fill: var(--bridge); font-size: 12px; paint-order: stroke;
 .swatch.admin { border-top: 2px solid var(--admin); }
 .swatch.uses { border-top: 2px dotted var(--wire); }
 .t-bad { color: var(--bad); }
+.t-warn { color: var(--warn); }
+pre.secret { white-space: pre-wrap; overflow-wrap: anywhere; user-select: all; }
 
 .table-wrap { overflow-x: auto; margin-bottom: 14px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
 table { border-collapse: collapse; width: 100%; font-size: 14px; }

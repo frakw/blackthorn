@@ -133,6 +133,16 @@ pub struct Host {
     /// Why setting it up failed last, and when (retried hourly).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub problem: Option<Problem>,
+    /// Its sshd takes blackthorn's certificates (see ca.rs).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ca: bool,
+    /// Why it does not, as its setup found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_problem: Option<String>,
+    /// blackthorn's management key line is gone from it: only a
+    /// certificate logs in.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub key_dropped: bool,
 }
 
 /// A space's logins on a machine: `bt-<key>` (user, and root with sudo)
@@ -147,6 +157,9 @@ pub struct Account {
     /// Its folder there, /srv/<srv> (the space's name when it was made).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub srv: Option<String>,
+    /// Its logins take certificates (their names are there), not keys.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ca: bool,
 }
 
 /// Work a machine still needs from the hub.
@@ -165,14 +178,19 @@ pub enum Pending {
         #[serde(default, skip_serializing_if = "is_false")]
         purge: bool,
     },
+    /// Send the certificate authorities to trust (one was added or
+    /// replaced).
+    Trust,
 }
 
 impl Pending {
+    /// The space it is for ("" for the machine's own).
     pub fn key(&self) -> &str {
         match self {
             Pending::Accounts { key, .. }
             | Pending::Revoke { key }
             | Pending::Remove { key, .. } => key,
+            Pending::Trust => "",
         }
     }
 }
@@ -700,6 +718,13 @@ impl State {
                     } else {
                         (crate::paths::unix_user(&s.key), m.user_key(&s.key))
                     };
+                    // With certificates: the one key in memory, whose
+                    // certificate names this login.
+                    let key = if h.ca && a.ca {
+                        crate::ca::space_key(&s.key)
+                    } else {
+                        key
+                    };
                     return Some(Login {
                         host: name,
                         h,
@@ -903,6 +928,9 @@ mod tests {
             accounts: BTreeMap::new(),
             pending: Vec::new(),
             problem: None,
+            ca: false,
+            ca_problem: None,
+            key_dropped: false,
         }
     }
 
@@ -1052,6 +1080,7 @@ mod tests {
                 Account {
                     full: true,
                     srv: Some("ops".into()),
+                    ca: false,
                 },
             );
         }

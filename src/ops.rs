@@ -176,6 +176,14 @@ pub struct HostView {
     /// Why setting it up failed last.
     #[serde(default)]
     pub problem: Option<String>,
+    /// It takes blackthorn's certificates; or why not; and whether its
+    /// management key line is gone.
+    #[serde(default)]
+    pub ca: bool,
+    #[serde(default)]
+    pub ca_problem: Option<String>,
+    #[serde(default)]
+    pub key_dropped: bool,
 }
 
 pub fn overview(with_version: bool) -> Result<Overview> {
@@ -326,10 +334,16 @@ pub fn overview(with_version: bool) -> Result<Overview> {
                         crate::state::Pending::Remove { .. } => {
                             format!("remove the logins of {space}")
                         }
+                        crate::state::Pending::Trust => {
+                            "send the certificate authorities to trust".to_string()
+                        }
                     }
                 })
                 .collect(),
             problem: h.problem.as_ref().map(|p| p.text.clone()),
+            ca: h.ca,
+            ca_problem: h.ca_problem.clone(),
+            key_dropped: h.key_dropped,
         })
         .collect();
     Ok(Overview {
@@ -2920,6 +2934,9 @@ pub fn host_add(
             accounts: Default::default(),
             pending: Vec::new(),
             problem: None,
+            ca: false,
+            ca_problem: None,
+            key_dropped: false,
         },
     );
     ctx.commit()?;
@@ -3509,6 +3526,9 @@ mod tests {
                 accounts: Default::default(),
                 pending: Vec::new(),
                 problem: None,
+                ca: false,
+                ca_problem: None,
+                key_dropped: false,
             },
         );
         let local = [ip("127.0.0.1"), ip("100.64.0.10")];

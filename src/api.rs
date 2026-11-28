@@ -242,6 +242,21 @@ pub enum Op {
         name: String,
         key: String,
     },
+    /// SSH certificates: the CAs, the machines trusting them, the latest.
+    CaShow,
+    /// Makes the recovery key (again, with `replace`): its private half,
+    /// shown once.
+    CaRecovery {
+        #[serde(default)]
+        replace: bool,
+        code: String,
+    },
+    /// Removes blackthorn's key line from a machine that takes its
+    /// certificates.
+    HostDropKey {
+        name: String,
+        code: String,
+    },
     /// Codex on the hub: its version, an install running.
     CodexShow,
     /// Installs or updates Codex on the hub.
@@ -481,6 +496,7 @@ impl Op {
                 | Op::Activity { .. }
                 | Op::UpdateCheck { .. }
                 | Op::CodexShow
+                | Op::CaShow
                 | Op::Account
                 | Op::NotifyShow
                 | Op::PasskeyLogin { .. }
@@ -514,6 +530,8 @@ impl Op {
             | Op::ConfigSet { code, .. }
             | Op::Update { code, .. }
             | Op::CodexInstall { code }
+            | Op::CaRecovery { code, .. }
+            | Op::HostDropKey { code, .. }
             | Op::AccountPassword { code, .. }
             | Op::AccountTotpBegin { code }
             | Op::SpaceRename { code, .. }
@@ -985,7 +1003,10 @@ fn need(op: &Op) -> Need {
         | Op::UpdateCheck { .. }
         | Op::Update { .. }
         | Op::CodexShow
-        | Op::CodexInstall { .. } => Need::Admin,
+        | Op::CodexInstall { .. }
+        | Op::CaShow
+        | Op::CaRecovery { .. }
+        | Op::HostDropKey { .. } => Need::Admin,
         Op::ChatFeed { name, .. }
         | Op::ChatCommands { name }
         | Op::SpaceScreen { name }
@@ -1702,6 +1723,9 @@ fn run_op(
         Op::LoginFinish { name, code } => json(ops::login_finish(&name, &code)?),
         Op::LoginApiKey { name, key } => json(ops::login_api_key(&name, &key)?),
         Op::CodexShow => json(ops::codex_view()?),
+        Op::CaShow => json(crate::ca::status()?),
+        Op::CaRecovery { replace, .. } => json(crate::ca::make_recovery(replace)?),
+        Op::HostDropKey { name, .. } => json(crate::ca::drop_key(&name)?),
         Op::CodexInstall { .. } => json(ops::codex_install()?),
         Op::LoginCancel { name } => {
             let (_, state) = ctx::read_only()?;
@@ -2243,6 +2267,15 @@ pub fn all_op_names() -> Vec<String> {
         },
         Op::CodexShow,
         Op::CodexInstall { code: s() },
+        Op::CaShow,
+        Op::CaRecovery {
+            replace: false,
+            code: s(),
+        },
+        Op::HostDropKey {
+            name: s(),
+            code: s(),
+        },
         Op::CodexChats { name: s() },
         Op::CodexFeed {
             name: s(),
@@ -2354,6 +2387,9 @@ pub fn all_op_names() -> Vec<String> {
             | Op::LoginApiKey { .. }
             | Op::CodexShow
             | Op::CodexInstall { .. }
+            | Op::CaShow
+            | Op::CaRecovery { .. }
+            | Op::HostDropKey { .. }
             | Op::CodexChats { .. }
             | Op::CodexFeed { .. }
             | Op::CodexNew { .. }

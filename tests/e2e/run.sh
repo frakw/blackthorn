@@ -572,12 +572,19 @@ echo "$out" | grep -q "is set up" && ok "thorn host setup --verify" || fail "set
 thorn host ls | grep "^t1 " | grep -q "their own" && ok "host ls: spaces there have logins of their own" || fail "host ls: $(thorn host ls)"
 thorn host ls | grep "^t1 " | grep -q " root " && ok "blackthorn itself now logs in to t1 as root" || fail "host ls login: $(thorn host ls)"
 docker exec "$P-t1" grep -q 'command="/usr/local/libexec/blackthorn-ssh"' /root/.ssh/authorized_keys && ok "blackthorn's key logs its commands on t1" || fail "root key line"
-docker exec "$P-t1" test -f "/etc/ssh/blackthorn/bt-$k1" && docker exec "$P-t1" test -f "/etc/ssh/blackthorn/bt-$k1-ro" && ok "t1-main got its two logins" || fail "t1-main's key lines"
-[ "$(docker exec "$P-t1" stat -c %U "/etc/ssh/blackthorn/bt-$k1")" = root ] && ok "their key lines are root's" || fail "key line owner"
+docker exec "$P-t1" test -f "/etc/ssh/blackthorn/principals/bt-$k1" && docker exec "$P-t1" test -f "/etc/ssh/blackthorn/principals/bt-$k1-ro" && ok "t1-main got its two logins, for certificates" || fail "t1-main's principals: $(docker exec "$P-t1" ls -R /etc/ssh/blackthorn 2>&1)"
+[ "$(docker exec "$P-t1" stat -c %U "/etc/ssh/blackthorn/principals/bt-$k1")" = root ] && ok "their lines are root's" || fail "principals owner"
+docker exec "$P-t1" test -e "/etc/ssh/blackthorn/bt-$k1" && fail "a key line stayed beside the principals" || ok "and no key line of theirs is left"
+docker exec "$P-t1" grep -q "^ssh-ed25519 " /etc/ssh/blackthorn/ca.pub && ok "t1 trusts blackthorn's CA" || fail "t1 ca.pub"
+docker exec "$P-t1" sshd -T 2>/dev/null | grep -qi "^trustedusercakeys /etc/ssh/blackthorn/ca.pub" && ok "and its sshd uses it" || fail "t1 sshd CA"
+thorn ca status | grep "trusted by" | grep -q t1 && ok "thorn ca status lists t1" || fail "ca status: $(thorn ca status)"
 hub grep -q "User bt-$k1" "/var/lib/blackthorn/spaces/$k1/.ssh/config" && ok "t1-main logs in as its own user" || fail "t1-main ssh config: $(hub cat /var/lib/blackthorn/spaces/$k1/.ssh/config)"
-want=$(hub cut -d' ' -f2 "/etc/blackthorn/keys/spaces/$k1.pub")
-got=$(hub env SSH_AUTH_SOCK="/run/blackthorn-agent/$k1/agent.sock" ssh-add -L | cut -d' ' -f2)
-[ "$got" = "$want" ] && ok "its agent holds only its own key" || fail "t1-main agent keys: $got"
+certs_of() { hub sh -c "SSH_AUTH_SOCK=/run/blackthorn-agent/$1/agent.sock ssh-add -L | grep cert-v01 > /tmp/cert-$1.pub; ssh-keygen -L -f /tmp/cert-$1.pub"; }
+c=$(certs_of "$k1")
+echo "$c" | grep -q "space-$k1-" && ok "its agent holds a certificate for its user login" || fail "t1-main cert: $c"
+echo "$c" | grep -q "source-address" && ok "usable only from the hub" || fail "cert source-address: $c"
+hub grep -q "space-$k1" /var/log/blackthorn/certs.log && ok "and the hub logs it" || fail "certs.log: $(hub tail -3 /var/log/blackthorn/certs.log 2>&1)"
+hub test -f "/run/blackthorn-certs/space-$k1" && ok "its key is in memory (/run)" || fail "space key in /run"
 [ "$(hub runuser -u "bt-$k1" -- ssh t1 id -un 2>/dev/null)" = "bt-$k1" ] && ok "ssh t1 is bt-$k1" || fail "t1-main login: $(hub runuser -u "bt-$k1" -- ssh t1 id -un 2>&1)"
 [ "$(docker exec "$P-t1" stat -c %U /srv/t1-main)" = "bt-$k1" ] && ok "/srv/t1-main is its own" || fail "/srv/t1-main owner"
 hub runuser -u "bt-$k1" -- ssh t1 'touch /srv/t1-main/x' && ok "it writes there" || fail "write to /srv/t1-main"
@@ -608,11 +615,28 @@ kr=$(key_of t1-ro)
 hub grep -q "User bt-$kr-ro" "/var/lib/blackthorn/spaces/$kr/.ssh/config" && ok "t1-ro logs in read-only" || fail "ro ssh config"
 hub grep -q "read-only" "/var/lib/blackthorn/spaces/$kr/t1-ro/CLAUDE.md" && ok "and its instructions say so" || fail "ro CLAUDE.md"
 expect_reach 30 t1-ro t1 ok
-want=$(hub cut -d' ' -f2 "/etc/blackthorn/keys/spaces/$kr-ro.pub")
-got=$(hub env SSH_AUTH_SOCK="/run/blackthorn-agent/$kr/agent.sock" ssh-add -L | cut -d' ' -f2)
-[ "$got" = "$want" ] && ok "its agent holds only its read-only key" || fail "ro agent keys: $got"
+c=$(certs_of "$kr")
+echo "$c" | grep -q "space-$kr-ro" && ! echo "$c" | grep -q "space-$kr-main\|space-$kr-[0-9a-f]\{8\}" && ok "its certificate names only its read-only login" || fail "ro cert: $c"
 if hub runuser -u "bt-$kr" -- ssh -l "bt-$kr" t1 true 2>/dev/null; then fail "a read-only space logged in as its user login"; else ok "it cannot log in as its user login"; fi
 if hub runuser -u "bt-$kr" -- ssh t1 'touch /root/x' 2>/dev/null; then fail "the read-only space wrote as root"; else ok "it cannot write where root can"; fi
+
+say "certificates: the recovery key, a new hub CA, certificates only"
+hub sh -c "/usr/local/bin/thorn ca recovery | sed -n '/BEGIN OPENSSH PRIVATE KEY/,/END OPENSSH PRIVATE KEY/p' > /tmp/rk"
+hub grep -q "BEGIN OPENSSH PRIVATE KEY" /tmp/rk && ok "thorn ca recovery prints the recovery key" || fail "recovery key: $(hub cat /tmp/rk)"
+part=$(hub sed -n 2p /tmp/rk)
+[ -z "$(hub grep -rlF "$part" /etc/blackthorn /var/lib/blackthorn 2>/dev/null)" ] && ok "and does not keep it" || fail "the recovery key is kept on the hub"
+thorn ca recovery 2>&1 | grep -q -- "--replace" && ok "a second one needs --replace" || fail "recovery twice"
+thorn _tick >/dev/null 2>&1
+[ "$(docker exec "$P-t1" grep -c '^ssh-ed25519 ' /etc/ssh/blackthorn/ca.pub)" = 2 ] && ok "t1 learns to trust it too" || fail "t1 ca.pub: $(docker exec "$P-t1" cat /etc/ssh/blackthorn/ca.pub)"
+old=$(docker exec "$P-t1" head -1 /etc/ssh/blackthorn/ca.pub)
+thorn ca rotate --recovery-key /tmp/rk | grep -q "^t1: done" && ok "thorn ca rotate, signed by the recovery key" || fail "rotate: $(thorn ca rotate --recovery-key /tmp/rk 2>&1)"
+[ "$(docker exec "$P-t1" head -1 /etc/ssh/blackthorn/ca.pub)" != "$old" ] && ok "t1 now trusts the new hub CA, not the old" || fail "t1 still has the old CA"
+[ "$(hub runuser -u "bt-$k1" -- ssh -o ControlMaster=no -o ControlPath=none t1 id -un 2>/dev/null)" = "bt-$k1" ] && ok "the space logs in with a certificate of the new CA" || fail "login after rotate: $(hub runuser -u "bt-$k1" -- ssh -o ControlMaster=no -o ControlPath=none t1 id -un 2>&1)"
+thorn host drop-key t1 | grep -q "only certificates" && ok "thorn host drop-key" || fail "drop-key: $(thorn host drop-key t1 2>&1)"
+docker exec "$P-t1" grep -q blackthorn-ssh /root/.ssh/authorized_keys && fail "blackthorn's key line stayed" || ok "its key line is gone from t1"
+thorn host check t1 >/dev/null 2>&1 && ok "and blackthorn still logs in, with a certificate" || fail "check after drop-key: $(thorn host check t1 2>&1)"
+web_get /settings | grep -q 'id="ca"' && ok "Settings shows the certificates" || fail "ca card"
+web_get /host/t1 | grep -q "Only certificates open it" && ok "and t1's page says only certificates open it" || fail "host page ca"
 
 say "root on approval"
 thorn new t1 --name t1-ask --root ask >/dev/null

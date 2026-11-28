@@ -5,6 +5,7 @@ mod api;
 mod apply;
 mod asks;
 mod backup;
+mod ca;
 mod chat;
 mod codex;
 mod codex_bridge;
@@ -312,6 +313,9 @@ enum Cmd {
     /// OpenAI's Codex on the hub, for Codex spaces.
     #[command(subcommand)]
     Codex(CodexCmd),
+    /// SSH certificates: what machines trust, the recovery key, a new CA.
+    #[command(subcommand)]
+    Ca(CaCmd),
     /// Show or change the settings the web UI can change too.
     #[command(subcommand)]
     Config(ConfigCmd),
@@ -344,6 +348,47 @@ enum Cmd {
     WebServe,
     #[command(name = "_totp", hide = true)]
     Totp { secret: String },
+}
+
+fn ca_status() -> anyhow::Result<()> {
+    let st = ca::status()?;
+    println!("hub CA:       {}", st.hub);
+    println!(
+        "recovery key: {}",
+        st.recovery
+            .as_deref()
+            .unwrap_or("none yet (thorn ca recovery)")
+    );
+    println!(
+        "trusted by:   {}",
+        if st.trusting.is_empty() {
+            "no machine yet".to_string()
+        } else {
+            st.trusting.join(", ")
+        }
+    );
+    for (n, why) in &st.not {
+        println!("not on {n}: {why}");
+    }
+    if !st.latest.is_empty() {
+        println!("\nlatest certificates:");
+        for l in &st.latest {
+            println!("  {l}");
+        }
+    }
+    Ok(())
+}
+
+fn ca_report(ok: &[String], failed: &[(String, String)]) {
+    for n in ok {
+        println!("{n}: done");
+    }
+    for (n, e) in failed {
+        println!("{n}: not reached: {e}");
+    }
+    if !failed.is_empty() {
+        println!("Run thorn ca push --recovery-key FILE once they can be reached.");
+    }
 }
 
 #[derive(Subcommand)]
@@ -451,6 +496,33 @@ struct CodexWith {
 }
 
 #[derive(Subcommand)]
+enum CaCmd {
+    /// The hub CA, the recovery key, the machines that trust them, and the
+    /// latest certificates.
+    Status,
+    /// Make the recovery key and print its private half, once: keep it
+    /// away from the hub (a password manager, paper). It lets you replace
+    /// the hub CA after a break-in (thorn ca rotate --recovery-key FILE).
+    Recovery {
+        /// Make a new one; the old one stops working.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Make a new hub CA and send it to every machine (signed by the old
+    /// one, or by the recovery key: after a break-in, use that).
+    Rotate {
+        #[arg(long)]
+        recovery_key: Option<std::path::PathBuf>,
+    },
+    /// Send the CAs to trust to every machine, signed by the recovery key
+    /// (for machines that no longer take the hub's certificates).
+    Push {
+        #[arg(long)]
+        recovery_key: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum TailscaleCmd {
     /// Whether it is installed, signed in, and on which tailnet.
     Status,
@@ -524,6 +596,10 @@ enum HostCmd {
     Unblock { name: String },
     /// Print the authorized_keys line to install on the machine.
     Pubkey { name: String },
+    /// Once the machine takes blackthorn's certificates: check that one
+    /// alone logs in, then remove blackthorn's key line from it, so no
+    /// long-lived key of the hub opens it.
+    DropKey { name: String },
     /// Check that blackthorn can log in, and learn the machine's OS.
     Check { name: String },
     /// Set a Linux machine up for logins of each space's own: bt-<id>, an
@@ -845,6 +921,28 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Update { check } => config_cmd::update(check),
+        Cmd::Ca(c) => match c {
+            CaCmd::Status => ca_status(),
+            CaCmd::Recovery { replace } => {
+                let key = ca::make_recovery(replace)?;
+                println!(
+                    "The recovery key. Keep it away from this hub (a password manager, or on paper);\n\
+                     it is not stored here. Machines learn to trust it as they are reached.\n"
+                );
+                print!("{key}");
+                Ok(())
+            }
+            CaCmd::Rotate { recovery_key } => {
+                let (ok, failed) = ca::rotate(recovery_key.as_deref())?;
+                ca_report(&ok, &failed);
+                Ok(())
+            }
+            CaCmd::Push { recovery_key } => {
+                let (ok, failed) = ca::push(&recovery_key)?;
+                ca_report(&ok, &failed);
+                Ok(())
+            }
+        },
         Cmd::Codex(c) => match c {
             CodexCmd::Status => config_cmd::codex_status(),
             CodexCmd::Install => config_cmd::codex_install(),
@@ -907,6 +1005,11 @@ fn run(cli: Cli) -> Result<()> {
             } => host_cmd::block(&name, duration.as_deref(), reason),
             HostCmd::Unblock { name } => host_cmd::unblock(&name),
             HostCmd::Pubkey { name } => host_cmd::pubkey(&name),
+            HostCmd::DropKey { name } => {
+                ca::drop_key(&name)?;
+                println!("{name} now takes only certificates from blackthorn's management login");
+                Ok(())
+            }
             HostCmd::Check { name } => host_cmd::check(&name),
             HostCmd::Rescan { name, yes } => host_cmd::rescan(&name, yes),
             HostCmd::Setup {
@@ -1106,6 +1209,9 @@ mod tests {
             ("host_setup", &["host", "setup"]),
             ("activity", &["log"]),
             ("login_api_key", &["login"]),
+            ("ca_show", &["ca", "status"]),
+            ("ca_recovery", &["ca", "recovery"]),
+            ("host_drop_key", &["host", "drop-key"]),
             ("codex_show", &["codex", "status"]),
             ("codex_install", &["codex", "install"]),
             ("codex_chats", &["codex", "chats"]),

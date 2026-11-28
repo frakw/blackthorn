@@ -78,6 +78,8 @@ pub fn init(opts: InitOpts) -> Result<()> {
         println!("wrote {}", paths::CONFIG_FILE);
     }
     let cfg = Config::load(Path::new(paths::CONFIG_FILE))?;
+    // The certificate authority machines will trust (v0.18).
+    crate::ca::ensure_hub_ca()?;
 
     let claude_from = opts.claude_from.or_else(|| {
         if cfg.claude_bin.is_file() {
@@ -470,6 +472,7 @@ pub fn tick() -> Result<()> {
         println!("root time up: {s} is back to its usual login on {h}");
     }
     let (cfg, state) = crate::ctx::read_only()?;
+    crate::ca::tick(&cfg, &state, now());
     crate::tls::tick(&cfg);
     crate::activity::tick(&state);
     crate::reach::tick(&state);
@@ -485,6 +488,10 @@ pub fn load_keys(key: &str) -> Result<()> {
         bail!("no space with key {key}");
     };
     keys::wait_for_socket(key)?;
+    let cfg = crate::config::Config::load(std::path::Path::new(crate::paths::CONFIG_FILE))?;
+    if let Err(e) = crate::ca::refresh_space(&cfg, &state, name, now()) {
+        eprintln!("the certificate of space {name}: {e:#}");
+    }
     keys::sync_agent(key, &apply::agent_keys(&state, name, now()))
 }
 

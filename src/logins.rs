@@ -38,7 +38,7 @@ pub const ASK_SPOOL: &str = "/var/lib/blackthorn-ask";
 
 /// The version of the setup a machine gets; machines with an older one are
 /// set up again (2: blackthorn-ask).
-pub const SETUP_VERSION: u32 = 2;
+pub const SETUP_VERSION: u32 = 3;
 
 /// blackthorn-ask. Every removal names the spool's full path, so an empty
 /// id cannot widen it.
@@ -232,6 +232,10 @@ pub struct SetupInput<'a> {
     /// The shared read-only login of before, whose sudo rule stays until
     /// it goes.
     pub legacy: Option<&'a str>,
+    /// The certificate authorities to trust (public keys, a line each),
+    /// and the management login's principals line (see ca.rs).
+    pub ca_list: &'a str,
+    pub manage_line: &'a str,
 }
 
 /// Sets a machine up for logins of each space's own. Run as root there.
@@ -257,6 +261,7 @@ pub fn setup_script(s: &SetupInput) -> Result<String> {
 admin_user={admin_user}
 admin_key={admin_key}
 admin_line={admin_line}
+manage_line={manage_line}
 add_root={add_root}
 [ "$(uname -s)" = Linux ] || {{ echo "only Linux machines get logins of each space's own for now" >&2; exit 1; }}
 
@@ -298,24 +303,54 @@ Cmnd_Alias BLACKTHORN_RREAD = {rdocker_cmds}
 {legacy_rule}EOF
 echo "bt: sudo rules"
 
-# 3. sshd also reads key lines from {keys}, where only root writes.
-mkdir -p {keys}
-chown root:root {keys}
-chmod 755 {keys}
+# 3. sshd also reads key lines from {keys}, where only root writes, and
+# takes certificates of blackthorn's authorities for the names listed in
+# {principals}/<login>, unless it trusts other authorities already.
+mkdir -p {keys} {principals}
+chown root:root {keys} {principals}
+chmod 755 {keys} {principals}
+cat >{ca}.tmp <<'BLACKTHORN_CA'
+{ca_list}
+BLACKTHORN_CA
+chmod 644 {ca}.tmp
+mv -f {ca}.tmp {ca}
+sshd=$(command -v sshd 2>/dev/null || echo /usr/sbin/sshd)
+setting() {{ "$sshd" -T 2>/dev/null | awk -v k="$1" 'tolower($1) == k {{ $1 = ""; sub(/^ /, ""); print; exit }}'; }}
+ca_ok=1
+ca_why=
+cur=$(setting trustedusercakeys)
+case "$cur" in ""|none|{ca}) ;; *) ca_ok=0; ca_why="sshd trusts other authorities ($cur)" ;; esac
+cur=$(setting authorizedprincipalsfile)
+case "$cur" in ""|none|"{principals}/%u") ;; *) ca_ok=0; ca_why="sshd reads principals from $cur" ;; esac
 conf=/etc/ssh/sshd_config
 line="AuthorizedKeysFile .ssh/authorized_keys .ssh/authorized_keys2 {keys}/%u"
+ca_lines="TrustedUserCAKeys {ca}
+AuthorizedPrincipalsFile {principals}/%u"
 if grep -Eqs '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config.d/' "$conf"; then
   mkdir -p /etc/ssh/sshd_config.d
-  printf '# Installed by blackthorn (thorn host setup).\n%s\n' "$line" >/etc/ssh/sshd_config.d/10-blackthorn-keys.conf
-elif ! grep -qF "{keys}/%u" "$conf"; then
-  {{ printf '# blackthorn (thorn host setup):\n%s\n' "$line"; cat "$conf"; }} >"$conf.bt"
-  chmod 644 "$conf.bt"
-  mv -f "$conf.bt" "$conf"
+  if [ "$ca_ok" = 1 ]; then
+    printf '# Installed by blackthorn (thorn host setup).\n%s\n%s\n' "$line" "$ca_lines" >/etc/ssh/sshd_config.d/10-blackthorn-keys.conf
+  else
+    printf '# Installed by blackthorn (thorn host setup).\n%s\n' "$line" >/etc/ssh/sshd_config.d/10-blackthorn-keys.conf
+  fi
+else
+  if ! grep -qF "{keys}/%u" "$conf"; then
+    {{ printf '# blackthorn (thorn host setup):\n%s\n' "$line"; cat "$conf"; }} >"$conf.bt"
+    chmod 644 "$conf.bt"
+    mv -f "$conf.bt" "$conf"
+  fi
+  if [ "$ca_ok" = 1 ] && ! grep -qF "{ca}" "$conf"; then
+    {{ printf '# blackthorn (thorn host setup):\n%s\n' "$ca_lines"; cat "$conf"; }} >"$conf.bt"
+    chmod 644 "$conf.bt"
+    mv -f "$conf.bt" "$conf"
+  fi
 fi
-sshd=$(command -v sshd 2>/dev/null || echo /usr/sbin/sshd)
 "$sshd" -t || {{ echo "sshd does not accept its configuration" >&2; exit 1; }}
 if "$sshd" -T 2>/dev/null | grep -i '^authorizedkeysfile' | grep -qF "{keys}/%u"; then :; else
   echo "sshd will not read {keys}: another AuthorizedKeysFile comes first in $conf" >&2; exit 1
+fi
+if [ "$ca_ok" = 1 ] && [ "$(setting trustedusercakeys)" != "{ca}" ]; then
+  ca_ok=0; ca_why="another TrustedUserCAKeys comes first in $conf"
 fi
 if sd systemctl && systemctl is-active -q ssh 2>/dev/null; then systemctl reload ssh
 elif sd systemctl && systemctl is-active -q sshd 2>/dev/null; then systemctl reload sshd
@@ -324,6 +359,7 @@ elif [ -s /var/run/sshd.pid ]; then kill -HUP "$(cat /var/run/sshd.pid)"
 else echo "bt: reload sshd yourself"
 fi
 echo "bt: sshd reads the spaces' key lines"
+if [ "$ca_ok" = 1 ]; then echo "bt: ca: yes"; else echo "bt: ca: no ($ca_why)"; fi
 
 # 4. Rootless Docker, where Docker is (Debian and Ubuntu).
 tool=$(command -v dockerd-rootless-setuptool.sh 2>/dev/null || true)
@@ -369,11 +405,20 @@ fi
 if logged "$admin_user"; then echo "bt: management key logged"
 else echo "bt: management key not found for $admin_user; its commands are not logged here"
 fi
+# Its certificates, for the management login (and root, when added).
+principals() {{
+  printf '%s\n' "$manage_line" >"{principals}/$1.tmp"
+  chmod 644 "{principals}/$1.tmp"
+  mv -f "{principals}/$1.tmp" "{principals}/$1"
+}}
+principals "$admin_user"
+[ "$add_root" = 1 ] && principals root
 echo "bt: done"
 "#,
         admin_user = q(s.admin_user)?,
         admin_key = q(s.admin_key)?,
         admin_line = q(s.admin_line)?,
+        manage_line = q(s.manage_line)?,
         add_root = if s.add_root { 1 } else { 0 },
         logger = paths::REMOTE_LOGGER,
         logger_text = remote::LOGGER,
@@ -385,6 +430,14 @@ echo "bt: done"
         docker = docker.join(", "),
         rdocker_cmds = rdocker.join(", "),
         keys = paths::REMOTE_KEYS_DIR,
+        principals = crate::ca::REMOTE_PRINCIPALS,
+        ca = crate::ca::REMOTE_CA,
+        ca_list = {
+            if s.ca_list.contains("BLACKTHORN_CA") || s.ca_list.contains('\'') {
+                bail!("an odd CA key");
+            }
+            s.ca_list
+        },
     ))
 }
 
@@ -397,6 +450,9 @@ pub struct AccountsInput<'a> {
     pub srv: Option<&'a str>,
     pub user_line: &'a str,
     pub ro_line: &'a str,
+    /// The lines are principals lines (the machine takes certificates):
+    /// written to the principals folder, and the key lines go.
+    pub ca: bool,
 }
 
 /// Makes (or brings up to date) a space's logins on a set-up machine.
@@ -412,6 +468,7 @@ full={full}
 srv={srv}
 user_line={user_line}
 ro_line={ro_line}
+ca={ca}
 shell=/bin/sh; [ -x /bin/bash ] && shell=/bin/bash
 mark="blackthorn space $k"
 make_user() {{
@@ -434,9 +491,17 @@ make_user() {{
   fi
 }}
 key_line() {{
-  printf '%s\n' "$2" >"{keys}/$1.tmp"
-  chmod 644 "{keys}/$1.tmp"
-  mv -f "{keys}/$1.tmp" "{keys}/$1"
+  if [ "$ca" = 1 ]; then
+    [ -d {principals} ] || {{ echo "this machine takes no certificates yet (thorn host setup)" >&2; exit 1; }}
+    printf '%s\n' "$2" >"{principals}/$1.tmp"
+    chmod 644 "{principals}/$1.tmp"
+    mv -f "{principals}/$1.tmp" "{principals}/$1"
+    rm -f "{keys}/$1"
+  else
+    printf '%s\n' "$2" >"{keys}/$1.tmp"
+    chmod 644 "{keys}/$1.tmp"
+    mv -f "{keys}/$1.tmp" "{keys}/$1"
+  fi
 }}
 [ -d {keys} ] || {{ echo "this machine is not set up yet (thorn host setup)" >&2; exit 1; }}
 
@@ -508,7 +573,9 @@ echo "bt: done"
         srv = q(a.srv.unwrap_or(""))?,
         user_line = q(a.user_line)?,
         ro_line = q(a.ro_line)?,
+        ca = if a.ca { 1 } else { 0 },
         keys = paths::REMOTE_KEYS_DIR,
+        principals = crate::ca::REMOTE_PRINCIPALS,
     ))
 }
 
@@ -590,7 +657,7 @@ if sd systemctl; then
   systemctl stop "blackthorn-unroot-$k.timer" "blackthorn-unroot-$k.service" 2>/dev/null || true
 fi
 for u in "bt-$k" "bt-$k-ro"; do
-  rm -f "{keys}/$u"
+  rm -f "{keys}/$u" "{principals}/$u"
   id "$u" >/dev/null 2>&1 || continue
   [ "$(comment_of "$u")" = "blackthorn space $k" ] || {{ echo "bt: $u is not blackthorn's; left alone"; continue; }}
   if sd loginctl; then
@@ -616,6 +683,7 @@ echo "bt: done"
         srv = q(srv.unwrap_or(""))?,
         purge = if purge { 1 } else { 0 },
         keys = paths::REMOTE_KEYS_DIR,
+        principals = crate::ca::REMOTE_PRINCIPALS,
     ))
 }
 
@@ -729,12 +797,15 @@ fn script_for(
         .nth(1)
         .context("the management public key has no key part")?
         .to_string();
+    let from = crate::ops::hub_addresses(cfg, h.address);
     setup_script(&SetupInput {
         admin_user: &h.user,
         admin_key: &admin_key,
         admin_line: &logged_line(cfg, h, &admin_pub),
         add_root,
         legacy: h.readonly.as_deref(),
+        ca_list: &crate::ca::trusted()?.join("\n"),
+        manage_line: &keys::logged_key_line(crate::ca::MANAGE, &from),
     })
 }
 
@@ -788,6 +859,9 @@ pub fn setup(name: &str, run_it: bool) -> Result<SetupDone> {
             &paths::key_file(name),
             "root",
             "test -d /etc/ssh/blackthorn && echo set-up; \
+             sshd=$(command -v sshd || echo /usr/sbin/sshd); \
+             if \"$sshd\" -T 2>/dev/null | grep -qix 'trustedusercakeys /etc/ssh/blackthorn/ca.pub'; then \
+             echo ca: yes; else echo 'ca: no (sshd does not trust the CA)'; fi; \
              if command -v dockerd-rootless-setuptool.sh >/dev/null 2>&1 || \
              [ -x /usr/share/docker.io/contrib/dockerd-rootless-setuptool.sh ]; then \
              echo rootless docker: yes; fi",
@@ -799,11 +873,17 @@ pub fn setup(name: &str, run_it: bool) -> Result<SetupDone> {
         }
         done.report = text
             .lines()
-            .filter(|l| l.starts_with("rootless"))
+            .filter(|l| l.starts_with("rootless") || l.starts_with("ca: "))
             .map(String::from)
             .collect();
     }
     let docker = done.report.iter().any(|l| l == "rootless docker: yes");
+    let ca = done.report.iter().any(|l| l == "ca: yes");
+    let ca_problem = done
+        .report
+        .iter()
+        .find_map(|l| l.strip_prefix("ca: no (").and_then(|w| w.strip_suffix(')')))
+        .map(String::from);
     {
         let mut ctx = Ctx::open()?;
         let x = ctx
@@ -816,6 +896,9 @@ pub fn setup(name: &str, run_it: bool) -> Result<SetupDone> {
         x.setup_version = SETUP_VERSION;
         x.rootless_docker = docker;
         x.problem = None;
+        x.ca = ca;
+        x.ca_problem = if ca { None } else { ca_problem };
+        x.pending.retain(|p| *p != Pending::Trust);
         ctx.commit()?;
     }
     let (r, waiting) = make_accounts(name)?;
@@ -855,7 +938,12 @@ pub fn make_accounts(name: &str) -> Result<(Vec<String>, Vec<String>)> {
     let mut waiting = Vec::new();
     for (key, key_id, space) in wanted(&state, name) {
         let full = true;
-        if h.accounts.get(&key).is_some_and(|a| a.full) {
+        // Made already (and, where the machine takes certificates, with
+        // their names).
+        if h.accounts
+            .get(&key)
+            .is_some_and(|a| a.full && (a.ca || !h.ca))
+        {
             continue;
         }
         match make_one(&cfg, name, &h, &key, &key_id, &space) {
@@ -885,6 +973,7 @@ pub fn make_accounts(name: &str) -> Result<(Vec<String>, Vec<String>)> {
                         Account {
                             full,
                             srv: full.then(|| space.clone()),
+                            ca: h.ca,
                         },
                     );
                     x.pending
@@ -920,19 +1009,30 @@ fn make_one(
     key_id: &str,
     space: &str,
 ) -> Result<Vec<String>> {
-    keys::generate_space(key, key_id)?;
-    let user_line = logged_line(
-        cfg,
-        h,
-        &keys::public_of(&paths::space_key_file(key, key_id))?,
-    );
-    let ro_line = logged_line(cfg, h, &keys::public_of(&paths::space_ro_key_file(key))?);
+    // With certificates the lines name the space's logins; else its keys.
+    let (user_line, ro_line) = if h.ca {
+        (
+            logged_line(cfg, h, &crate::ca::user_principal(key, key_id)),
+            logged_line(cfg, h, &crate::ca::ro_principal(key)),
+        )
+    } else {
+        keys::generate_space(key, key_id)?;
+        (
+            logged_line(
+                cfg,
+                h,
+                &keys::public_of(&paths::space_key_file(key, key_id))?,
+            ),
+            logged_line(cfg, h, &keys::public_of(&paths::space_ro_key_file(key))?),
+        )
+    };
     let script = accounts_script(&AccountsInput {
         key,
         full: true,
         srv: Some(space),
         user_line: &user_line,
         ro_line: &ro_line,
+        ca: h.ca,
     })?;
     run(name, h, &script)
 }
@@ -1105,6 +1205,7 @@ pub fn do_pending(name: &str) -> Result<Vec<String>> {
             }
             Pending::Revoke { key } => revoke_script(key)?,
             Pending::Remove { key, srv, purge } => remove_script(key, srv.as_deref(), *purge)?,
+            Pending::Trust => crate::ca::trust_script(&crate::ca::trusted()?)?,
         };
         run(name, &h, &script)?;
         let mut ctx = Ctx::open()?;
@@ -1124,6 +1225,7 @@ pub fn do_pending(name: &str) -> Result<Vec<String>> {
         done.push(match &p {
             Pending::Revoke { key } => format!("root taken back from space {key}"),
             Pending::Remove { key, .. } => format!("logins of space {key} removed"),
+            Pending::Trust => "certificate authorities sent".to_string(),
             Pending::Accounts { .. } => unreachable!(),
         });
     }
@@ -1261,8 +1363,14 @@ mod tests {
             admin_line: "from=\"100.64.0.1\",restrict,command=\"/usr/local/libexec/blackthorn-ssh\" ssh-ed25519 AAAB admin",
             add_root: true,
             legacy: Some("blackthorn"),
+            ca_list: "ssh-ed25519 AAAA hub\nssh-ed25519 BBBB rec",
+            manage_line: "from=\"100.64.0.1\",restrict,command=\"/usr/local/libexec/blackthorn-ssh\" blackthorn-manage",
         })
         .unwrap();
+        assert!(s.contains("ssh-ed25519 AAAA hub\nssh-ed25519 BBBB rec\nBLACKTHORN_CA\n"));
+        assert!(s.contains("TrustedUserCAKeys /etc/ssh/blackthorn/ca.pub"));
+        assert!(s.contains("AuthorizedPrincipalsFile /etc/ssh/blackthorn/principals/%u"));
+        assert!(s.contains("[ \"$add_root\" = 1 ] && principals root"));
         assert!(s.starts_with("#!/bin/sh\n"));
         assert!(s.contains("add_root=1"));
         assert!(s.contains("exec \"${SHELL:-/bin/sh}\" -c \"$c\"\nBLACKTHORN_LOGGER\n"));
@@ -1296,8 +1404,10 @@ mod tests {
             srv: Some("fig-claude"),
             user_line: "restrict ssh-ed25519 AAAA u",
             ro_line: "restrict ssh-ed25519 AAAB r",
+            ca: false,
         })
         .unwrap();
+        assert!(a.contains("ca=0"));
         assert!(a.contains("k='a1b2c3d4'"));
         assert!(a.contains("srv='fig-claude'"));
         assert!(a.contains("$ro ALL=(root) NOPASSWD: BLACKTHORN_READ"));

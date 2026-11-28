@@ -5,7 +5,7 @@ coding agents live. They keep running there, you reach them from your phone
 or laptop, and each one can work on exactly one of your machines, over SSH,
 one way only.
 
-Status: **early (v0.17)**. It works and is tested end to end, but expect
+Status: **early (v0.18)**. It works and is tested end to end, but expect
 changes. Read [THREAT_MODEL.md](THREAT_MODEL.md) before trusting it with
 anything important.
 
@@ -412,8 +412,9 @@ be on the machine.
 logins of its own there. blackthorn logs in as the machine's own login
 (root, or a user with sudo without a password) and:
 
-- has sshd also read key lines from `/etc/ssh/blackthorn/<user>`, where
-  only root writes, so no space can change its own key line;
+- has sshd also read key lines from `/etc/ssh/blackthorn/<user>`, and
+  take blackthorn's certificates (see *SSH certificates* below), both
+  where only root writes, so no space can change its own lines;
 - puts a logger in front of every blackthorn key (`command=` in the key
   line), so every command is in the machine's system log, under the
   space's own user: `journalctl -t blackthorn`;
@@ -470,6 +471,49 @@ root. To set it up anyway, `thorn host setup NAME --print` prints the
 script; run it there as root (it also lets blackthorn's key log in as
 root), then `thorn host setup NAME --verify`. Run the setup again after
 the machine moves address.
+
+### SSH certificates
+
+On a set-up machine, the spaces and blackthorn itself log in with
+**certificates** instead of keys the machine lists. The setup makes the
+machine's sshd trust blackthorn's certificate authority
+(`/etc/ssh/blackthorn/ca.pub`) for the names in
+`/etc/ssh/blackthorn/principals/<login>`, each line with the hub's
+addresses and the logger, as the key lines were. A machine whose sshd
+already trusts another authority keeps the key lines.
+
+- A space's key exists only in memory (`/run`), made again at every
+  boot. Its agent holds one certificate naming the logins it has now
+  (its user login on one machine, its read-only login on another), good
+  for ten minutes and renewed every minute while it may work there.
+  Taking a machine away, or lowering a login, changes the next
+  certificate, and the old one is useless within minutes.
+- blackthorn's own management login gets a certificate the same way.
+  Its key line stays in the machine's `authorized_keys` until you remove
+  it: **Remove the key line** on the machine's page (or
+  `thorn host drop-key NAME`) checks that a certificate alone logs in,
+  then removes it. After that, nothing stored on the hub opens the
+  machine by itself.
+- Every certificate has a serial, written to
+  `/var/log/blackthorn/certs.log` on the hub and to the machine's sshd log
+  when it is used. A serial on a machine that the hub did not log is a
+  certificate someone else signed.
+
+The hub CA's private key is in `/etc/blackthorn/ca`, root's alone, so
+whoever has root on the hub can sign certificates while they have it.
+The **recovery key** is for after: make it once (Settings → SSH
+certificates, or `thorn ca recovery`), keep it away from the hub (a
+password manager, or paper), and the machines trust it too. After a
+break-in, on a new hub restored from an export:
+
+```sh
+sudo thorn ca rotate --recovery-key recovery.key   # a new hub CA, sent to every machine
+sudo thorn ca recovery --replace                   # the old recovery key has been used
+```
+
+The old hub CA stops working on every machine reached; `thorn ca push
+--recovery-key FILE` reaches the rest later. `thorn ca status` shows the
+CAs, the machines that trust them and the latest certificates.
 
 ### macOS and Windows machines
 

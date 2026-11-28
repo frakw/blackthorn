@@ -18,6 +18,11 @@ pub fn everything(cfg: &Config, state: &State, now: u64) -> Result<()> {
     for (name, s) in &state.spaces {
         space_files(cfg, state, name, s, now)
             .with_context(|| format!("updating files of space {name}"))?;
+        // Its certificate first (where its machines take them): the agent
+        // loads it with the key.
+        if let Err(e) = crate::ca::refresh_space(cfg, state, name, now) {
+            eprintln!("warning: the certificate of space {name}: {e:#}");
+        }
         keys::sync_agent(&s.key, &agent_keys(state, name, now))
             .with_context(|| format!("updating the keys of space {name}"))?;
     }

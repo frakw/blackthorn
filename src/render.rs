@@ -406,6 +406,9 @@ mod tests {
                 accounts: Default::default(),
                 pending: Vec::new(),
                 problem: None,
+                ca: false,
+                ca_problem: None,
+                key_dropped: false,
             },
         );
         st.hosts.insert(
@@ -424,6 +427,9 @@ mod tests {
                 accounts: Default::default(),
                 pending: Vec::new(),
                 problem: None,
+                ca: false,
+                ca_problem: None,
+                key_dropped: false,
             },
         );
         st.hosts.insert(
@@ -446,6 +452,9 @@ mod tests {
                 accounts: Default::default(),
                 pending: Vec::new(),
                 problem: None,
+                ca: false,
+                ca_problem: None,
+                key_dropped: false,
             },
         );
         for (n, h) in [

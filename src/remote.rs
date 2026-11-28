@@ -84,6 +84,32 @@ pub fn ssh(
     out
 }
 
+/// The same with a certificate of the caller's (and nothing else).
+pub fn ssh_with(
+    name: &str,
+    h: &Host,
+    key: &Path,
+    cert: Option<&Path>,
+    user: &str,
+    command: &str,
+    input: Option<&str>,
+) -> Result<Output> {
+    let known = known_hosts(name, h)?;
+    let child = ssh_command_with(name, h, key, cert, user, &known)
+        .arg(command)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let out = finish(child, input);
+    let _ = std::fs::remove_file(&known);
+    out
+}
+
 /// A known_hosts file with the machine's recorded keys, of its own for
 /// each connection (several may be open at once). Remove it afterwards.
 pub fn known_hosts(name: &str, h: &Host) -> Result<PathBuf> {
@@ -103,7 +129,27 @@ pub fn known_hosts(name: &str, h: &Host) -> Result<PathBuf> {
 }
 
 /// ssh to the machine with one of root's keys, without the command yet.
+/// The management key goes with its certificate, where the machine takes
+/// blackthorn's (the key alone is tried after it).
 pub fn ssh_command(name: &str, h: &Host, key: &Path, user: &str, known: &Path) -> Command {
+    let cert = if key == crate::paths::key_file(name) {
+        let cfg =
+            crate::config::Config::load(Path::new(crate::paths::CONFIG_FILE)).unwrap_or_default();
+        crate::ca::manage_cert(&cfg, name, h)
+    } else {
+        None
+    };
+    ssh_command_with(name, h, key, cert.as_deref(), user, known)
+}
+
+pub fn ssh_command_with(
+    name: &str,
+    h: &Host,
+    key: &Path,
+    cert: Option<&Path>,
+    user: &str,
+    known: &Path,
+) -> Command {
     let mut c = Command::new("ssh");
     c.args([
         "-F",
@@ -127,9 +173,13 @@ pub fn ssh_command(name: &str, h: &Host, key: &Path, user: &str, known: &Path) -
     .arg("-o")
     .arg(format!("HostKeyAlias=blackthorn-{name}"))
     .arg("-i")
-    .arg(key)
-    .args(["-p", &h.port.to_string()])
-    .arg(format!("{user}@{}", h.address));
+    .arg(key);
+    if let Some(cert) = cert {
+        c.arg("-o")
+            .arg(format!("CertificateFile={}", cert.display()));
+    }
+    c.args(["-p", &h.port.to_string()])
+        .arg(format!("{user}@{}", h.address));
     c
 }
 
