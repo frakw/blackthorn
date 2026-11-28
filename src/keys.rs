@@ -15,13 +15,14 @@ pub fn generate(host: &str) -> Result<()> {
     )
 }
 
-/// A space's own two keys: its user (and root) login and its read-only
-/// one, for the machines set up for logins of each space's own.
-pub fn generate_space(key: &str) -> Result<()> {
+/// A space's own keys for one of its machines: the user (and root) login
+/// there (`id`: the machine's key id) and its read-only one (the same on
+/// every machine: it reads only).
+pub fn generate_space(key: &str, id: &str) -> Result<()> {
     crate::sys::mkdir(Path::new(paths::SPACE_KEYS_DIR), 0o700)?;
     let hub = crate::sys::hostname();
     keygen(
-        &paths::space_key_file(key),
+        &paths::space_key_file(key, id),
         &format!("blackthorn@{hub}:space-{key}"),
     )?;
     keygen(
@@ -30,9 +31,30 @@ pub fn generate_space(key: &str) -> Result<()> {
     )
 }
 
-pub fn remove_space(key: &str) -> Result<()> {
-    for p in [paths::space_key_file(key), paths::space_ro_key_file(key)] {
-        for f in [p.clone(), p.with_extension("pub")] {
+/// Removes a space's keys: all of them, or (`id`) one machine's.
+pub fn remove_space(key: &str, id: Option<&str>) -> Result<()> {
+    let mut files = Vec::new();
+    match id {
+        Some(id) => files.push(paths::space_key_file(key, id)),
+        None => {
+            files.push(paths::space_key_file(key, ""));
+            files.push(paths::space_ro_key_file(key));
+            let prefix = format!("{key}.");
+            if let Ok(dir) = std::fs::read_dir(paths::SPACE_KEYS_DIR) {
+                for e in dir.flatten() {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    let id = n.strip_prefix(&prefix).unwrap_or("");
+                    if !id.is_empty() && id.len() == 8 && id.bytes().all(|b| b.is_ascii_hexdigit())
+                    {
+                        files.push(e.path());
+                    }
+                }
+            }
+        }
+    }
+    for p in files {
+        let public = std::path::PathBuf::from(format!("{}.pub", p.display()));
+        for f in [p.clone(), public] {
             match std::fs::remove_file(&f) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

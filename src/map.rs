@@ -4,8 +4,9 @@
 //! through the app; your tailnet (the device you manage blackthorn from,
 //! this hub with blackthorn and its spaces, the machines on the tailnet);
 //! your LAN (its router, the machines on it). Arrows point the way commands
-//! go. Dashed wires are bridges (amber) and blocks (red); dotted ones are
-//! services a space uses, and the hub's way to the internet.
+//! go. A space has a wire to each of its machines, coloured by how far it
+//! goes there; dashed red ones are blocked. Dotted wires are services a
+//! space uses, and the hub's way to the internet.
 
 use crate::ops::{HostView, Overview, SpaceView};
 use crate::state::Tier;
@@ -489,7 +490,8 @@ pub fn svg(o: &Overview) -> String {
     let mut hub_members = vec!["hub".to_string()];
 
     // Spaces of machines on the tailnet (or elsewhere) first, then those
-    // of LAN machines, so the wires down to the LAN band are short.
+    // of LAN machines, so the wires down to the LAN band are short. A space
+    // of several machines is drawn by its first.
     let lan_band = |h: &HostView| net_of(h) != Net::Tailnet && (tailnet || net_of(h) == Net::Lan);
     let mut order: Vec<&HostView> = o.hosts.iter().filter(|h| !lan_band(h)).collect();
     order.extend(o.hosts.iter().filter(|h| lan_band(h)));
@@ -498,7 +500,11 @@ pub fn svg(o: &Overview) -> String {
     let mut hy = top;
     let mut lan_hosts: Vec<Node> = Vec::new();
     for h in order {
-        let spaces: Vec<&SpaceView> = o.spaces.iter().filter(|s| s.host == h.name).collect();
+        let spaces: Vec<&SpaceView> = o
+            .spaces
+            .iter()
+            .filter(|s| s.machines.first().is_some_and(|m| m.host == h.name))
+            .collect();
         let first = sy;
         for s in &spaces {
             let detail = match (s.chats_24h, s.memory_mb) {
@@ -515,28 +521,34 @@ pub fn svg(o: &Overview) -> String {
             };
             let (ins, outs) = space_ports(s);
             let id = format!("space:{}", s.name);
-            let login = if s.login.is_empty() {
-                "no login yet".to_string()
-            } else {
-                s.login.clone()
-            };
-            let access = match (s.tier, s.root.as_ref().and_then(|r| r.until)) {
-                (Tier::ReadOnly, _) => (Tone::Ok, format!("read-only as {login}")),
-                (Tier::User, _) => (Tone::Dim, format!("user as {login}")),
-                (Tier::Root, Some(u)) => (
-                    Tone::Bad,
-                    format!(
-                        "root as {login} ({})",
-                        crate::ops::describe_left(u, crate::state::now())
+            let mut rows = vec![(Tone::Dim, format!("{} · {}", s.agent, s.state))];
+            let several = s.machines.len() > 1;
+            for m in &s.machines {
+                let login = if m.login.is_empty() {
+                    "no login yet".to_string()
+                } else {
+                    m.login.clone()
+                };
+                let (tone, text) = match (m.tier, m.root.as_ref().and_then(|r| r.until)) {
+                    (Tier::ReadOnly, _) => (Tone::Ok, format!("read-only as {login}")),
+                    (Tier::User, _) => (Tone::Dim, format!("user as {login}")),
+                    (Tier::Root, Some(u)) => (
+                        Tone::Bad,
+                        format!(
+                            "root as {login} ({})",
+                            crate::ops::describe_left(u, crate::state::now())
+                        ),
                     ),
-                ),
-                (Tier::Root, None) => (Tone::Bad, format!("root as {login}")),
-            };
-            let mut rows = vec![
-                (Tone::Dim, format!("{} · {}", s.agent, s.state)),
-                (access.0, clip(&access.1, 34)),
-                (Tone::Dim, detail),
-            ];
+                    (Tier::Root, None) => (Tone::Bad, format!("root as {login}")),
+                };
+                let text = if several {
+                    format!("{}: {text}", m.host)
+                } else {
+                    text
+                };
+                rows.push((tone, clip(&text, 34)));
+            }
+            rows.push((Tone::Dim, detail));
             if let Some(m) = &s.model {
                 rows.push((Tone::Dim, clip(&format!("model: {m}"), 34)));
             }
@@ -570,26 +582,29 @@ pub fn svg(o: &Overview) -> String {
                     });
                 }
             }
-            let class = if h.blocked {
-                "wire cut"
-            } else if s.tier == Tier::ReadOnly {
-                "wire ro"
-            } else if s.tier == Tier::User {
-                "wire user"
-            } else {
-                "wire admin"
-            };
-            wires.push(wire(
-                &id,
-                n.port_out("ssh"),
-                &format!("host:{}", h.name),
-                0,
-                class,
-            ));
+            for m in &s.machines {
+                let blocked = o.hosts.iter().any(|x| x.name == m.host && x.blocked);
+                let class = if blocked {
+                    "wire cut"
+                } else if m.tier == Tier::ReadOnly {
+                    "wire ro"
+                } else if m.tier == Tier::User {
+                    "wire user"
+                } else {
+                    "wire admin"
+                };
+                wires.push(wire(
+                    &id,
+                    n.port_out("ssh"),
+                    &format!("host:{}", m.host),
+                    0,
+                    class,
+                ));
+            }
             nodes.push(n);
             hub_members.push(id);
         }
-        let node = host_node(h, spaces.len());
+        let node = host_node(h, o.spaces.iter().filter(|s| s.on(&h.name)).count());
         if lan_band(h) {
             lan_hosts.push(node);
             continue;
@@ -607,23 +622,6 @@ pub fn svg(o: &Overview) -> String {
         }
         nodes.push(Node { y, ..node });
     }
-    for b in &o.bridges {
-        let Some(from) = nodes.iter().find(|n| n.id == format!("space:{}", b.from)) else {
-            continue;
-        };
-        let ssh = from.port_out("ssh");
-        wires.push(Wire {
-            label: Some(format!("bridge {}", b.remaining)),
-            ..wire(
-                &format!("space:{}", b.from),
-                ssh,
-                &format!("host:{}", b.host),
-                0,
-                "wire bridge",
-            )
-        });
-    }
-
     // The management device halfway down the tailnet band.
     let band_bottom = nodes
         .iter()
@@ -932,7 +930,7 @@ mod tests {
         assert_eq!(web_path(&l(&["192.168.10.106:7180"])), "over your network");
         assert_eq!(web_path(&l(&["100.128.0.1:7180"])), "over your network");
     }
-    use crate::ops::{BridgeView, HubView, NetView};
+    use crate::ops::{HubView, MachineView, NetView};
     use crate::state::{Mode, Os};
 
     fn overview() -> Overview {
@@ -957,19 +955,8 @@ mod tests {
             pending: vec![],
             problem: None,
         };
-        let space = |n: &str, h: &str, st: &str| SpaceView {
-            name: n.into(),
+        let machine = |n: &str, h: &str| MachineView {
             host: h.into(),
-            agent: "claude".into(),
-            mode: Mode::Server,
-            remote_control: n != "fig-aider",
-            rc_name: n.into(),
-            dir: n.into(),
-            state: st.into(),
-            memory_mb: Some(300),
-            chats_24h: Some(2),
-            reachable: vec![],
-            model: (n == "fig-claude").then(|| "Opus 5.5".to_string()),
             access: if n == "fig-claude" {
                 crate::state::Access::Readonly
             } else {
@@ -991,15 +978,30 @@ mod tests {
                 "root"
             }
             .into(),
-            root_beside: vec![],
             srv: None,
             linked: true,
             link: String::new(),
+        };
+        let space = |n: &str, h: &str, st: &str| SpaceView {
+            name: n.into(),
+            machines: vec![machine(n, h)],
+            agent: "claude".into(),
+            mode: Mode::Server,
+            remote_control: n != "fig-aider",
+            rc_name: n.into(),
+            dir: n.into(),
+            state: st.into(),
+            memory_mb: Some(300),
+            chats_24h: Some(2),
+            reachable: vec![],
+            model: (n == "fig-claude").then(|| "Opus 5.5".to_string()),
             unattended: false,
             owner: None,
             shares: Vec::new(),
             level: None,
         };
+        let mut fig = space("fig-claude", "fig", "running");
+        fig.machines.push(machine("fig-claude", "nas"));
         Overview {
             hub: HubView {
                 hostname: "blackthorn".into(),
@@ -1018,7 +1020,7 @@ mod tests {
                 },
             },
             spaces: vec![
-                space("fig-claude", "fig", "running"),
+                fig,
                 space("fig-aider", "fig", "stopped"),
                 space("nas-<x>", "nas", "needs login"),
             ],
@@ -1027,13 +1029,6 @@ mod tests {
                 host("nas", "192.168.10.5", true),
                 host("pine", "100.80.0.9", false),
             ],
-            bridges: vec![BridgeView {
-                from: "fig-claude".into(),
-                to: "nas-<x>".into(),
-                host: "nas".into(),
-                until: Some(10),
-                remaining: "for 52m".into(),
-            }],
             agents: vec!["claude".into()],
         }
     }
@@ -1060,8 +1055,8 @@ mod tests {
         );
         assert!(!s.contains("Tailnet coordination"));
         // management device->hub, devices->app, hub->3 spaces, app->2 spaces
-        // with Remote Control, 3 spaces->API, 3 spaces->their machines,
-        // 1 bridge, router->hub.
+        // with Remote Control, 3 spaces->API, 4 wires to the spaces'
+        // machines (fig-claude has two), router->hub.
         assert_eq!(s.matches("<path class=\"wire").count(), 15);
         // The router's internet side to the hub's, dotted, no arrow.
         assert!(s.contains(
@@ -1072,7 +1067,7 @@ mod tests {
             "data-from=\"app:anthropic\" data-fp=\"0\" data-to=\"space:fig-claude\" data-tp=\"0\" marker-end"
         ));
         assert!(!s.contains("marker-start"));
-        // Read-only and admin logins, a blocked machine, a bridge.
+        // Read-only and admin logins, a blocked machine, a second machine.
         assert!(s.contains(
             "class=\"wire ro\" data-from=\"space:fig-claude\" data-fp=\"1\" data-to=\"host:fig\""
         ));
@@ -1081,7 +1076,7 @@ mod tests {
             "class=\"wire cut\" data-from=\"space:nas-&lt;x&gt;\" data-fp=\"1\" data-to=\"host:nas\""
         ));
         assert!(s.contains(
-            "class=\"wire bridge\" data-from=\"space:fig-claude\" data-fp=\"1\" data-to=\"host:nas\""
+            "class=\"wire cut\" data-from=\"space:fig-claude\" data-fp=\"1\" data-to=\"host:nas\""
         ));
         assert!(s.contains("class=\"wire uses\" data-from=\"space:fig-claude\" data-fp=\"0\" data-to=\"api:anthropic\""));
         // No arrow into the API.
@@ -1090,10 +1085,9 @@ mod tests {
             !s.contains("data-from=\"app:anthropic\" data-fp=\"0\" data-to=\"space:fig-aider\""),
             "Remote Control off: no wire from the app"
         );
-        assert!(s.contains("read-only as blackthorn"));
+        assert!(s.contains("fig: read-only as blackthorn"));
         assert!(s.contains("root as root"));
         assert!(s.contains("read-only: blackthorn"));
-        assert!(s.contains("bridge for 52m"));
         assert!(s.contains("no space yet"), "pine has none");
         assert!(s.contains("href=\"/space/fig-claude\""));
         assert!(s.contains("local only"), "fig-aider has Remote Control off");
@@ -1215,7 +1209,6 @@ mod tests {
         let mut o = overview();
         o.hosts.clear();
         o.spaces.clear();
-        o.bridges.clear();
         assert!(svg(&o).contains("No machines yet"));
     }
 }

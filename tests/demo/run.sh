@@ -1,7 +1,7 @@
 #!/bin/bash
 # Screenshots of the web UI for the website, from a demo hub in throwaway
 # Docker containers (the same images as the end-to-end test): four
-# machines, five spaces with believable chats, a bridge, root given in
+# machines, five spaces with believable chats, one on two machines, root given in
 # each way, one command waiting for approval.
 #
 #   tests/demo/run.sh path/to/thorn OUTDIR
@@ -94,7 +94,7 @@ for s in web-claude db-claude nas-claude web-staging; do
   echo good-code | thorni login "$s" >/dev/null
 done
 echo "sk-demo-0123456789abcdefghijklmnop" | thorni login ci-codex --api-key >/dev/null
-thorn bridge add web-claude db-claude --for 2h >/dev/null
+thorn connect web-claude db-01 >/dev/null
 
 say "chats"
 T=$(mktemp -d)

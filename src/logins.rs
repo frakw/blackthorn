@@ -390,8 +390,8 @@ echo "bt: done"
 
 pub struct AccountsInput<'a> {
     pub key: &'a str,
-    /// The user login too (the space's own machine), else only the
-    /// read-only one (a machine it reaches through a bridge).
+    /// The user login too, else only the read-only one (as for the
+    /// machines bridges reached before v0.16).
     pub full: bool,
     /// Its folder: /srv/<srv>.
     pub srv: Option<&'a str>,
@@ -739,7 +739,7 @@ fn script_for(
 }
 
 /// Sets a machine up for logins of each space's own, then makes them for
-/// its spaces (and the spaces bridged to it), then removes the shared
+/// the spaces working on it, then removes the shared
 /// read-only login of before. `run`: through the management login; else
 /// you ran the printed script yourself, and blackthorn checks that its key
 /// now logs in as root.
@@ -830,23 +830,17 @@ pub fn setup(name: &str, run_it: bool) -> Result<SetupDone> {
     Ok(done)
 }
 
-/// The logins a machine should have: (space key, its own machine, folder).
-fn wanted(state: &State, host: &str, now: u64) -> Vec<(String, bool, String)> {
-    let mut v: Vec<(String, bool, String)> = state
+/// The logins a machine should have: (space key, the machine's key id,
+/// the space's name, for its folder).
+fn wanted(state: &State, host: &str) -> Vec<(String, String, String)> {
+    state
         .spaces
         .iter()
-        .filter(|(_, s)| s.host == host)
-        .map(|(n, s)| (s.key.clone(), true, n.clone()))
-        .collect();
-    for b in state.bridges.iter().filter(|b| b.active(now)) {
-        let (Some(from), Some(to)) = (state.spaces.get(&b.from), state.spaces.get(&b.to)) else {
-            continue;
-        };
-        if to.host == host && from.host != host && !v.iter().any(|(k, _, _)| *k == from.key) {
-            v.push((from.key.clone(), false, b.from.clone()));
-        }
-    }
-    v
+        .filter_map(|(n, s)| {
+            s.machine(host)
+                .map(|m| (s.key.clone(), m.key_id.clone(), n.clone()))
+        })
+        .collect()
 }
 
 /// Makes the logins a set-up machine is missing. Returns the report and
@@ -859,11 +853,12 @@ pub fn make_accounts(name: &str) -> Result<(Vec<String>, Vec<String>)> {
     }
     let mut report = Vec::new();
     let mut waiting = Vec::new();
-    for (key, full, space) in wanted(&state, name, crate::state::now()) {
-        if h.accounts.get(&key).is_some_and(|a| a.full || !full) {
+    for (key, key_id, space) in wanted(&state, name) {
+        let full = true;
+        if h.accounts.get(&key).is_some_and(|a| a.full) {
             continue;
         }
-        match make_one(&cfg, name, &h, &key, full, &space) {
+        match make_one(&cfg, name, &h, &key, &key_id, &space) {
             Ok(r) => {
                 report.extend(r.into_iter().map(|l| format!("{space}: {l}")));
                 // Root it already has (given before its logins were made, or
@@ -872,8 +867,9 @@ pub fn make_accounts(name: &str) -> Result<(Vec<String>, Vec<String>)> {
                 let root = state
                     .spaces
                     .get(&space)
-                    .and_then(|s| s.root.clone())
-                    .filter(|r| full && r.active(now));
+                    .and_then(|s| s.machine(name))
+                    .and_then(|m| m.root.clone())
+                    .filter(|r| r.active(now));
                 if let Some(r) = root {
                     match root_script(&key, r.until.map(|u| u.saturating_sub(now)), r.ask)
                         .and_then(|sc| run(name, &h, &sc))
@@ -921,16 +917,20 @@ fn make_one(
     name: &str,
     h: &Host,
     key: &str,
-    full: bool,
+    key_id: &str,
     space: &str,
 ) -> Result<Vec<String>> {
-    keys::generate_space(key)?;
-    let user_line = logged_line(cfg, h, &keys::public_of(&paths::space_key_file(key))?);
+    keys::generate_space(key, key_id)?;
+    let user_line = logged_line(
+        cfg,
+        h,
+        &keys::public_of(&paths::space_key_file(key, key_id))?,
+    );
     let ro_line = logged_line(cfg, h, &keys::public_of(&paths::space_ro_key_file(key))?);
     let script = accounts_script(&AccountsInput {
         key,
-        full,
-        srv: full.then_some(space),
+        full: true,
+        srv: Some(space),
         user_line: &user_line,
         ro_line: &ro_line,
     })?;
@@ -959,41 +959,52 @@ fn drop_legacy(name: &str) -> Result<()> {
 
 // ------------------------------------------------------------ root
 
-/// Gives a space root on its machine (set up for it) until `until`, or
-/// until taken back. Through the machine first; the state after.
-/// With `ask`: root on approval, each root command waiting for someone to
-/// approve it (only on a set-up machine).
-pub fn grant(space: &str, until: Option<u64>, ask: bool) -> Result<()> {
+/// Gives a space root on one of its machines (set up for it) until
+/// `until`, or until taken back. Through the machine first; the state
+/// after. With `ask`: root on approval, each root command waiting for
+/// someone to approve it (only on a set-up machine). One space at a time
+/// holds root on a machine: `take` takes it from the one that has it.
+pub fn grant(space: &str, host: &str, until: Option<u64>, ask: bool, take: bool) -> Result<()> {
     let (_, state) = ctx::read_only()?;
     let s = state.space(space)?.clone();
-    let h = state.host(&s.host)?.clone();
+    if !s.on(host) {
+        bail!("{space} does not work on {host} (thorn connect {space} {host})");
+    }
+    let h = state.host(host)?.clone();
+    if let Some(other) = state.root_holder(host, space, crate::state::now()) {
+        if !take {
+            bail!(
+                "{other} has root on {host}; one space at a time may (take it over: --take, \
+                 or take it back first: thorn root {other} --host {host} --off)"
+            );
+        }
+        let other = other.to_string();
+        drop(state);
+        revoke(&other, host)?;
+        return grant(space, host, until, ask, false);
+    }
     if ask && (h.setup.is_none() || h.setup_version < SETUP_VERSION) {
         bail!(
-            "root on approval needs {} set up for it (thorn host setup {}{})",
-            s.host,
-            s.host,
+            "root on approval needs {host} set up for it (thorn host setup {host}{})",
             if h.setup.is_some() { ", again" } else { "" }
         );
     }
     if h.setup.is_some() {
         if !h.accounts.get(&s.key).is_some_and(|a| a.full) {
             bail!(
-                "{space} has no login of its own on {} yet; it is made when the machine can be \
-                 reached (or: thorn host setup {})",
-                s.host,
-                s.host
+                "{space} has no login of its own on {host} yet; it is made when the machine can be \
+                 reached (or: thorn host setup {host})"
             );
         }
         let now = crate::state::now();
         run(
-            &s.host,
+            host,
             &h,
             &root_script(&s.key, until.map(|u| u.saturating_sub(now)), ask)?,
         )?;
     } else if !h.root_login() {
         bail!(
-            "blackthorn reaches {} as {}, not root, so it has no root to give",
-            s.host,
+            "blackthorn reaches {host} as {}, not root, so it has no root to give",
             h.user
         );
     }
@@ -1004,13 +1015,16 @@ pub fn grant(space: &str, until: Option<u64>, ask: bool) -> Result<()> {
         .spaces
         .get_mut(space)
         .with_context(|| format!("{space} was removed meanwhile"))?;
-    sp.root = Some(crate::state::Root {
+    let m = sp
+        .machine_mut(host)
+        .with_context(|| format!("{host} was taken from {space} meanwhile"))?;
+    m.root = Some(crate::state::Root {
         since: now,
         until,
         ask,
     });
     let key = sp.key.clone();
-    if let Some(x) = ctx.state.hosts.get_mut(&s.host) {
+    if let Some(x) = ctx.state.hosts.get_mut(host) {
         x.pending
             .retain(|p| !matches!(p, Pending::Revoke { key: k } if *k == key));
     }
@@ -1020,23 +1034,26 @@ pub fn grant(space: &str, until: Option<u64>, ask: bool) -> Result<()> {
     Ok(())
 }
 
-/// Takes a space's root away: at once on the hub (its agent no longer
-/// holds a key that has it), then on the machine (or later, if it cannot
-/// be reached: the tick retries).
-pub fn revoke(space: &str) -> Result<bool> {
+/// Takes a space's root on a machine away: at once on the hub (its agent
+/// no longer holds a key that has it), then on the machine (or later, if
+/// it cannot be reached: the tick retries).
+pub fn revoke(space: &str, host: &str) -> Result<bool> {
     let mut ctx = Ctx::open()?;
     let s = ctx.state.space(space)?.clone();
-    if s.root.is_none() {
+    if s.machine(host).map_or(true, |m| m.root.is_none()) {
         return Ok(false);
     }
-    ctx.state.spaces.get_mut(space).expect("checked").root = None;
-    let set_up = ctx
+    if let Some(m) = ctx
         .state
-        .hosts
-        .get(&s.host)
-        .is_some_and(|h| h.setup.is_some());
+        .spaces
+        .get_mut(space)
+        .and_then(|sp| sp.machine_mut(host))
+    {
+        m.root = None;
+    }
+    let set_up = ctx.state.hosts.get(host).is_some_and(|h| h.setup.is_some());
     if set_up {
-        if let Some(x) = ctx.state.hosts.get_mut(&s.host) {
+        if let Some(x) = ctx.state.hosts.get_mut(host) {
             let p = Pending::Revoke { key: s.key.clone() };
             if !x.pending.contains(&p) {
                 x.pending.push(p);
@@ -1047,7 +1064,7 @@ pub fn revoke(space: &str) -> Result<bool> {
     drop(ctx);
     close_connections(&s.key);
     if set_up {
-        let _ = do_pending(&s.host);
+        let _ = do_pending(host);
     }
     Ok(true)
 }
@@ -1101,7 +1118,7 @@ pub fn do_pending(name: &str) -> Result<Vec<String>> {
         if let Pending::Remove { key, .. } = &p {
             let (_, st) = ctx::read_only()?;
             if !st.spaces.values().any(|s| s.key == *key) {
-                let _ = keys::remove_space(key);
+                let _ = keys::remove_space(key, None);
             }
         }
         done.push(match &p {
@@ -1114,7 +1131,7 @@ pub fn do_pending(name: &str) -> Result<Vec<String>> {
 }
 
 /// Queues the removal of a space's logins from every machine that has
-/// them (after the space is gone, or a bridge ended), and tries at once.
+/// them (after the space is gone), or from `only`.
 pub fn forget(state: &mut State, key: &str, purge: bool, only: Option<&str>) {
     for (n, h) in state.hosts.iter_mut() {
         if only.is_some_and(|o| o != n) {
@@ -1131,21 +1148,22 @@ pub fn forget(state: &mut State, key: &str, purge: bool, only: Option<&str>) {
     }
 }
 
-/// Queues the removal of read-only logins kept for bridges that ended.
+/// Queues the removal of logins of spaces that no longer work on a
+/// machine (taken off it, or reaching it through a bridge before v0.16).
 /// Returns the machines with something to do.
-pub fn unused(state: &mut State, now: u64) -> Vec<String> {
+pub fn unused(state: &mut State) -> Vec<String> {
     let mut gone: Vec<(String, String)> = Vec::new();
     for (n, h) in &state.hosts {
         if h.setup.is_none() {
             continue;
         }
-        let want = wanted(state, n, now);
-        for (key, a) in &h.accounts {
+        let want = wanted(state, n);
+        for key in h.accounts.keys() {
             let queued = h
                 .pending
                 .iter()
                 .any(|p| matches!(p, Pending::Remove { key: k, .. } if k == key));
-            if !a.full && !queued && !want.iter().any(|(k, _, _)| k == key) {
+            if !queued && !want.iter().any(|(k, _, _)| k == key) {
                 gone.push((n.clone(), key.clone()));
             }
         }
@@ -1162,20 +1180,22 @@ pub fn unused(state: &mut State, now: u64) -> Vec<String> {
 
 /// Every minute: take back root whose time ran out, retry what machines
 /// still need, and set up (once an hour at most) the machines reached as
-/// root that are not yet. Returns the spaces whose root ended.
-pub fn tick() -> Result<Vec<String>> {
+/// root that are not yet. Returns where root ended: (space, machine).
+pub fn tick() -> Result<Vec<(String, String)>> {
     let mut ctx = Ctx::open()?;
     let now = ctx.now;
     let mut ended = Vec::new();
     let mut revoke = Vec::new();
     for (n, s) in ctx.state.spaces.iter_mut() {
-        if s.root.as_ref().is_some_and(|r| !r.active(now)) {
-            s.root = None;
-            ended.push(n.clone());
-            revoke.push((s.host.clone(), s.key.clone()));
+        for m in s.machines.iter_mut() {
+            if m.root.as_ref().is_some_and(|r| !r.active(now)) {
+                m.root = None;
+                ended.push((n.clone(), m.host.clone()));
+                revoke.push((m.host.clone(), s.key.clone()));
+            }
         }
     }
-    let bridged = unused(&mut ctx.state, now);
+    let unused = unused(&mut ctx.state);
     for (host, key) in &revoke {
         if let Some(h) = ctx.state.hosts.get_mut(host) {
             if h.setup.is_some() {
@@ -1186,7 +1206,7 @@ pub fn tick() -> Result<Vec<String>> {
             }
         }
     }
-    if !ended.is_empty() || !bridged.is_empty() {
+    if !ended.is_empty() || !unused.is_empty() {
         ctx.commit()?;
     }
     let state = ctx.state.clone();
@@ -1308,21 +1328,40 @@ mod tests {
         st.spaces.insert("fig-claude".into(), s);
         let mut s = crate::state::tests_space("nas");
         s.key = "bbbb".into();
-        st.spaces.insert("nas-claude".into(), s);
-        st.bridges.push(crate::state::Bridge {
-            from: "nas-claude".into(),
-            to: "fig-claude".into(),
-            since: 0,
-            until: Some(100),
-        });
-        let w = wanted(&st, "fig", 5);
+        let mut m = crate::state::Machine::new("fig", crate::state::Access::Readonly);
+        m.key_id = "0f0f0f0f".into();
+        s.machines.push(m);
+        st.spaces.insert("ops".into(), s);
         assert_eq!(
-            w,
+            wanted(&st, "fig"),
             vec![
-                ("aaaa".to_string(), true, "fig-claude".to_string()),
-                ("bbbb".to_string(), false, "nas-claude".to_string())
+                ("aaaa".to_string(), String::new(), "fig-claude".to_string()),
+                (
+                    "bbbb".to_string(),
+                    "0f0f0f0f".to_string(),
+                    "ops".to_string()
+                )
             ]
         );
-        assert_eq!(wanted(&st, "fig", 100).len(), 1, "the bridge ended");
+        assert_eq!(wanted(&st, "nas").len(), 1);
+
+        // Logins left by a space that no longer works there go.
+        let mut h: crate::state::Host =
+            toml::from_str("address = \"100.80.0.3\"\nport = 22\nuser = \"root\"\nsetup = 1\n")
+                .unwrap();
+        for k in ["aaaa", "bbbb", "cccc"] {
+            h.accounts.insert(k.into(), Default::default());
+        }
+        st.hosts.insert("fig".into(), h);
+        assert_eq!(unused(&mut st), vec!["fig"]);
+        assert_eq!(
+            st.hosts["fig"].pending,
+            vec![Pending::Remove {
+                key: "cccc".into(),
+                srv: None,
+                purge: false
+            }]
+        );
+        assert!(unused(&mut st).is_empty(), "queued once");
     }
 }

@@ -5,7 +5,7 @@ coding agents live. They keep running there, you reach them from your phone
 or laptop, and each one can work on exactly one of your machines, over SSH,
 one way only.
 
-Status: **early (v0.15)**. It works and is tested end to end, but expect
+Status: **early (v0.16)**. It works and is tested end to end, but expect
 changes. Read [THREAT_MODEL.md](THREAT_MODEL.md) before trusting it with
 anything important.
 
@@ -18,19 +18,19 @@ anything important.
 2. **Many machines from one place.** Sign in to Claude on the hub only. The
    machines it works on need an SSH server and one line in
    `authorized_keys`. Linux and macOS.
-3. **One-way isolation, simple permissions.** A space is *one machine + one
-   agent*. It can reach that machine and nothing else; the machines cannot
-   reach the hub at all. To let a space work on a second machine for a
-   while, open a **bridge**. Cut a machine off from everything with one
-   **block**. All of it is enforced by the kernel, not by asking the model.
-   On the machines themselves, each space has **logins of its own**: an
-   ordinary user for its project, a read-only one, and root only for a
-   time you choose.
+3. **One-way isolation, simple permissions.** A space is *one agent + the
+   machines you give it*. It can reach those machines and nothing else; the
+   machines cannot reach the hub at all. Cut a machine off from everything
+   with one **block**. All of it is enforced by the kernel, not by asking
+   the model. On the machines themselves, each space has **logins of its
+   own**, set machine by machine: an ordinary user for its project, a
+   read-only one, and root only for a time you choose, and only one space
+   at a time on a machine.
 4. **Keys stay on the hub.** Private keys never leave root-only files; each
    space gets only its own key, through an agent it cannot read. Keys only
    work from the hub's address.
-5. **See everything.** A web UI with a live map of machines, spaces and
-   bridges, or the same from the command line. Every command a space runs
+5. **See everything.** A web UI with a live map of machines and spaces,
+   or the same from the command line. Every command a space runs
    is recorded on the hub, and on machines set up for logins of each
    space's own, in their own system log too.
 
@@ -47,14 +47,15 @@ anything important.
  │ space "fig-claude"  = Unix user bt-1a2b3c4d                       │
  │   tmux ─ claude remote-control      ssh-agent: fig's key          │
  │                                     nftables: may reach fig:22    │
- │ space "nas-claude"  = Unix user bt-5e6f7a8b                       │
- │   tmux ─ claude remote-control      ssh-agent: nas's key          │
- │      └─ bridge for 1h ─────────────────────────────┐              │
+ │ space "ops"         = Unix user bt-5e6f7a8b                       │
+ │   tmux ─ codex (chats on the web)   ssh-agent: fig's read-only    │
+ │                                       key, nas's user key         │
+ │                                     nftables: fig:22, nas:22      │
  └───────────────┬───────────────────────────────────────────────────┘
-                 │ outbound SSH only                 │
-        ┌────────┴─────────┐                         │
-        ▼                  ▼                         ▼
-       fig                nas  ◄─────────────────────┘
+                 │ outbound SSH only
+        ┌────────┴─────────┐
+        ▼                  ▼
+       fig                nas
        (machines cannot connect to the hub: the hub's firewall drops them)
 ```
 
@@ -65,14 +66,15 @@ Each space is:
 - **a systemd unit** (`blackthorn-space@<key>`) running a tmux server whose
   only pane runs the agent, sandboxed with `ProtectSystem=strict`,
   `ProtectHome`, `NoNewPrivileges` and friends;
-- **an ssh-agent** (`blackthorn-agent@<key>`) holding the key of its
-  machine (and of bridged machines). Root loads the keys; ssh-agent refuses
-  to let the space user read its memory;
+- **an ssh-agent** (`blackthorn-agent@<key>`) holding the keys of its
+  machines, each for the login it has there now: a machine where it is
+  read-only gets no key that logs in as more. Root loads the keys;
+  ssh-agent refuses to let the space user read its memory;
 - **nftables rules** matching the space's uid: it may send packets only to
   loopback, your DNS servers, HTTPS (for Anthropic), and the SSH port of
   the machines it may reach. Everything else is rejected, including packets
-  on connections that were already open, so blocks and the end of a bridge
-  take effect at once.
+  on connections that were already open, so blocks and taking a machine
+  from a space take effect at once.
 
 The hub's own inbound firewall drops every connection from a managed
 machine, and, if you list your devices, allows the admin ports (SSH, web UI)
@@ -158,13 +160,24 @@ sudo thorn root fig-claude --for 8h      # root for a time (or --forever), then 
 sudo thorn root fig-claude --off         # take it back now
 ```
 
-Cut a machine off for an hour, or let `fig-claude` reach `nas` for 30
-minutes:
+Let `fig-claude` work on `nas` too (read-only there unless you say
+otherwise; each machine has its own login and root), take it away again,
+or cut a machine off for an hour:
 
 ```sh
+sudo thorn connect fig-claude nas                 # --access user for more
+sudo thorn root fig-claude --host nas --for 1h    # root on nas only
+sudo thorn disconnect fig-claude nas
 sudo thorn host block fig --for 1h --reason "kernel upgrade"
-sudo thorn bridge add fig-claude nas-claude --for 30m
 ```
+
+One space at a time has root on a machine: giving it to another takes it
+from the first only when you say so (`--take`, or the checkbox on the
+web). Spaces with a user login there cannot touch each other's files, so
+root is the one way two spaces could change the same thing. Other chats of
+the same space can still be at work on a machine at once: each space's
+instructions tell its agent to look at what ran there lately
+(`journalctl -t blackthorn`) before changing the machine itself.
 
 ## Web UI
 
@@ -181,8 +194,9 @@ The web UI is the everyday way to run blackthorn, on a laptop or a phone:
   Remote Control a new chat runs next to the others and shows in the Claude
   app), each with its own page to read and type into it (see
   [Chats on the web](#chats-on-the-web)),
-  a live view of its terminal, Claude sign-in, bridges, Remote Control on
-  or off, and the name the Claude app lists it by.
+  a live view of its terminal, Claude sign-in, its machines (the login and
+  root on each, adding and removing them), Remote Control on or off, and
+  the name the Claude app lists it by.
 - **Machines**: the key line to install (with a Copy button), checking the
   machine's host keys, blocks, renaming.
 - **Settings**: who may connect, never_manage and the web address, edited
@@ -193,7 +207,7 @@ The web UI is the everyday way to run blackthorn, on a laptop or a phone:
 - **Notifications** (on the Settings page): pushed to your phone through
   [ntfy](https://ntfy.sh) (ntfy.sh or your own server) when a managed
   machine tries to connect to the hub, a space fails or must sign in again,
-  a block or bridge ends, or a new release is out.
+  a block or root time ends, or a new release is out.
 - **Account**: rename it, change your password, or move to a new
   authenticator app; see where it is logged in (browser, system, address,
   last used) and end any of those logins.
@@ -201,7 +215,7 @@ The web UI is the everyday way to run blackthorn, on a laptop or a phone:
 The command line can do everything it can, for when it is down.
 
 Logins need the password and a TOTP code; deleting or renaming anything,
-removing a machine, opening a bridge, accepting new host keys and changing
+removing a machine, adding one to a space, accepting new host keys and changing
 settings ask for a fresh code again. The HTTP-facing process runs as an unprivileged, sandboxed user and
 cannot act on its own: a root process behind a Unix socket checks every
 login and code.
@@ -271,15 +285,16 @@ restores the old settings at any time.
 | Command | What it does |
 |---|---|
 | `thorn init [--claude-from PATH] [--no-web]` | Set up the hub (the installer runs it), or update Claude Code |
-| `thorn status [--json]` | The map: machines, spaces, bridges, hub health |
-| `thorn ls` | Spaces: machine, agent, state, what they can reach |
+| `thorn status [--json]` | The map: machines, the spaces on them, hub health |
+| `thorn ls` | Spaces: machines, agent, logins, state, what they can reach |
 | `thorn new HOST [--agent A] [--name N] [--access user\|read-only] [--root 8h\|forever\|no] [--single] [--local] [--arg A]...` | Create a space on a machine |
 | `thorn login SPACE [--api-key]` | Sign a Claude or Codex space in, then start it (Codex: a device code, or an API key on standard input) |
 | `thorn codex status` / `install` | OpenAI's Codex on the hub: its version; install or update it |
 | `thorn codex chats\|show\|new\|send\|stop\|answer\|rename\|archive SPACE ...` | A Codex space's chats: list, read, start, write, stop, answer what Codex asks |
 | `thorn start\|stop\|restart SPACE... \| --all` | Control spaces |
-| `thorn access SPACE user\|read-only` | A space's usual login on its machine; applies at once |
-| `thorn root SPACE [--for 8h \| --forever \| --ask \| --off]` | Give a space root for a time (at most 72h), until taken back, or on approval; take it back |
+| `thorn connect SPACE HOST [--access read-only\|user]` / `thorn disconnect SPACE HOST` | Let a space work on one more machine (read-only by default); take one from it |
+| `thorn access SPACE user\|read-only [--host H]` | A space's usual login on one of its machines; applies at once |
+| `thorn root SPACE [--host H] [--take] [--for 8h \| --forever \| --ask \| --off]` | Give a space root on one of its machines for a time (at most 72h), until taken back, or on approval; take it back. One space at a time per machine (`--take` takes it over) |
 | `thorn approvals [--all]` / `thorn approve ID` / `thorn deny ID [--reason R]` | Root commands spaces with root on approval asked for |
 | `thorn log SPACE [-n 50]` | The commands a space ran (recorded by root) |
 | `thorn attach SPACE` | Open the space's terminal |
@@ -290,7 +305,6 @@ restores the old settings at any time.
 | `thorn chat new SPACE [--name N]` / `chat open SPACE ID` | Start a new chat, or go back to one |
 | `thorn remote SPACE on\|off` | Remote Control on, or off: one local conversation, only from the hub |
 | `thorn rm SPACE [--purge] [--purge-data]` | Delete; files are archived unless `--purge`; its folder on the machine stays unless `--purge-data` |
-| `thorn bridge add FROM TO [--for 1h]` / `bridge rm` / `bridge ls` | Let one space reach another space's machine for a while |
 | `thorn host add NAME USER@IP [--port P]` | Register a machine and create its key |
 | `thorn host ls` / `host check` / `host pubkey` / `host rescan` / `host rename` / `host rm` | Manage machines |
 | `thorn host setup NAME [--print \| --verify]` | Set a Linux machine up for logins of each space's own, and log their commands there |
@@ -425,11 +439,14 @@ text, `rm -rf`, keys) are pointed out, not refused. Deciding needs a browser
 unlocked as for typing into chats, and *manage* on the space; every ask
 and decision goes to the space's log.
 
-A space has a usual login, user or read-only, and root on top for a time.
-Change either at once, on the space's page or with `thorn access` and
-`thorn root`; going up needs an authenticator code on the web, going down
-does not. New spaces get root for 8 hours, then user. A space reaching a
-machine through a bridge logs in there read-only.
+On each of its machines, a space has a usual login, user or read-only, and
+root on top for a time. Change either at once, on the space's page or with
+`thorn access` and `thorn root` (`--host` when it has several machines);
+going up needs an authenticator code on the web, going down does not. New
+spaces get root on their machine for 8 hours, then user; a machine added
+later (`thorn connect`) starts read-only. One space at a time has root on a
+machine. Each machine has a user key of its own, and the space's agent
+holds it only while the space may log in there as more than read-only.
 
 blackthorn sets up machines it reaches as root by itself (once an hour
 until it works). One it reaches as an ordinary user cannot be set up that
@@ -503,14 +520,14 @@ SPACE ACCOUNT view|use|manage|none`:
 - **view**: read its chats, terminal and state;
 - **use**: also type into its chats, answer Claude, start and stop chats
   and the space;
-- **manage**: also change its settings, access and bridges, share it and
-  delete it.
+- **manage**: also change its settings and its logins on its machines,
+  share it and delete it.
 
 Its owner may also give it to another account (`thorn owner SPACE
 ACCOUNT`); the old owner may still manage it. Hub admins (the first
 account, and those made with `thorn web user add NAME --admin` or `thorn
-web user admin NAME on`) may do everything, and alone see machines,
-bridges and settings. Other accounts see only the spaces they own or that
+web user admin NAME on`) may do everything, and alone see machines, add
+machines to spaces and change settings. Other accounts see only the spaces they own or that
 are shared with them.
 
 Every message typed into a chat from the hub (the chat page, the
@@ -609,7 +626,7 @@ since the key lines depend on it. To move to a tailnet later:
 | `/etc/blackthorn/config.toml` | Configuration |
 | `/etc/blackthorn/keys/` | One private key per machine (root only) |
 | `/etc/blackthorn/web-users.toml` | Web accounts: password hashes, TOTP secrets (root only) |
-| `/var/lib/blackthorn/state.toml` | Machines, spaces, bridges, blocks (root only; use `thorn`) |
+| `/var/lib/blackthorn/state.toml` | Machines, spaces and their machines, blocks (root only; use `thorn`) |
 | `/var/lib/blackthorn/spaces/<key>/` | Space home: agent config, credentials, conversations |
 | `/var/lib/blackthorn/archive/` | Removed spaces |
 | `/etc/systemd/system/blackthorn-*` | Units installed by `thorn init` |
@@ -642,7 +659,7 @@ tests/e2e/run.sh                 # full test in throwaway Docker containers
 
 The end-to-end test starts a systemd container as the hub, two SSH targets
 and an "admin laptop", and checks isolation between spaces, the inbound
-firewall, the web UI (login, CSRF, step-up codes, Claude sign-in), bridges,
+firewall, the web UI (login, CSRF, step-up codes, Claude sign-in), spaces on several machines,
 blocks, renames, SSH two-factor with its automatic undo, reboots and
 removal, using a fake `claude`.
 

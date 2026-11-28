@@ -12,7 +12,7 @@ use crate::http;
 use crate::map::{self, esc};
 use crate::notify::NotifyView;
 use crate::ops::{
-    self, Action, BridgeView, Chat, ConfigChange, HostView, NewSpace, Overview, Peer, Scan,
+    self, Action, Chat, ConfigChange, HostView, MachineView, NewSpace, Overview, Peer, Scan,
     Setting, SpaceView, SPECIAL_KEYS,
 };
 use crate::webauth::url_encode;
@@ -571,7 +571,7 @@ fn route(
         ("GET", ["account"]) => account_page(&c, &flash),
         ("POST", ["account", action]) => account_post(&c, action, form),
 
-        ("GET", ["bridges"]) => Reply::Redirect("/spaces#bridges".into(), None),
+        ("GET", ["bridges"]) => Reply::Redirect("/spaces".into(), None),
         ("GET", ["chats"]) => chats_page(&c, &flash),
         ("POST", ["chats"]) => {
             let space = f(form, "space").to_string();
@@ -582,34 +582,6 @@ fn route(
             } else {
                 space_post(&c, &space, "chat-new", form)
             }
-        }
-        ("POST", ["bridges"]) => {
-            let from = f(form, "from").to_string();
-            let r = get::<serde_json::Value>(
-                &c,
-                Op::BridgeAdd {
-                    from: from.clone(),
-                    to: f(form, "to").into(),
-                    duration: opt(form, "duration"),
-                    code: f(form, "code").into(),
-                },
-            );
-            let to = f(form, "back");
-            let local = to.starts_with('/') && !to.starts_with("//") && !to.contains('\\');
-            back(
-                if local { to } else { "/spaces#bridges" },
-                r.map(|_| format!("bridge up from {from}")),
-            )
-        }
-        ("POST", ["bridges", "rm"]) => {
-            let r = get::<serde_json::Value>(
-                &c,
-                Op::BridgeRm {
-                    from: f(form, "from").into(),
-                    to: f(form, "to").into(),
-                },
-            );
-            back("/spaces#bridges", r.map(|_| "bridge removed".into()))
         }
         _ => Reply::Html(
             404,
@@ -640,7 +612,7 @@ const MENU: &[(&str, &str)] = &[
 /// Which menu entry a page belongs to.
 fn section(path: &str) -> &'static str {
     match path.trim_start_matches('/').split('/').next().unwrap_or("") {
-        "spaces" | "space" | "bridges" => "/spaces",
+        "spaces" | "space" => "/spaces",
         "chats" => "/chats",
         "hosts" | "host" => "/hosts",
         "settings" | "update" => "/settings",
@@ -970,7 +942,7 @@ fn health(o: &Overview) -> String {
     }
     if hub.timer != "active" {
         bad.push(format!(
-            "the block timer is {}: blocks and bridges will not expire",
+            "the block timer is {}: blocks and root time will not expire",
             esc(&hub.timer)
         ));
     }
@@ -1066,7 +1038,7 @@ fn map_page(c: &Ctx, flash: &Flash) -> Reply {
          login <span class=\"dot idle\"></span>stopped <span class=\"dot bad\"></span>failed \
          <span class=\"swatch ro\"></span>read-only login <span class=\"swatch user\"></span>user login \
          <span class=\"swatch admin\"></span>root \
-         <span class=\"swatch bridge\"></span>bridge <span class=\"swatch cut\"></span>blocked (a machine you cut off) \
+         <span class=\"swatch cut\"></span>blocked (a machine you cut off) \
          <span class=\"swatch uses\"></span>a service it uses \
          <span>Arrows point the way commands go: from you, through the Claude app or the hub, to a space, to its \
          machine. Every connection is opened from the left end except Remote Control, which the space keeps open \
@@ -1089,10 +1061,11 @@ fn reach_badge(s: &SpaceView) -> &'static str {
 
 fn space_controls(c: &Ctx, s: &SpaceView) -> String {
     let n = url_encode(&s.name);
-    let revoke = if s.root.is_some() {
+    let revoke = if s.rooted() {
         format!(
             "<form method=\"post\" action=\"/space/{n}/root-off\" class=\"inline\" data-confirm=\"Take root back from {}? \
-             What it runs as root now is cut off.\">{}<button>Revoke root</button></form>",
+             What it runs as root now is cut off.\">{}<input type=\"hidden\" name=\"host\" value=\"*\">\
+             <button>Revoke root</button></form>",
             esc(&s.name),
             csrf(c)
         )
@@ -1116,13 +1089,13 @@ fn space_controls(c: &Ctx, s: &SpaceView) -> String {
     }
 }
 
-/// How far the space goes on its machine now, as a badge: read-only,
-/// user, root (with the time it has left).
-fn access_badge(s: &SpaceView) -> String {
+/// How far a space goes on one of its machines now, as a badge:
+/// read-only, user, root (with the time it has left).
+fn machine_badge(m: &MachineView) -> String {
     use crate::state::Tier;
-    match (s.tier, s.root.as_ref().and_then(|r| r.until)) {
+    match (m.tier, m.root.as_ref().and_then(|r| r.until)) {
         (Tier::ReadOnly, _) => "<span class=\"badge ro\">read-only</span>".into(),
-        (Tier::User, _) if s.root.as_ref().is_some_and(|r| r.ask) => {
+        (Tier::User, _) if m.root.as_ref().is_some_and(|r| r.ask) => {
             "<span class=\"badge user\">user · root on approval</span>".into()
         }
         (Tier::User, _) => "<span class=\"badge user\">user</span>".into(),
@@ -1177,9 +1150,9 @@ fn root_select(default: &str, ask: bool) -> String {
     )
 }
 
-/// A link symbol before its machine's name: green when the space reaches
-/// its machine now, grey when not, with why in its title.
-fn link_icon(s: &SpaceView) -> String {
+/// A link symbol before a machine's name: green when the space reaches
+/// it now, grey when not, with why in its title.
+fn link_icon(s: &MachineView) -> String {
     let (class, word) = if s.linked {
         ("ok", "connected")
     } else {
@@ -1193,6 +1166,22 @@ fn link_icon(s: &SpaceView) -> String {
     )
 }
 
+/// Each machine of a space: the link symbol, its name, how far it goes.
+fn machines_line(s: &SpaceView) -> String {
+    s.machines
+        .iter()
+        .map(|m| {
+            format!(
+                "<li>{}<a href=\"/host/{}\">{}</a> {}</li>",
+                link_icon(m),
+                url_encode(&m.host),
+                esc(&m.host),
+                machine_badge(m)
+            )
+        })
+        .collect()
+}
+
 fn space_card(c: &Ctx, s: &SpaceView) -> String {
     let chats = s
         .chats_24h
@@ -1200,15 +1189,14 @@ fn space_card(c: &Ctx, s: &SpaceView) -> String {
         .unwrap_or_default();
     format!(
         "<article class=\"item\"><div class=\"item-head\"><span class=\"dot {}\"></span>\
-         <a class=\"item-name\" href=\"/space/{}\">{}</a>{}{}</div>\
-         <p class=\"item-meta\">on {}{} · {} · {}{chats}</p><div class=\"buttons\">{}</div></article>",
+         <a class=\"item-name\" href=\"/space/{}\">{}</a>{}</div>\
+         <ul class=\"on-machines\">{}</ul>\
+         <p class=\"item-meta\">{} · {}{chats}</p><div class=\"buttons\">{}</div></article>",
         map::state_class(&s.state),
         url_encode(&s.name),
         esc(&s.name),
-        access_badge(s),
         reach_badge(s),
-        link_icon(s),
-        esc(&s.host),
+        machines_line(s),
         esc(&crate::space_cmd::agent_label(&s.agent, s.mode)),
         esc(&s.state),
         space_controls(c, s)
@@ -1221,8 +1209,8 @@ fn spaces_page(c: &Ctx, flash: &Flash) -> Reply {
         Err(r) => return r,
     };
     let mut b = String::from(
-        "<h1>Spaces</h1><p class=\"hint\">A space is one machine worked on by one AI agent: its own user, keys, \
-         firewall rules and chats.</p>",
+        "<h1>Spaces</h1><p class=\"hint\">A space is one AI agent working on one or more machines: its own user, \
+         keys, firewall rules and chats. Add machines to a space on its page.</p>",
     );
     if !c.admin {
         b.push_str("<p class=\"hint\">These are the spaces you own or that are shared with you. A hub admin makes new ones.</p>");
@@ -1289,7 +1277,6 @@ fn spaces_page(c: &Ctx, flash: &Flash) -> Reply {
         }
         b.push_str("</div>");
     }
-    b.push_str(&bridges_section(c, &o));
     Reply::Html(200, page(c, "Spaces", &b, flash))
 }
 
@@ -1308,7 +1295,7 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
     let (can_use, can_manage) = (lvl >= Level::Use, lvl >= Level::Manage);
     let mut b = format!(
         "<div class=\"page-head\"><h1><span class=\"dot {}\"></span>{}</h1><div class=\"buttons\">{}{}</div></div>\
-         <p class=\"item-meta\">on {}<a href=\"/host/{}\">{}</a> as {} · {} · {}{} {}{}{}</p>",
+         <ul class=\"on-machines\">{}</ul><p class=\"item-meta\">{} · {}{} {}{}</p>",
         map::state_class(&s.state),
         esc(&s.name),
         if can_use { space_controls(c, s) } else { String::new() },
@@ -1317,14 +1304,10 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
         } else {
             String::new()
         },
-        link_icon(s),
-        url_encode(&s.host),
-        esc(&s.host),
-        esc(&s.login),
+        machines_line(s),
         esc(&crate::space_cmd::agent_label(&s.agent, s.mode)),
         esc(&s.state),
         s.memory_mb.map(|m| format!(" · {m} MB")).unwrap_or_default(),
-        access_badge(s),
         reach_badge(s),
         if lvl < Level::Owner {
             format!(
@@ -1335,7 +1318,11 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
             String::new()
         },
     );
-    if s.tier == crate::state::Tier::Root && s.unattended {
+    if s.machines
+        .iter()
+        .any(|m| m.tier == crate::state::Tier::Root)
+        && s.unattended
+    {
         b.push_str(
             "<p class=\"flash err\">This space has root and skips permission prompts (its arguments include auto or \
              bypass permission mode): its agent changes the machine without asking. Take root back when it is \
@@ -1420,71 +1407,13 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
             String::new()
         }
     ));
+    b.push_str(&machines_card(c, s, &o, can_manage));
     if !can_manage {
         return Reply::Html(200, page(c, &s.name, &b, flash));
     }
 
-    // Bridges.
-    let outgoing: Vec<&BridgeView> = o.bridges.iter().filter(|x| x.from == s.name).collect();
-    let mut br = String::new();
-    for x in &outgoing {
-        br.push_str(&format!(
-            "<li>→ {} (via {}) {} {}</li>",
-            esc(&x.host),
-            esc(&x.to),
-            esc(&x.remaining),
-            button(
-                c,
-                "/bridges/rm",
-                "Remove",
-                "link",
-                &format!(
-                    "<input type=\"hidden\" name=\"from\" value=\"{}\"><input type=\"hidden\" name=\"to\" value=\"{}\">",
-                    esc(&x.from),
-                    esc(&x.to)
-                )
-            )
-        ));
-    }
-    let others: String = o
-        .spaces
-        .iter()
-        .filter(|x| x.host != s.host)
-        .map(|x| {
-            format!(
-                "<option value=\"{}\">{} ({})</option>",
-                esc(&x.name),
-                esc(&x.host),
-                esc(&x.name)
-            )
-        })
-        .collect();
-    b.push_str(&format!(
-        "<section class=\"card\"><h2>Bridges</h2><p class=\"hint\">A bridge lets this space's chats also reach \
-         another space's machine for a while. While it lasts, both machines are one trust zone for this space.</p>\
-         <ul>{}</ul>",
-        if br.is_empty() { "<li>none</li>".into() } else { br }
-    ));
-    if !others.is_empty() {
-        b.push_str(&format!(
-            "<form method=\"post\" action=\"/bridges\" class=\"grid\">{}<input type=\"hidden\" name=\"from\" value=\"{}\">\
-             <input type=\"hidden\" name=\"back\" value=\"/space/{n}\">\
-             <label>Reach <select name=\"to\">{others}</select></label>{}{}<button>Open bridge</button></form>",
-            csrf(c),
-            esc(&s.name),
-            duration_select(&["30m", "1h", "4h", "1d"], "1h", true),
-            code_field()
-        ));
-    }
-    b.push_str("</section>");
-
     // Settings of the space.
     b.push_str("<section class=\"row\">");
-    b.push_str(&access_card(
-        c,
-        s,
-        o.hosts.iter().find(|h| h.name == s.host),
-    ));
     if claude {
         let (text, label, on, class) = if s.remote_control {
             (
@@ -1539,14 +1468,25 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
          Also delete its files</label>{}{}<button class=\"danger\">Delete space</button></form></section></section>",
         esc(&s.name),
         csrf(c),
-        match &s.srv {
-            Some(d) => format!(
-                "<label class=\"check\"><input type=\"checkbox\" name=\"purge_data\"> Also delete its folder on {}, \
-                 <code>/srv/{}</code> (kept otherwise)</label>",
-                esc(&s.host),
-                esc(d)
-            ),
-            None => String::new(),
+        {
+            let folders: Vec<String> = s
+                .machines
+                .iter()
+                .filter_map(|m| {
+                    m.srv
+                        .as_ref()
+                        .map(|d| format!("<code>/srv/{}</code> on {}", esc(d), esc(&m.host)))
+                })
+                .collect();
+            if folders.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "<label class=\"check\"><input type=\"checkbox\" name=\"purge_data\"> Also delete its folders, \
+                     {} (kept otherwise)</label>",
+                    folders.join(", ")
+                )
+            }
         },
         code_field()
     ));
@@ -1575,8 +1515,8 @@ fn sharing_card(c: &Ctx, s: &SpaceView, lvl: crate::state::Level) -> String {
     let mut out = format!(
         "<section class=\"card\" id=\"sharing\"><h2>Sharing</h2><p>Owner: <b>{}</b>.</p>\
          <p class=\"hint\"><b>View</b>: read its chats, terminal and state. <b>Use</b>: also type into its chats, \
-         answer Claude, start and stop chats and the space. <b>Manage</b>: also change its settings, access and \
-         bridges, share it, delete it. Hub admins may do everything. Every message sent from the hub is recorded \
+         answer Claude, start and stop chats and the space. <b>Manage</b>: also change its settings and its \
+         logins on its machines, share it, delete it. Hub admins may do everything. Every message sent from the hub is recorded \
          with the account that sent it.</p><ul>{}</ul>",
         esc(s.owner.as_deref().unwrap_or("the hub admins")),
         if list.is_empty() {
@@ -2290,134 +2230,200 @@ fn chat_post(c: &Ctx, name: &str, id: &str, action: &str, form: &HashMap<String,
     }
 }
 
-/// How the space logs in to its machine: its usual login, root for a
-/// time, and changing either.
-fn access_card(c: &Ctx, s: &SpaceView, h: Option<&HostView>) -> String {
+/// The space's machines: how it logs in to each, root there, changing
+/// either, taking a machine from it; and (hub admins) adding one.
+fn machines_card(c: &Ctx, s: &SpaceView, o: &Overview, can_manage: bool) -> String {
     use crate::state::Tier;
     let n = url_encode(&s.name);
-    let tiers = h.map(|h| h.tiers.clone()).unwrap_or_default();
-    let login = if s.login.is_empty() {
-        "<b>no login yet</b>".to_string()
-    } else {
-        format!("<b>{}</b>", esc(&s.login))
-    };
-    let what = match s.tier {
-        Tier::ReadOnly => "reads logs and container status, and changes nothing",
-        Tier::User => "an ordinary user: its own files and containers, no sudo",
-        Tier::Root => "can change anything there",
-    };
-    let mut text = format!(
-        "<p>It logs in to {} as {login} ({}): {what}.</p>",
-        esc(&s.host),
-        s.tier
+    let several = s.machines.len() > 1;
+    let mut out = format!(
+        "<section class=\"card\" id=\"machines\"><h2>Machines</h2><p class=\"hint\">This space works on {}. Each \
+         machine has its own login for it; one space at a time may have root on a machine.</p>",
+        if several {
+            format!("{} machines", s.machines.len())
+        } else {
+            "one machine".to_string()
+        }
     );
-    match &s.root {
-        Some(r) => {
-            let until = match r.until {
-                Some(u) => format!(
-                    "until {} ({} left), then it logs in as {}",
-                    when_utc(u),
-                    esc(&crate::ops::describe_left(u, crate::state::now())),
-                    s.access
-                ),
-                None if r.ask => "on approval: each command it wants as root waits for you \
-                                  (<a href=\"/approvals\">Approvals</a>), until taken back"
-                    .into(),
-                None => "until taken back".into(),
-            };
+    for m in &s.machines {
+        let h = o.hosts.iter().find(|h| h.name == m.host);
+        let tiers = h.map(|h| h.tiers.clone()).unwrap_or_default();
+        let hidden = format!(
+            "<input type=\"hidden\" name=\"host\" value=\"{}\">",
+            esc(&m.host)
+        );
+        let login = if m.login.is_empty() {
+            "<b>no login yet</b>".to_string()
+        } else {
+            format!("<b>{}</b>", esc(&m.login))
+        };
+        let what = match m.tier {
+            Tier::ReadOnly => "reads logs and container status, and changes nothing",
+            Tier::User => "an ordinary user: its own files and containers, no sudo",
+            Tier::Root => "can change anything there",
+        };
+        let mut text = format!("<p>Logs in as {login} ({}): {what}.</p>", m.tier);
+        match &m.root {
+            Some(r) => {
+                let until = match r.until {
+                    Some(u) => format!(
+                        "until {} ({} left), then it logs in as {}",
+                        when_utc(u),
+                        esc(&crate::ops::describe_left(u, crate::state::now())),
+                        m.access
+                    ),
+                    None if r.ask => "on approval: each command it wants as root waits for you \
+                                      (<a href=\"/approvals\">Approvals</a>), until taken back"
+                        .into(),
+                    None => "until taken back".into(),
+                };
+                text.push_str(&format!("<p class=\"t-bad\">Root {until}.</p>"));
+            }
+            None => text.push_str(&format!(
+                "<p class=\"hint\">Its usual login there: <b>{}</b>.</p>",
+                m.access
+            )),
+        }
+        // Who else has root there.
+        let holder = o
+            .spaces
+            .iter()
+            .find(|x| x.name != s.name && x.machine(&m.host).is_some_and(|y| y.root.is_some()));
+        if let Some(x) = holder {
             text.push_str(&format!(
-                "<p class=\"t-bad\">Root {until}.</p><div class=\"buttons\"><form method=\"post\" \
-                 action=\"/space/{n}/root-off\" class=\"inline\" data-confirm=\"Take root back now? What it runs as \
-                 root is cut off.\">{}<button class=\"danger\">Revoke root now</button></form></div>",
+                "<p class=\"hint\">{} has root on {} now; one space at a time may.</p>",
+                esc(&x.name),
+                esc(&m.host)
+            ));
+        }
+        if let Some(d) = &m.srv {
+            text.push_str(&format!(
+                "<p class=\"hint\">Its folder there: <code>/srv/{}</code>.</p>",
+                esc(d)
+            ));
+        }
+        let mut actions = String::new();
+        if m.root.is_some() {
+            actions.push_str(&format!(
+                "<form method=\"post\" action=\"/space/{n}/root-off\" class=\"inline\" data-confirm=\"Take root on {} \
+                 back now? What it runs as root there is cut off.\">{}{hidden}<button class=\"danger\">Revoke root</button></form>",
+                esc(&m.host),
                 csrf(c)
             ));
         }
-        None => text.push_str(&format!(
-            "<p class=\"hint\">Its usual login: <b>{}</b>.</p>",
-            s.access
-        )),
-    }
-    if !s.root_beside.is_empty() {
-        text.push_str(&format!(
-            "<p class=\"hint\">Also root on {} now: {}.</p>",
-            esc(&s.host),
-            esc(&s.root_beside.join(", "))
-        ));
-    }
-    if let Some(d) = &s.srv {
-        text.push_str(&format!(
-            "<p class=\"hint\">Its folder there: <code>/srv/{}</code>.</p>",
-            esc(d)
-        ));
-    }
-    let mut actions = String::new();
-    let usual: Vec<Tier> = tiers.iter().copied().filter(|t| *t != Tier::Root).collect();
-    if usual.len() > 1 {
-        let opts: String = usual
-            .iter()
-            .map(|t| {
-                format!(
-                    "<option value=\"{t}\"{}>{t}</option>",
-                    if s.access.tier() == *t {
-                        " selected"
-                    } else {
-                        ""
-                    }
-                )
-            })
-            .collect();
-        actions.push_str(&pop_dialog(
-            c,
-            &format!("/space/{n}/access"),
-            "Usual login…",
-            "",
-            "Usual login",
-            &format!(
-                "<p class=\"hint\">Applies at once: its open connections close; the space and its chats go on. \
-                 Going up to user takes a code; going down does not.</p>\
-                 <label>Login <select name=\"access\">{opts}</select></label>{}",
-                code_field()
+        if can_manage {
+            let usual: Vec<Tier> = tiers.iter().copied().filter(|t| *t != Tier::Root).collect();
+            if usual.len() > 1 {
+                let opts: String = usual
+                    .iter()
+                    .map(|t| {
+                        format!(
+                            "<option value=\"{t}\"{}>{t}</option>",
+                            if m.access.tier() == *t {
+                                " selected"
+                            } else {
+                                ""
+                            }
+                        )
+                    })
+                    .collect();
+                actions.push_str(&pop_dialog(
+                    c,
+                    &format!("/space/{n}/access"),
+                    "Usual login…",
+                    "",
+                    &format!("Usual login on {}", m.host),
+                    &format!(
+                        "{hidden}<p class=\"hint\">Applies at once: its open connections close; the space and its \
+                         chats go on. Going up to user takes a code; going down does not.</p>\
+                         <label>Login <select name=\"access\">{opts}</select></label>{}",
+                        code_field()
+                    ),
+                    "Change",
+                ));
+            }
+            if tiers.contains(&Tier::Root) {
+                let take = match holder {
+                    Some(x) => format!(
+                        "<label class=\"check\"><input type=\"checkbox\" name=\"take\" value=\"1\" required> Take root \
+                         from {} (it goes back to its usual login there)</label>",
+                        esc(&x.name)
+                    ),
+                    None => String::new(),
+                };
+                actions.push_str(&pop_dialog(
+                    c,
+                    &format!("/space/{n}/root"),
+                    if m.root.is_some() { "Change root time…" } else { "Root for…" },
+                    if m.root.is_some() || holder.is_some() { "" } else { "primary" },
+                    &format!("Root on {}", m.host),
+                    &format!(
+                        "{hidden}<p class=\"hint\">It can change anything on {} until then, through <code>sudo</code> \
+                         on its own login. When the time is up it goes back to its usual login ({}); its chats go \
+                         on.</p>{}{take}{}",
+                        esc(&m.host),
+                        m.access,
+                        root_select("8h", true),
+                        code_field()
+                    ),
+                    "Give root",
+                ));
+            }
+            if several {
+                actions.push_str(&format!(
+                    "<form method=\"post\" action=\"/space/{n}/disconnect\" class=\"inline\" data-confirm=\"Take {} from \
+                     {}? Its root and logins there go; its folder there stays.\">{}{hidden}<button class=\"link\">Remove \
+                     from this space</button></form>",
+                    esc(&m.host),
+                    esc(&s.name),
+                    csrf(c)
+                ));
+            }
+        }
+        let note = match h {
+            Some(h) if h.setup.is_none() && h.user == "root" => format!(
+                "<p class=\"hint\">{} is not set up for logins of each space's own yet, so its spaces have root or \
+                 nothing. Set it up on <a href=\"/host/{}\">its page</a>.</p>",
+                esc(&h.name),
+                url_encode(&h.name)
             ),
-            "Change",
-        ));
-    }
-    if tiers.contains(&Tier::Root) {
-        actions.push_str(&pop_dialog(
-            c,
-            &format!("/space/{n}/root"),
-            if s.root.is_some() { "Change root time…" } else { "Root for…" },
-            if s.root.is_some() { "" } else { "primary" },
-            &format!("Root on {}", s.host),
-            &format!(
-                "<p class=\"hint\">It can change anything on {} until then, through <code>sudo</code> on its own \
-                 login. When the time is up it goes back to its usual login ({}); its chats go on.</p>{}{}",
-                esc(&s.host),
-                s.access,
-                root_select("8h", true),
-                code_field()
+            Some(h) if h.setup.is_none() => format!(
+                "<p class=\"hint\">blackthorn reaches {} as {}, so its spaces log in as that user and get no root. \
+                 See <a href=\"/host/{}\">its page</a> for more.</p>",
+                esc(&h.name),
+                esc(&h.user),
+                url_encode(&h.name)
             ),
-            "Give root",
+            _ => String::new(),
+        };
+        out.push_str(&format!(
+            "<div class=\"machine\"><h3>{}<a href=\"/host/{}\">{}</a> {}</h3>{text}{note}<div class=\"buttons\">{actions}</div></div>",
+            link_icon(m),
+            url_encode(&m.host),
+            esc(&m.host),
+            machine_badge(m)
         ));
     }
-    let note = match h {
-        Some(h) if h.setup.is_none() && h.user == "root" => format!(
-            "<p class=\"hint\">{} is not set up for logins of each space's own yet, so its spaces have root or \
-             nothing. Set it up on <a href=\"/host/{}\">its page</a>.</p>",
-            esc(&h.name),
-            url_encode(&h.name)
-        ),
-        Some(h) if h.setup.is_none() => format!(
-            "<p class=\"hint\">blackthorn reaches {} as {}, so its spaces log in as that user and get no root. \
-             See <a href=\"/host/{}\">its page</a> for more.</p>",
-            esc(&h.name),
-            esc(&h.user),
-            url_encode(&h.name)
-        ),
-        _ => String::new(),
-    };
-    format!(
-        "<section class=\"card\" id=\"access\"><h2>Login</h2>{text}{note}<div class=\"buttons\">{actions}</div></section>"
-    )
+    let free: String = o
+        .hosts
+        .iter()
+        .filter(|h| !s.on(&h.name))
+        .map(|h| format!("<option>{}</option>", esc(&h.name)))
+        .collect();
+    if c.admin && !free.is_empty() {
+        out.push_str(&format!(
+            "<form method=\"post\" action=\"/space/{n}/connect\" class=\"grid add-machine\">{}\
+             <label>Add a machine <select name=\"host\">{free}</select></label>\
+             <label>Login <select name=\"access\"><option value=\"read-only\">read-only</option>\
+             <option value=\"user\">user</option></select></label>{}<button>Add</button></form>\
+             <p class=\"hint\">Its chats can then work on that machine too. Root there is given separately, for a \
+             time.</p>",
+            csrf(c),
+            code_field()
+        ));
+    }
+    out.push_str("</section>");
+    out
 }
 
 /// A time as "2026-11-24 18:00 UTC".
@@ -2752,28 +2758,87 @@ fn space_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>)
             }
         }
         "root" => back(
-            &here,
+            &format!("{here}#machines"),
             get::<String>(
                 c,
                 Op::SpaceRoot {
                     name: name.into(),
+                    host: opt(form, "host"),
                     duration: root_value(form),
+                    take: f(form, "take") == "1",
                     code: f(form, "code").into(),
                 },
             ),
         ),
+        "root-off" if f(form, "host") == "*" => {
+            // Every machine it has root on.
+            let hosts: Vec<String> = get::<Overview>(c, Op::Overview)
+                .ok()
+                .and_then(|o| o.spaces.into_iter().find(|s| s.name == name))
+                .map(|s| {
+                    s.machines
+                        .into_iter()
+                        .filter(|m| m.root.is_some())
+                        .map(|m| m.host)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut done = Vec::new();
+            for h in hosts {
+                match get::<String>(
+                    c,
+                    Op::SpaceRootOff {
+                        name: name.into(),
+                        host: Some(h),
+                    },
+                ) {
+                    Ok(m) => done.push(m),
+                    Err(e) => return back(&here, Err(e)),
+                }
+            }
+            back(&here, Ok(done.join("; ")))
+        }
         "root-off" => back(
-            &here,
-            get::<String>(c, Op::SpaceRootOff { name: name.into() }),
+            &format!("{here}#machines"),
+            get::<String>(
+                c,
+                Op::SpaceRootOff {
+                    name: name.into(),
+                    host: opt(form, "host"),
+                },
+            ),
         ),
         "access" => back(
-            &here,
+            &format!("{here}#machines"),
             get::<String>(
                 c,
                 Op::SpaceAccess {
                     name: name.into(),
+                    host: opt(form, "host"),
                     access: parse_usual(f(form, "access")),
                     code: f(form, "code").into(),
+                },
+            ),
+        ),
+        "connect" => back(
+            &format!("{here}#machines"),
+            get::<String>(
+                c,
+                Op::SpaceConnect {
+                    name: name.into(),
+                    host: f(form, "host").into(),
+                    access: parse_usual(f(form, "access")),
+                    code: f(form, "code").into(),
+                },
+            ),
+        ),
+        "disconnect" => back(
+            &format!("{here}#machines"),
+            get::<String>(
+                c,
+                Op::SpaceDisconnect {
+                    name: name.into(),
+                    host: f(form, "host").into(),
                 },
             ),
         ),
@@ -3628,7 +3693,7 @@ fn notify_card(c: &Ctx) -> String {
     format!(
         "<section class=\"card\" id=\"notify\"><h2>Notifications</h2><p class=\"hint\">Pushed to your phone with \
          <a href=\"https://ntfy.sh\" target=\"_blank\" rel=\"noopener noreferrer\">ntfy</a> when a managed machine tries to \
-         connect to the hub, a space fails or needs to sign in again, a block or bridge ends, or a new release is out. \
+         connect to the hub, a space fails or needs to sign in again, a block or root time ends, or a new release is out. \
          Use ntfy.sh with a topic nobody can guess, or your own ntfy server. Messages carry names, never secrets.</p>\
          {status}<form method=\"post\" action=\"/notify\" class=\"stack\">{}\
          <label>Topic URL <input name=\"url\" value=\"{}\" placeholder=\"{}\" autocomplete=\"off\" spellcheck=\"false\"></label>\
@@ -4012,66 +4077,6 @@ fn settings_post(c: &Ctx, form: &HashMap<String, String>) -> Reply {
     )
 }
 
-/// The bridges, and opening one: the lower half of the Spaces page.
-fn bridges_section(c: &Ctx, o: &Overview) -> String {
-    let mut b = String::from(
-        "<h2 id=\"bridges\">Bridges</h2><p class=\"hint\">A bridge lets one space reach another space's machine for a while. It is \
-         one-way: the other space gains nothing. While it lasts, the two machines are one trust zone for the \
-         bridged space.</p>",
-    );
-    if o.bridges.is_empty() {
-        b.push_str("<p>No bridges.</p>");
-    } else {
-        b.push_str("<div class=\"items\">");
-        for x in &o.bridges {
-            b.push_str(&format!(
-                "<article class=\"item\"><div class=\"item-head\"><span class=\"swatch bridge\"></span>\
-                 <span class=\"item-name\">{} → {}</span></div><p class=\"item-meta\">via space {} · {}</p>\
-                 <div class=\"buttons\">{}</div></article>",
-                esc(&x.from),
-                esc(&x.host),
-                esc(&x.to),
-                esc(&x.remaining),
-                button(
-                    c,
-                    "/bridges/rm",
-                    "Remove",
-                    "",
-                    &format!(
-                        "<input type=\"hidden\" name=\"from\" value=\"{}\"><input type=\"hidden\" name=\"to\" value=\"{}\">",
-                        esc(&x.from),
-                        esc(&x.to)
-                    )
-                )
-            ));
-        }
-        b.push_str("</div>");
-    }
-    if o.spaces.len() >= 2 {
-        let opts: String = o
-            .spaces
-            .iter()
-            .map(|s| {
-                format!(
-                    "<option value=\"{}\">{} ({})</option>",
-                    esc(&s.name),
-                    esc(&s.name),
-                    esc(&s.host)
-                )
-            })
-            .collect();
-        b.push_str(&format!(
-            "<section class=\"card\"><h2>Open a bridge</h2><form method=\"post\" action=\"/bridges\" class=\"stack\">{}\
-             <label>Space <select name=\"from\">{opts}</select></label><label>May also reach the machine of \
-             <select name=\"to\">{opts}</select></label>{}{}<button class=\"primary\">Open bridge</button></form></section>",
-            csrf(c),
-            duration_select(&["30m", "1h", "4h", "1d"], "1h", true),
-            code_field()
-        ));
-    }
-    b
-}
-
 /// Every chat of the spaces the account may see: newest first, each with
 /// its space and machine; and a new one, in a space you choose.
 fn chats_page(c: &Ctx, flash: &Flash) -> Reply {
@@ -4174,7 +4179,7 @@ fn chats_page(c: &Ctx, flash: &Flash) -> Reply {
                     "<option value=\"{}\">{} (on {})</option>",
                     esc(&s.name),
                     esc(&s.name),
-                    esc(&s.host)
+                    esc(&s.hosts_text())
                 )
             })
             .collect()
@@ -4213,12 +4218,11 @@ fn chats_page(c: &Ctx, flash: &Flash) -> Reply {
             b.push_str(&format!(
                 "<article class=\"item\"><div class=\"item-head\"><span class=\"dot {dot}\"></span>\
                  <a class=\"item-name\" href=\"{}\">{}</a></div>\
-                 <p class=\"item-meta\">on <a href=\"/host/{}\">{}</a> · space <a href=\"/space/{}\">{}</a> · {} · \
+                 <p class=\"item-meta\">on {} · space <a href=\"/space/{}\">{}</a> · {} · \
                  last written {}</p></article>",
                 esc(href),
                 esc(title),
-                url_encode(&s.host),
-                esc(&s.host),
+                esc(&s.hosts_text()),
                 url_encode(&s.name),
                 esc(&s.name),
                 esc(doing),

@@ -1,5 +1,5 @@
 //! thorn status (and --json): the hub at a glance, machines with the spaces
-//! that work on them, bridges between them.
+//! that work on them.
 
 use crate::ops::{self, Overview};
 use crate::space_cmd::agent_label;
@@ -65,7 +65,7 @@ pub fn map(o: &Overview) -> String {
             "{}  {}@{} · {} · {}",
             host.name, host.user, host.address, host.os, host.status
         );
-        let spaces: Vec<_> = o.spaces.iter().filter(|s| s.host == host.name).collect();
+        let spaces: Vec<_> = o.spaces.iter().filter(|s| s.on(&host.name)).collect();
         if spaces.is_empty() {
             let _ = writeln!(out, " └─ (no spaces: sudo thorn new {})", host.name);
         }
@@ -87,17 +87,21 @@ pub fn map(o: &Overview) -> String {
             if let Some(m) = s.memory_mb {
                 let _ = write!(line, "  {m} MB");
             }
-            let _ = writeln!(out, "{line}");
-            for b in o.bridges.iter().filter(|b| b.from == s.name) {
-                let _ = writeln!(
-                    out,
-                    " {}    └─ bridge → {} (via {}) {}",
-                    if last { " " } else { "│" },
-                    b.host,
-                    b.to,
-                    b.remaining
-                );
+            if let Some(m) = s.machine(&host.name) {
+                let _ = write!(line, "  {}", m.tier);
             }
+            if s.machines.len() > 1 {
+                let _ = write!(line, "  (also on {})", {
+                    let v: Vec<&str> = s
+                        .machines
+                        .iter()
+                        .map(|m| m.host.as_str())
+                        .filter(|h| *h != host.name)
+                        .collect();
+                    crate::state::and_list(&v)
+                });
+            }
+            let _ = writeln!(out, "{line}");
         }
     }
     out

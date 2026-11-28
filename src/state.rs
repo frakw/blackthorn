@@ -1,4 +1,4 @@
-//! /var/lib/blackthorn/state.toml: the hosts, spaces and bridges blackthorn manages.
+//! /var/lib/blackthorn/state.toml: the hosts and spaces blackthorn manages.
 //! Only `thorn` writes it, always while holding the state lock.
 
 use anyhow::{bail, Context, Result};
@@ -16,8 +16,10 @@ use std::path::Path;
 pub struct State {
     pub hosts: BTreeMap<String, Host>,
     pub spaces: BTreeMap<String, Space>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub bridges: Vec<Bridge>,
+    /// Bridges between spaces (v0.2 to v0.15), now spaces of several
+    /// machines: read and dropped.
+    #[serde(rename = "bridges", skip_serializing)]
+    old_bridges: Vec<toml::Value>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,12 +103,12 @@ pub struct Host {
 }
 
 /// A space's logins on a machine: `bt-<key>` (user, and root with sudo)
-/// and `bt-<key>-ro` (read-only); on a machine it only reaches through a
-/// bridge, the read-only one alone.
+/// and `bt-<key>-ro` (read-only). Before v0.16 a machine reached through a
+/// bridge had the read-only one alone.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Account {
-    /// Has `bt-<key>` too (its own machine).
+    /// Has `bt-<key>` too.
     #[serde(default, skip_serializing_if = "is_false")]
     pub full: bool,
     /// Its folder there, /srv/<srv> (the space's name when it was made).
@@ -118,7 +120,7 @@ pub struct Account {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "do", rename_all = "kebab-case")]
 pub enum Pending {
-    /// Make a space's logins there (`full`: its own machine).
+    /// Make a space's logins there (`full`: the user one too).
     Accounts { key: String, full: bool },
     /// Take a space's root away (sudo) and end its sessions.
     Revoke { key: String },
@@ -166,7 +168,7 @@ pub enum Level {
     /// Also type into its chats, answer Claude, start and stop chats and
     /// the space.
     Use,
-    /// Also change its settings, access and bridges, share it, delete it.
+    /// Also change its settings, machines and access, share it, delete it.
     Manage,
     /// Its owner (or a hub admin): also give it to another account.
     Owner,
@@ -284,8 +286,6 @@ pub struct Login<'a> {
     /// The key file its agent holds for this login.
     pub key: std::path::PathBuf,
     pub tier: Tier,
-    /// Reached through a bridge (not the space's own machine).
-    pub bridged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -300,16 +300,18 @@ pub struct Block {
     pub reason: Option<String>,
 }
 
-/// A space is one machine worked on by one AI agent: its own Unix user,
-/// firewall rules, ssh-agent and conversations.
+/// A space is one AI agent working on one or more machines: its own Unix
+/// user, firewall rules, ssh-agent and conversations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Space {
     /// Stable identity: names the Unix user (bt-<key>), the systemd units and
     /// the home directory, so renaming a space touches none of them.
     pub key: String,
-    /// The machine this space works on.
-    pub host: String,
+    /// The machines it works on, and how far it goes on each. All alike:
+    /// none comes first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub machines: Vec<Machine>,
     /// "claude", or the name of an agent in config.toml.
     pub agent: String,
     /// Claude only: one Remote Control server with many chats (default), or
@@ -336,16 +338,18 @@ pub struct Space {
     #[serde(default)]
     pub args: Vec<String>,
     pub created: u64,
-    /// Its usual login on its machine: read-only or user.
-    #[serde(default)]
-    pub access: Access,
-    /// Root on its machine, for a time or until taken back.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub root: Option<Root>,
+    /// Before v0.16 a space had one machine: `host`, its usual login there
+    /// (`access`) and root. Read once, then turned into `machines`.
+    #[serde(default, rename = "host", skip_serializing)]
+    old_host: Option<String>,
+    #[serde(default, rename = "access", skip_serializing)]
+    old_access: Option<Access>,
+    #[serde(default, rename = "root", skip_serializing)]
+    old_root: Option<Root>,
     /// Before v0.12: when a limited admin space stopped. Read once, then
-    /// turned into `root`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub until: Option<u64>,
+    /// turned into root.
+    #[serde(default, skip_serializing)]
+    until: Option<u64>,
     /// The name a new conversation gets when it starts (single mode and
     /// spaces without Remote Control).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -359,8 +363,37 @@ pub struct Space {
     pub shares: BTreeMap<String, Level>,
 }
 
-impl Space {
-    /// How far it goes on its machine now.
+/// A machine a space works on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Machine {
+    pub host: String,
+    /// Its usual login there: read-only or user.
+    pub access: Access,
+    /// Root there, for a time or until taken back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<Root>,
+    /// Names the key of its user login there (spaces/<key>.<id>); empty:
+    /// the space's key of before v0.16 (spaces/<key>), kept for the machine
+    /// it had then. Each machine has a key of its own, so the space's agent
+    /// holds a user key only for the machines it may log in to as a user.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key_id: String,
+}
+
+impl Machine {
+    pub fn new(host: &str, access: Access) -> Machine {
+        let mut b = [0u8; 4];
+        getrandom::fill(&mut b).expect("random bytes");
+        Machine {
+            host: host.to_string(),
+            access,
+            root: None,
+            key_id: b.iter().map(|x| format!("{x:02x}")).collect(),
+        }
+    }
+
+    /// How far it goes there now.
     pub fn tier(&self, now: u64) -> Tier {
         match &self.root {
             Some(r) if r.active(now) && r.ask => Tier::User,
@@ -369,9 +402,81 @@ impl Space {
         }
     }
 
-    /// Asks for each root command now (root on approval).
+    /// Asks for each root command there now (root on approval).
     pub fn asks(&self, now: u64) -> bool {
         self.root.as_ref().is_some_and(|r| r.active(now) && r.ask)
+    }
+
+    /// Holds root there now, in any form (root on approval too).
+    pub fn rooted(&self, now: u64) -> bool {
+        self.root.as_ref().is_some_and(|r| r.active(now))
+    }
+
+    /// The key of its user login there.
+    pub fn user_key(&self, space_key: &str) -> std::path::PathBuf {
+        crate::paths::space_key_file(space_key, &self.key_id)
+    }
+}
+
+impl Space {
+    /// A new space's start: no machines yet.
+    pub fn new(key: &str, agent: &str, rc_name: &str, created: u64) -> Space {
+        Space {
+            key: key.to_string(),
+            machines: Vec::new(),
+            agent: agent.to_string(),
+            mode: Mode::Server,
+            remote_control: true,
+            rc_name: rc_name.to_string(),
+            dir: rc_name.to_string(),
+            conversation: String::new(),
+            args: Vec::new(),
+            created,
+            old_host: None,
+            old_access: None,
+            old_root: None,
+            until: None,
+            title: None,
+            owner: None,
+            shares: BTreeMap::new(),
+        }
+    }
+
+    pub fn machine(&self, host: &str) -> Option<&Machine> {
+        self.machines.iter().find(|m| m.host == host)
+    }
+
+    pub fn machine_mut(&mut self, host: &str) -> Option<&mut Machine> {
+        self.machines.iter_mut().find(|m| m.host == host)
+    }
+
+    /// Works on this machine.
+    pub fn on(&self, host: &str) -> bool {
+        self.machine(host).is_some()
+    }
+
+    /// Its machines' names, in order.
+    pub fn hosts(&self) -> Vec<&str> {
+        self.machines.iter().map(|m| m.host.as_str()).collect()
+    }
+
+    /// "fig", "fig and nas", "fig, nas and pine".
+    pub fn hosts_text(&self) -> String {
+        and_list(&self.hosts())
+    }
+
+    /// Asks for each root command on some machine now.
+    pub fn asks_anywhere(&self, now: u64) -> bool {
+        self.machines.iter().any(|m| m.asks(now))
+    }
+
+    /// The highest it goes anywhere now.
+    pub fn top_tier(&self, now: u64) -> Tier {
+        self.machines
+            .iter()
+            .map(|m| m.tier(now))
+            .max()
+            .unwrap_or(Tier::ReadOnly)
     }
 
     /// How far `user` may go with this space (`admin`: a hub admin).
@@ -380,6 +485,15 @@ impl Space {
             return Some(Level::Owner);
         }
         self.shares.get(user).copied()
+    }
+}
+
+/// "a", "a and b", "a, b and c".
+pub fn and_list(v: &[&str]) -> String {
+    match v {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -399,26 +513,7 @@ pub enum Mode {
     Single,
 }
 
-/// Lets the chats of space `from` also reach the machine of space `to`, for
-/// a limited time. One-way: `to` gains nothing.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct Bridge {
-    pub from: String,
-    pub to: String,
-    pub since: u64,
-    /// Unix seconds; None lasts until `thorn bridge rm`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub until: Option<u64>,
-}
-
 impl Block {
-    pub fn active(&self, now: u64) -> bool {
-        self.until.map_or(true, |u| now < u)
-    }
-}
-
-impl Bridge {
     pub fn active(&self, now: u64) -> bool {
         self.until.map_or(true, |u| now < u)
     }
@@ -466,39 +561,59 @@ impl State {
         }
     }
 
-    /// Turns the admin spaces of v0.7 to v0.11 into a usual login and
-    /// root: a time-limited one (its machine had a read-only login) stays
-    /// read-only, with root for the time it had left; any other keeps root
-    /// until taken back, over a user login. Where the admin login is not
-    /// root, it was a user's all along.
+    /// Brings a state written by an older version up to date:
+    ///
+    /// - v0.7 to v0.11 admin spaces become a usual login and root: a
+    ///   time-limited one (its machine had a read-only login) stays
+    ///   read-only, with root for the time it had left; any other keeps root
+    ///   until taken back, over a user login. Where the admin login is not
+    ///   root, it was a user's all along.
+    /// - Before v0.16 a space had one machine: it becomes its only one,
+    ///   keeping its key. Bridges (v0.2 to v0.15) are gone.
     pub fn upgrade(&mut self) {
+        self.old_bridges.clear();
         for s in self.spaces.values_mut() {
-            if s.access != Access::Admin {
+            let Some(host) = s.old_host.take() else {
                 continue;
-            }
-            let h = self.hosts.get(&s.host);
-            let ro = h.is_some_and(|h| h.readonly.is_some());
-            let root_login = h.is_some_and(|h| h.root_login());
-            if ro {
-                s.access = Access::Readonly;
-                if let Some(u) = s.until {
-                    s.root = Some(Root {
-                        since: s.created,
-                        until: Some(u),
-                        ask: false,
-                    });
-                }
-            } else {
-                s.access = Access::User;
-                if root_login {
-                    s.root = Some(Root {
-                        since: s.created,
-                        until: None,
-                        ask: false,
-                    });
+            };
+            let mut access = s.old_access.take().unwrap_or(Access::Admin);
+            let mut root = s.old_root.take();
+            if access == Access::Admin {
+                let h = self.hosts.get(&host);
+                let ro = h.is_some_and(|h| h.readonly.is_some());
+                let root_login = h.is_some_and(|h| h.root_login());
+                if ro {
+                    access = Access::Readonly;
+                    if let Some(u) = s.until {
+                        root = Some(Root {
+                            since: s.created,
+                            until: Some(u),
+                            ask: false,
+                        });
+                    }
+                } else {
+                    access = Access::User;
+                    if root_login {
+                        root = Some(Root {
+                            since: s.created,
+                            until: None,
+                            ask: false,
+                        });
+                    }
                 }
             }
             s.until = None;
+            if !s.on(&host) {
+                s.machines.insert(
+                    0,
+                    Machine {
+                        host,
+                        access,
+                        root,
+                        key_id: String::new(),
+                    },
+                );
+            }
         }
     }
 
@@ -522,26 +637,15 @@ impl State {
         Ok(())
     }
 
-    /// The hosts a space may reach right now: its own machine plus the
-    /// machines of the spaces it has an active bridge to, minus blocked ones.
+    /// The hosts a space may reach right now: its machines, minus blocked
+    /// ones.
     pub fn reachable_hosts<'a>(&'a self, space: &str, now: u64) -> Vec<(&'a str, &'a Host)> {
         let Some(s) = self.spaces.get(space) else {
             return Vec::new();
         };
-        let mut names: BTreeSet<&str> = BTreeSet::new();
-        names.insert(s.host.as_str());
-        for b in self
-            .bridges
+        s.machines
             .iter()
-            .filter(|b| b.from == space && b.active(now))
-        {
-            if let Some(t) = self.spaces.get(&b.to) {
-                names.insert(t.host.as_str());
-            }
-        }
-        names
-            .into_iter()
-            .filter_map(|n| self.hosts.get_key_value(n))
+            .filter_map(|m| self.hosts.get_key_value(&m.host))
             .filter(|(_, h)| !h.blocked(now))
             .map(|(n, h)| (n.as_str(), h))
             .collect()
@@ -550,14 +654,13 @@ impl State {
     /// How space `space` logs in to each machine it may reach now.
     ///
     /// A machine set up for it: its own logins there, `bt-<key>` (user, or
-    /// root through sudo) or `bt-<key>-ro`, by how far it goes now; through
-    /// a bridge always the read-only one. None until they are made.
+    /// root through sudo; with the machine's own key) or `bt-<key>-ro`, by
+    /// how far it goes there now. None until they are made.
     ///
     /// Any other machine: the machine's own logins, its shared read-only
-    /// one or blackthorn's (root, or a user's). A bridge takes the
-    /// read-only one if there is one. Nothing if the login it should have
-    /// is not there (a user login on a machine blackthorn reaches only as
-    /// root, which has none).
+    /// one or blackthorn's (root, or a user's). Nothing if the login it
+    /// should have is not there (a user login on a machine blackthorn
+    /// reaches only as root, which has none).
     pub fn logins<'a>(&'a self, space: &str, now: u64) -> Vec<Login<'a>> {
         let Some(s) = self.spaces.get(space) else {
             return Vec::new();
@@ -565,8 +668,8 @@ impl State {
         self.reachable_hosts(space, now)
             .into_iter()
             .filter_map(|(name, h)| {
-                let own = name == s.host;
-                let want = if own { s.tier(now) } else { Tier::ReadOnly };
+                let m = s.machine(name)?;
+                let want = m.tier(now);
                 if h.setup.is_some() {
                     let a = h.accounts.get(&s.key)?;
                     let tier = if a.full { want } else { Tier::ReadOnly };
@@ -576,10 +679,7 @@ impl State {
                             crate::paths::space_ro_key_file(&s.key),
                         )
                     } else {
-                        (
-                            crate::paths::unix_user(&s.key),
-                            crate::paths::space_key_file(&s.key),
-                        )
+                        (crate::paths::unix_user(&s.key), m.user_key(&s.key))
                     };
                     return Some(Login {
                         host: name,
@@ -587,7 +687,6 @@ impl State {
                         user,
                         key,
                         tier,
-                        bridged: !own,
                     });
                 }
                 let ro = h.readonly.as_ref().filter(|_| want == Tier::ReadOnly);
@@ -598,7 +697,6 @@ impl State {
                         user: u.clone(),
                         key: crate::paths::ro_key_file(name),
                         tier: Tier::ReadOnly,
-                        bridged: !own,
                     });
                 }
                 let tier = if h.root_login() {
@@ -606,9 +704,8 @@ impl State {
                 } else {
                     Tier::User
                 };
-                // Only a bridge falls back to more than it asked for, as
-                // before v0.12; a space gets no more than its tier.
-                if own && tier > want {
+                // A space gets no more than its tier.
+                if tier > want {
                     return None;
                 }
                 Some(Login {
@@ -617,10 +714,19 @@ impl State {
                     user: h.user.clone(),
                     key: crate::paths::key_file(name),
                     tier,
-                    bridged: !own,
                 })
             })
             .collect()
+    }
+
+    /// The space other than `except` that holds root on `host` now (root
+    /// on approval too): one at a time on a machine.
+    pub fn root_holder(&self, host: &str, except: &str, now: u64) -> Option<&str> {
+        self.spaces
+            .iter()
+            .filter(|(n, _)| n.as_str() != except)
+            .find(|(_, s)| s.machine(host).is_some_and(|m| m.rooted(now)))
+            .map(|(n, _)| n.as_str())
     }
 
     /// Lifts blocks whose time is up. Returns the hosts that were unblocked.
@@ -633,19 +739,6 @@ impl State {
             }
         }
         lifted
-    }
-
-    /// Removes bridges whose time is up. Returns them as "from -> to".
-    pub fn expire_bridges(&mut self, now: u64) -> Vec<String> {
-        let mut gone = Vec::new();
-        self.bridges.retain(|b| {
-            let keep = b.active(now);
-            if !keep {
-                gone.push(format!("{} -> {}", b.from, b.to));
-            }
-            keep
-        });
-        gone
     }
 
     pub fn space_by_key(&self, key: &str) -> Option<(&str, &Space)> {
@@ -669,10 +762,11 @@ impl State {
         }
     }
 
+    /// The spaces working on a machine.
     pub fn spaces_on(&self, host: &str) -> Vec<&str> {
         self.spaces
             .iter()
-            .filter(|(_, s)| s.host == host)
+            .filter(|(_, s)| s.on(host))
             .map(|(n, _)| n.as_str())
             .collect()
     }
@@ -794,24 +888,15 @@ mod tests {
     }
 
     pub fn space(host: &str) -> Space {
-        Space {
-            key: format!("k{host}"),
+        let mut s = Space::new(&format!("k{host}"), "claude", &format!("{host}-claude"), 0);
+        s.conversation = "7bb9dc88-2ec5-4933-90b6-b872466876b2".into();
+        s.machines.push(Machine {
             host: host.into(),
-            agent: "claude".into(),
-            mode: Mode::Server,
-            remote_control: true,
-            rc_name: format!("{host}-claude"),
-            dir: format!("{host}-claude"),
-            conversation: "7bb9dc88-2ec5-4933-90b6-b872466876b2".into(),
-            args: vec![],
-            created: 0,
             access: Access::User,
             root: None,
-            until: None,
-            title: None,
-            owner: None,
-            shares: BTreeMap::new(),
-        }
+            key_id: String::new(),
+        });
+        s
     }
 
     fn forever() -> Option<Block> {
@@ -836,6 +921,8 @@ mod tests {
         assert!(validate_rc_name("ops hub").is_err());
         assert!(validate_remote_user("frakw").is_ok());
         assert!(validate_remote_user("-oProxyCommand=x").is_err());
+        assert_eq!(and_list(&["a", "b", "c"]), "a, b and c");
+        assert_eq!(and_list(&["a"]), "a");
     }
 
     #[test]
@@ -860,103 +947,68 @@ mod tests {
     }
 
     #[test]
-    fn a_space_reaches_its_host_and_bridged_hosts() {
+    fn a_space_reaches_its_machines() {
         let mut st = State::default();
         st.hosts.insert("fig".into(), host(None));
         st.hosts.insert("nas".into(), host(None));
         st.hosts.insert("pine".into(), host(forever()));
-        st.spaces.insert("fig-claude".into(), space("fig"));
+        let mut s = space("fig");
+        s.machines.push(Machine::new("nas", Access::Readonly));
+        s.machines.push(Machine::new("pine", Access::User));
+        st.spaces.insert("ops".into(), s);
         st.spaces.insert("nas-claude".into(), space("nas"));
-        st.spaces.insert("pine-claude".into(), space("pine"));
-        let names = |st: &State, s: &str, now| -> Vec<String> {
-            st.reachable_hosts(s, now)
+        let names = |st: &State, s: &str| -> Vec<String> {
+            st.reachable_hosts(s, 5)
                 .into_iter()
                 .map(|(n, _)| n.to_string())
                 .collect()
         };
-        assert_eq!(names(&st, "fig-claude", 5), vec!["fig"]);
-        assert!(names(&st, "pine-claude", 5).is_empty(), "blocked");
-        assert!(names(&st, "gone", 5).is_empty());
-
-        st.bridges.push(Bridge {
-            from: "fig-claude".into(),
-            to: "nas-claude".into(),
-            since: 0,
-            until: Some(100),
-        });
-        st.bridges.push(Bridge {
-            from: "fig-claude".into(),
-            to: "pine-claude".into(),
-            since: 0,
-            until: None,
-        });
-        assert_eq!(names(&st, "fig-claude", 5), vec!["fig", "nas"]);
-        assert_eq!(
-            names(&st, "nas-claude", 5),
-            vec!["nas"],
-            "bridges are one-way"
-        );
-        assert_eq!(names(&st, "fig-claude", 100), vec!["fig"], "expired");
-        assert_eq!(st.expire_bridges(100), vec!["fig-claude -> nas-claude"]);
-        assert_eq!(st.bridges.len(), 1);
+        assert_eq!(names(&st, "ops"), vec!["fig", "nas"], "pine is blocked");
+        assert_eq!(names(&st, "nas-claude"), vec!["nas"]);
+        assert!(names(&st, "gone").is_empty());
+        assert_eq!(st.spaces_on("nas"), vec!["nas-claude", "ops"]);
+        assert_eq!(st.spaces["ops"].hosts_text(), "fig, nas and pine");
     }
 
     #[test]
-    fn logins_follow_access_and_bridges() {
+    fn logins_follow_each_machines_access() {
         // Machines not set up: their own logins.
         let mut st = State::default();
         st.hosts.insert("fig".into(), host(None));
         let mut nas = host(None);
         nas.readonly = Some("blackthorn".into());
         st.hosts.insert("nas".into(), nas);
-        st.spaces.insert("fig-claude".into(), space("fig"));
-        let mut ro = space("nas");
-        ro.access = Access::Readonly;
-        st.spaces.insert("nas-ro".into(), ro);
-        st.spaces.insert("nas-user".into(), space("nas"));
-        st.bridges.push(Bridge {
-            from: "fig-claude".into(),
-            to: "nas-user".into(),
-            since: 0,
-            until: None,
-        });
-        let l = st.logins("fig-claude", 5);
+        let mut s = space("fig");
+        s.machines.push(Machine::new("nas", Access::Readonly));
+        st.spaces.insert("ops".into(), s);
+        let l = st.logins("ops", 5);
         assert_eq!(l.len(), 2);
         assert_eq!(
             (l[0].host, l[0].user.as_str(), l[0].tier),
             ("fig", "frakw", Tier::User)
         );
         assert_eq!(
-            (l[1].host, l[1].user.as_str(), l[1].tier, l[1].bridged),
-            ("nas", "blackthorn", Tier::ReadOnly, true),
-            "a bridge reaches the read-only login"
+            (l[1].host, l[1].user.as_str(), l[1].tier),
+            ("nas", "blackthorn", Tier::ReadOnly)
         );
-        let l = st.logins("nas-ro", 5);
-        assert_eq!(
-            (l[0].user.as_str(), l[0].tier),
-            ("blackthorn", Tier::ReadOnly)
-        );
-        assert_eq!(st.logins("nas-user", 5)[0].user, "frakw");
         st.hosts.get_mut("nas").unwrap().readonly = None;
-        assert!(st.logins("nas-ro", 5).is_empty(), "no read-only login left");
+        assert_eq!(
+            st.logins("ops", 5).len(),
+            1,
+            "no read-only login left on nas"
+        );
 
         // Reached as root only: no user login there, root for root.
         st.hosts.get_mut("fig").unwrap().user = "root".into();
-        let own = |st: &State, t| {
-            st.logins("fig-claude", t)
-                .into_iter()
-                .filter(|l| !l.bridged)
-                .count()
-        };
-        assert_eq!(own(&st, 5), 0);
-        st.spaces.get_mut("fig-claude").unwrap().root = Some(Root {
+        assert!(st.logins("ops", 5).is_empty());
+        st.spaces.get_mut("ops").unwrap().machines[0].root = Some(Root {
             since: 0,
             until: Some(10),
             ask: false,
         });
-        let l = st.logins("fig-claude", 5);
+        let l = st.logins("ops", 5);
         assert_eq!((l[0].user.as_str(), l[0].tier), ("root", Tier::Root));
-        assert_eq!(own(&st, 10), 0, "root ran out");
+        assert!(st.logins("ops", 10).is_empty(), "root ran out");
     }
 
     #[test]
@@ -970,89 +1022,148 @@ mod tests {
         st.hosts.insert("nas".into(), nas);
         let mut s = space("fig");
         s.key = "a1b2c3d4".into();
-        st.spaces.insert("fig-claude".into(), s);
-        st.spaces.insert("nas-claude".into(), space("nas"));
-        st.bridges.push(Bridge {
-            from: "fig-claude".into(),
-            to: "nas-claude".into(),
-            since: 0,
-            until: None,
-        });
-        assert!(st.logins("fig-claude", 5).is_empty(), "not made yet");
-        st.hosts.get_mut("fig").unwrap().accounts.insert(
-            "a1b2c3d4".into(),
-            Account {
-                full: true,
-                srv: Some("fig-claude".into()),
-            },
-        );
-        st.hosts
-            .get_mut("nas")
-            .unwrap()
-            .accounts
-            .insert("a1b2c3d4".into(), Account::default());
-        let l = st.logins("fig-claude", 5);
+        let mut m = Machine::new("nas", Access::Readonly);
+        m.key_id = "0f0f0f0f".into();
+        s.machines.push(m);
+        st.spaces.insert("ops".into(), s);
+        assert!(st.logins("ops", 5).is_empty(), "not made yet");
+        for h in ["fig", "nas"] {
+            st.hosts.get_mut(h).unwrap().accounts.insert(
+                "a1b2c3d4".into(),
+                Account {
+                    full: true,
+                    srv: Some("ops".into()),
+                },
+            );
+        }
+        let l = st.logins("ops", 5);
         assert_eq!((l[0].user.as_str(), l[0].tier), ("bt-a1b2c3d4", Tier::User));
-        assert!(l[0].key.ends_with("spaces/a1b2c3d4"));
+        assert!(l[0].key.ends_with("spaces/a1b2c3d4"), "the key of before");
         assert_eq!(
-            (l[1].user.as_str(), l[1].tier, l[1].bridged),
-            ("bt-a1b2c3d4-ro", Tier::ReadOnly, true)
+            (l[1].user.as_str(), l[1].tier),
+            ("bt-a1b2c3d4-ro", Tier::ReadOnly)
         );
         assert!(l[1].key.ends_with("spaces/a1b2c3d4-ro"));
 
-        let s = st.spaces.get_mut("fig-claude").unwrap();
-        s.access = Access::Readonly;
-        let l = st.logins("fig-claude", 5);
-        assert_eq!(l[0].user, "bt-a1b2c3d4-ro");
-        st.spaces.get_mut("fig-claude").unwrap().root = Some(Root {
+        // Each machine its own: root on nas only.
+        st.spaces.get_mut("ops").unwrap().machines[1].root = Some(Root {
             since: 0,
             until: None,
             ask: false,
         });
-        let l = st.logins("fig-claude", 5);
+        let l = st.logins("ops", 5);
+        assert_eq!(l[0].tier, Tier::User, "fig stays a user");
         assert_eq!(
-            (l[0].user.as_str(), l[0].tier),
+            (l[1].user.as_str(), l[1].tier),
             ("bt-a1b2c3d4", Tier::Root),
             "root is the user login with sudo"
         );
-        assert_eq!(l[1].tier, Tier::ReadOnly, "a bridge stays read-only");
+        assert!(
+            l[1].key.ends_with("spaces/a1b2c3d4.0f0f0f0f"),
+            "with nas's own key"
+        );
+        assert_eq!(st.root_holder("nas", "other", 5), Some("ops"));
+        assert_eq!(st.root_holder("nas", "ops", 5), None);
+        assert_eq!(st.root_holder("fig", "other", 5), None);
     }
 
     #[test]
-    fn admin_spaces_of_before_become_root() {
-        let mut st = State::default();
-        let mut fig = host(None);
-        fig.user = "root".into();
-        st.hosts.insert("fig".into(), fig);
-        let mut nas = host(None);
-        nas.user = "root".into();
-        nas.readonly = Some("blackthorn".into());
-        st.hosts.insert("nas".into(), nas);
-        st.hosts.insert("mac".into(), host(None));
-        for (n, h, until) in [
-            ("fig-claude", "fig", None),
-            ("nas-admin", "nas", Some(500)),
-            ("nas-idle", "nas", None),
-            ("mac-claude", "mac", None),
-        ] {
-            let mut s = space(h);
-            s.access = Access::Admin;
-            s.until = until;
-            st.spaces.insert(n.into(), s);
-        }
-        st.upgrade();
+    fn spaces_of_before_get_their_machine() {
+        let text = r#"
+[hosts.fig]
+address = "100.80.0.3"
+port = 22
+user = "root"
+
+[hosts.nas]
+address = "100.80.0.4"
+port = 22
+user = "root"
+readonly = "blackthorn"
+
+[hosts.mac]
+address = "100.80.0.5"
+port = 22
+user = "frakw"
+
+[spaces.fig-claude]
+key = "k1"
+host = "fig"
+agent = "claude"
+rc_name = "fig-claude"
+conversation = "c"
+created = 1
+access = "user"
+root = { since = 5, until = 900, ask = true }
+
+[spaces.fig-admin]
+key = "k2"
+host = "fig"
+agent = "claude"
+rc_name = "fig-admin"
+conversation = "c"
+created = 1
+access = "admin"
+
+[spaces.nas-admin]
+key = "k3"
+host = "nas"
+agent = "claude"
+rc_name = "nas-admin"
+conversation = "c"
+created = 1
+access = "admin"
+until = 500
+
+[spaces.mac-claude]
+key = "k4"
+host = "mac"
+agent = "claude"
+rc_name = "mac-claude"
+conversation = "c"
+created = 1
+
+[[bridges]]
+from = "fig-claude"
+to = "nas-admin"
+since = 1
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        std::fs::write(&path, text).unwrap();
+        let st = State::load(&path).unwrap();
         let get = |n: &str| {
             let s = &st.spaces[n];
-            (s.access, s.root.as_ref().map(|r| r.until), s.until)
+            assert_eq!(s.machines.len(), 1);
+            let m = &s.machines[0];
+            assert!(m.key_id.is_empty(), "keeps its key");
+            (
+                m.host.clone(),
+                m.access,
+                m.root.as_ref().map(|r| (r.until, r.ask)),
+            )
         };
-        assert_eq!(get("fig-claude"), (Access::User, Some(None), None));
-        assert_eq!(get("nas-admin"), (Access::Readonly, Some(Some(500)), None));
-        assert_eq!(get("nas-idle"), (Access::Readonly, None, None));
+        assert_eq!(
+            get("fig-claude"),
+            ("fig".into(), Access::User, Some((Some(900), true)))
+        );
+        assert_eq!(
+            get("fig-admin"),
+            ("fig".into(), Access::User, Some((None, false)))
+        );
+        assert_eq!(
+            get("nas-admin"),
+            ("nas".into(), Access::Readonly, Some((Some(500), false)))
+        );
         assert_eq!(
             get("mac-claude"),
-            (Access::User, None, None),
+            ("mac".into(), Access::User, None),
             "frakw is no root"
         );
+        st.save(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("bridges"), "bridges are gone");
+        assert_eq!(State::load(&path).unwrap(), st);
     }
 
     #[test]
@@ -1099,13 +1210,9 @@ mod tests {
                 reason: Some("x".into()),
             })),
         );
-        st.spaces.insert("basil-claude".into(), space("basil"));
-        st.bridges.push(Bridge {
-            from: "basil-claude".into(),
-            to: "basil-claude".into(),
-            since: 1,
-            until: None,
-        });
+        let mut s = space("basil");
+        s.machines.push(Machine::new("nas", Access::Readonly));
+        st.spaces.insert("basil-claude".into(), s);
         st.save(&path).unwrap();
         assert_eq!(State::load(&path).unwrap(), st);
         use std::os::unix::fs::PermissionsExt;

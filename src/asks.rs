@@ -177,7 +177,7 @@ pub fn decide(id: &str, approve: bool, by: &str, reason: &str) -> Result<Ask> {
         // Only while the space still has root on approval there.
         let ok = state
             .space_by_key(&a.key)
-            .is_some_and(|(_, s)| s.host == a.host && s.asks(now()));
+            .is_some_and(|(_, s)| s.machine(&a.host).is_some_and(|m| m.asks(now())));
         if !ok {
             bail!("{} no longer has root on approval on {}", a.space, a.host);
         }
@@ -241,7 +241,12 @@ fn wanted(state: &State, t: u64) -> BTreeMap<String, Host> {
         .hosts
         .iter()
         .filter(|(_, h)| h.setup_version >= logins::SETUP_VERSION && !h.blocked(t))
-        .filter(|(n, _)| state.spaces.values().any(|s| s.host == **n && s.asks(t)))
+        .filter(|(n, _)| {
+            state
+                .spaces
+                .values()
+                .any(|s| s.machine(n).is_some_and(|m| m.asks(t)))
+        })
         .map(|(n, h)| (n.clone(), h.clone()))
         .collect()
 }
@@ -423,7 +428,7 @@ fn asked(
     let key = user.strip_prefix("bt-").unwrap_or("");
     let space = state
         .space_by_key(key)
-        .filter(|(_, s)| s.host == host && s.asks(now()))
+        .filter(|(_, s)| s.machine(host).is_some_and(|m| m.asks(now())))
         .map(|(n, _)| n.to_string());
     let cmd = String::from_utf8_lossy(cmd).to_string();
     let Some(space) = space else {

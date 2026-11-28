@@ -9,8 +9,8 @@ issue.
 - **The managed machines**, from actions you did not intend.
 - **The hub's secrets**: the Claude sign-in of each space, the SSH private
   keys for the managed machines, and the web UI's accounts.
-- **Isolation between spaces**: work on one machine should not spill onto
-  another.
+- **Isolation between spaces**: what one space does should not spill
+  onto machines it was not given.
 - **The hub itself**, from the machines it manages: they must have no way
   back.
 
@@ -55,9 +55,10 @@ they are enforced by the kernel or by what the space has, not by the model.
 | Control | Mechanism |
 |---|---|
 | Spaces are separated | Each space is its own Unix user with its own home (mode 0700). |
-| A space reaches only its machine | nftables rules match the space's uid and allow only the IP and SSH port of its machine (and of machines it has an active bridge to) while not blocked, plus DNS and HTTPS. Everything else is rejected. |
-| Blocks and bridge ends are immediate | There is no "established connections are allowed" rule for spaces, so packets on open connections are rejected too. Keys are removed from agents at the same time. Timed blocks and bridges end within a minute of their time. |
-| Bridges are one-way | A bridge from A to B gives A's user B's machine; B's user gains nothing. |
+| A space reaches only its machines | nftables rules match the space's uid and allow only the IP and SSH port of each of its machines while not blocked, plus DNS and HTTPS. Everything else is rejected. Only hub admins add a machine to a space. |
+| Blocks and taking a machine away are immediate | There is no "established connections are allowed" rule for spaces, so packets on open connections are rejected too. Keys are removed from agents at the same time. Timed blocks end within a minute of their time. |
+| Each machine gets only the login it was given | A space's user key is per machine, and its agent holds one only while the space may log in there as a user or root; on a machine where it is read-only it holds only its read-only key, which logs in as nothing more. |
+| One space at a time has root on a machine | Giving root (for a time, forever or on approval) is refused while another space has it there, unless taken over on purpose, which takes it from the other first. |
 | Managed machines cannot reach the hub | The hub's input rules drop every connection from a managed machine (and from `never_manage`/`deny_from` addresses), and note who tried, for notifications. Replies to the hub's own SSH connections still arrive. blackthorn refuses to manage an address listed in `inbound.admin_from` or the address you are connected from. |
 | Admin ports only from your devices | If `inbound.admin_from` is set, only those addresses may reach SSH and the web UI. |
 | Spaces never see private keys | Keys are root-only files. Root loads them into the space's ssh-agent, which marks itself non-dumpable so the space user cannot read its memory. |
@@ -68,7 +69,7 @@ they are enforced by the kernel or by what the space has, not by the model.
 | Spaces cannot change the system | systemd sandbox: `ProtectSystem=strict`, `ProtectHome`, `NoNewPrivileges`, `PrivateTmp`, `RestrictSUIDSGID`, and more. |
 | Without the firewall, nothing runs | Space units require the firewall unit, and stopping the firewall unit leaves its rules loaded. |
 | The web UI's network side has no power | The HTTP listener runs as the unprivileged `blackthorn-web` user in a tight systemd sandbox, with no access to blackthorn's files. It forwards requests to a root API on a Unix socket, which accepts only that user, checks the password (Argon2id) and TOTP code itself, keeps the sessions, and enforces the CSRF value. A compromised web process can act only through a session a user has logged in to. |
-| Logins resist guessing | Password and TOTP are both needed; each code works once; five failures lock the account and the address for 15 minutes. Deleting spaces, removing machines, moving them, renaming anything, opening bridges, accepting new host keys, changing settings or notifications, updating blackthorn, giving a space root, raising a space's usual login, setting a machine up and changing your password or authenticator need a fresh code. A new authenticator replaces the old one only after a code made from it is accepted; password and authenticator changes end your other logins. Accounts are created and removed only on the hub's command line. Passkeys must verify the user (PIN or biometrics) and are checked for the hub's name and origin, a one-time challenge, the signature and a growing counter. |
+| Logins resist guessing | Password and TOTP are both needed; each code works once; five failures lock the account and the address for 15 minutes. Deleting spaces, removing machines, moving them, renaming anything, adding machines to spaces, accepting new host keys, changing settings or notifications, updating blackthorn, giving a space root, raising a space's usual login, setting a machine up and changing your password or authenticator need a fresh code. A new authenticator replaces the old one only after a code made from it is accepted; password and authenticator changes end your other logins. Accounts are created and removed only on the hub's command line. Passkeys must verify the user (PIN or biometrics) and are checked for the hub's name and origin, a one-time challenge, the signature and a growing counter. |
 | Account secrets do not linger | The terminal that showed a new account's QR code and recovery codes is cleared, scrollback included, once you have written them down. |
 | Root does not follow a space's links | Listing, naming and deleting chats reads and writes files in the space's home as root; it skips symbolic links, opens transcripts with `O_NOFOLLOW`, and acts only on files the space user owns. Generated files (such as CLAUDE.md in the space's own work folder) are written through a temporary file created anew (`O_EXCL`), owned and set by its descriptor, so a link planted at that name is never followed (before v0.6 it was). |
 | Web pages are hard to abuse | SameSite=Strict, HttpOnly session cookie; a CSRF value on every form; a CSP that allows no inline script or third-party resource; a small HTTP parser with size, time and connection limits. |
@@ -76,7 +77,7 @@ they are enforced by the kernel or by what the space has, not by the model.
 | Tailscale from the web | Installing Tailscale, signing in and its web interface need a fresh authenticator code. The installer is Tailscale's own, over HTTPS. Its web interface (port 5252) counts as an admin port: with `inbound.admin_from` set, only those addresses reach it, and managed machines never do. While it is off, the hub's firewall drops connections to that port too, since `tailscale set --webclient=false` does not always stop it. |
 | Typing into chats from the web | A chat's page shows its transcript to anyone logged in; typing into it, pressing Stop or answering Claude's questions, and adding files need this browser to be unlocked with the password and a code again (a separate HttpOnly cookie, listed with the logins and ended the same way). Messages go to the chat's tmux window as a paste and Enter, as at its terminal; nothing is typed while the screen shows Claude asking a question, and an answer is only a number the question offers, pressed by you. Files are written by the space's own user into `.uploads` in its folder. |
 | Logins can be seen and ended | The account page lists each login and chat unlock with its browser, system and address, and ends any of them. They are kept by the SHA-256 of their tokens in a root-only file, so a restart keeps them and the file gives none away; they last `web.session_hours` (24) at most, and logins end after `web.idle_minutes` (30) unused unless `web.idle_logout` is turned off. |
-| Shared spaces stay within their share | Accounts that are not hub admins see and act on only the spaces they own or that are shared with them, at the level shared (view, use, manage); the root API checks this for every request, and filters what the map and lists show. Machines, bridges to spaces they may not manage, settings, Tailscale, updates and accounts are for hub admins. Sharing or giving away a space needs a fresh code. Messages typed into chats from the hub, answers and files are logged with the account. A hub admin, like root, can see everything: sharing does not protect accounts from them. |
+| Shared spaces stay within their share | Accounts that are not hub admins see and act on only the spaces they own or that are shared with them, at the level shared (view, use, manage); the root API checks this for every request, and filters what the map and lists show. Machines, adding machines to spaces, settings, Tailscale, updates and accounts are for hub admins. Sharing or giving away a space needs a fresh code. Messages typed into chats from the hub, answers and files are logged with the account. A hub admin, like root, can see everything: sharing does not protect accounts from them. |
 | SSH changes cannot lock you out | `thorn harden ssh` checks your authenticator first, validates sshd's configuration, and undoes itself unless you confirm from a new login. |
 
 ## What blackthorn does not protect against
@@ -94,9 +95,13 @@ Know these before you rely on it.
    space): give each its own key with only the permissions it needs, so it
    can be revoked alone.
 
-2. **A bridge makes one trust zone.** While space A has a bridge to B's
-   machine, injected text from either machine can drive A's actions on the
-   other. Keep bridges short, and between machines you trust alike.
+2. **A space's machines are one trust zone.** Injected text from any of a
+   space's machines can drive what it does on the others, as far as its
+   login on each goes. Give a space several machines only where you trust
+   them alike, and more than read-only only where it must change things.
+   Chats of the same space (and spaces with user logins) can work on a
+   machine at the same time; only root is held by one space at a time, and
+   the agents are asked, not forced, to look at what else ran there first.
 
 3. **A space can do anything its remote user can.** blackthorn decides
    *whether* a space reaches a machine; the login decides *what* it does

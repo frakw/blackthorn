@@ -214,13 +214,19 @@ hub runuser -u "bt-$k1" -- ln -s /etc/shadow "/var/lib/blackthorn/spaces/$k1/t1-
 thorn apply >/dev/null
 hub sh -c 'head -1 /etc/shadow | grep -q "^root:"' && [ "$(hub stat -c %U /etc/shadow)" = root ] && ok "a link planted where root writes CLAUDE.md is not followed" || fail "/etc/shadow was touched through a planted link"
 
-say "bridges are one-way and end at once"
-thorn bridge add t1-claude t2-claude --for 1h >/dev/null
+say "a space on two machines"
+out=$(thorn connect t1-claude t2 2>&1) && fail "read-only on a machine without such a login: $out" || ok "no read-only login on t2 yet: refused"
+thorn connect t1-claude t2 --access user | grep -q "works on t2 too" && ok "thorn connect adds a machine" || fail "connect"
 expect_reach 15 t1-claude t2 ok
 expect_reach 5 t2-claude t1 FAIL
-hub grep -q 'temporary bridge' "/var/lib/blackthorn/spaces/$k1/t1-claude/CLAUDE.md" && ok "CLAUDE.md lists the bridged machine" || fail "CLAUDE.md lists the bridged machine"
-thorn bridge rm t1-claude t2-claude >/dev/null
+hub grep -q 'works on the machines `t1` and `t2`' "/var/lib/blackthorn/spaces/$k1/t1-claude/CLAUDE.md" && ok "CLAUDE.md lists both machines" || fail "CLAUDE.md lists both machines"
+thorn ls | grep "^t1-claude " | grep -q "t1,t2" && ok "thorn ls lists both" || fail "ls machines: $(thorn ls)"
+web_get /space/t1-claude | grep -q 'id="machines"' && ok "the space page has a Machines card" || fail "machines card"
+out=$(thorn access t1-claude user 2>&1) && fail "access without --host on two machines: $out" || ok "access asks which machine"
+echo "$out" | grep -q -- "--host" && ok "and says how" || fail "access hint: $out"
+thorn disconnect t1-claude t2 | grep -q "no longer works on t2" && ok "thorn disconnect" || fail "disconnect"
 expect_reach 10 t1-claude t2 FAIL
+out=$(thorn disconnect t1-claude t1 2>&1) && fail "took a space's only machine: $out" || ok "a space keeps its last machine"
 
 say "web: block and unblock a machine; harmful actions need a fresh code"
 r=$(web_post /host/t2/block --data-urlencode "csrf=$C" --data-urlencode "duration=15m" --data-urlencode "reason=from the web")
@@ -590,7 +596,7 @@ thorn ls | grep "^t1-dev " | grep -q "root (" && ok "thorn ls shows root and its
 thorn root t1-dev --off | grep -q "no root" && ok "thorn root --off" || fail "root off"
 docker exec "$P-t1" test -e "/etc/sudoers.d/bt-$kd-root" && fail "the sudo rule stayed" || ok "its sudo rule is gone"
 if hub runuser -u "bt-$kd" -- ssh t1 'sudo -n true' 2>/dev/null; then fail "sudo still works"; else ok "and sudo no longer works"; fi
-thorn access t1-dev read-only | grep -q "now logs in as read-only" && ok "thorn access read-only, at once" || fail "access ro"
+thorn access t1-dev read-only | grep -q "now logs in to t1 as read-only" && ok "thorn access read-only, at once" || fail "access ro"
 [ "$(hub runuser -u "bt-$kd" -- ssh t1 id -un 2>/dev/null)" = "bt-$kd-ro" ] && ok "ssh t1 is now bt-$kd-ro" || fail "ro login: $(hub runuser -u "bt-$kd" -- ssh t1 id -un 2>&1)"
 hub runuser -u "bt-$kd" -- ssh t1 'ls /srv/t1-dev' >/dev/null 2>&1 && ok "read-only reads its folder" || fail "ro read /srv"
 if hub runuser -u "bt-$kd" -- ssh t1 'touch /srv/t1-dev/y' 2>/dev/null; then fail "read-only wrote to its folder"; else ok "but does not write it"; fi
@@ -648,6 +654,8 @@ case "$r" in *"fresh%20code"*) ok "going up to user needs a code";; *) fail "acc
 r=$(web_post /space/t1-dev/root --data-urlencode "csrf=$C" --data-urlencode "root_for=1h")
 case "$r" in *"fresh%20code"*) ok "root needs a code";; *) fail "root without a code: $r";; esac
 thorn root t1-dev --for 1m | grep -q "has root on t1 until" && ok "thorn root --for" || fail "root for"
+out=$(thorn root t1-ro --for 1h 2>&1) && fail "two spaces with root on t1: $out" || ok "one space at a time has root on a machine"
+echo "$out" | grep -q "t1-dev has root on t1" && ok "it says who has it" || fail "root holder: $out"
 [ "$(hub runuser -u "bt-$kd" -- ssh t1 id -un 2>/dev/null)" = "bt-$kd" ] && ok "root goes through its user login" || fail "root login"
 web_get /space/t1-dev | grep -q "Revoke root" && ok "the space page offers to revoke root" || fail "no revoke button"
 web_get /host/t1 | grep -q "logins of its own" && ok "the machine page lists the spaces' logins" || fail "host page logins"
@@ -679,7 +687,7 @@ hub tail -1 "/var/lib/blackthorn/spaces/$k2/fake-claude.args" | grep -Eq -- "--n
 web_get /chats | grep -q 'href="/space/t2-claude/chat/' && ok "the Chats page lists chats, with their space" || fail "chats page: $(web_get /chats | head -c 600)"
 web_get /chats | grep -q 'action="/chats"' && ok "and starts new ones" || fail "no new chat form"
 r=$(admin curl -s -o /dev/null -w '%{redirect_url}' -b /tmp/jar "http://$HUB:7180/bridges")
-case "$r" in *"/spaces#bridges") ok "bridges moved to the Spaces page";; *) fail "bridges redirect: $r";; esac
+case "$r" in *"/spaces") ok "the old bridges page goes to Spaces";; *) fail "bridges redirect: $r";; esac
 
 echo "   waiting for t1-dev's root to run out (tick runs every minute)..."
 for _ in $(seq 75); do docker exec "$P-t1" test -e "/etc/sudoers.d/bt-$kd-root" || break; sleep 2; done

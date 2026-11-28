@@ -1,5 +1,5 @@
 //! thorn new / rm / rename / start / stop / restart / attach / login / ls /
-//! bridge: the CLI side of the space operations in `ops`.
+//! connect / disconnect: the CLI side of the space operations in `ops`.
 
 use crate::ops::{self, Action, NewSpace};
 use crate::{ctx, paths, sys};
@@ -13,25 +13,27 @@ pub fn new(o: NewSpace) -> Result<()> {
     let (_, state) = ctx::read_only()?;
     let s = state.space(&name)?;
     let t = crate::state::now();
+    let m = s.machines.first().context("the space has no machine")?;
     println!(
         "created space {name}: {} on {}, logs in as {} (Remote Control name {}, user {})",
         s.agent,
-        s.host,
-        s.tier(t),
+        m.host,
+        m.tier(t),
         s.rc_name,
         paths::unix_user(&s.key)
     );
-    match &s.root {
+    match &m.root {
         Some(r) if r.active(t) => match r.until {
             Some(u) => println!(
                 "it has root there until {} UTC, then logs in as {}",
                 ops::rfc3339(u),
-                s.access
+                m.access
             ),
             None => println!("it has root there until taken back: sudo thorn root {name} --off"),
         },
         _ => {}
     }
+    println!("to let it work on more machines: sudo thorn connect {name} HOST");
     for n in &done.notes {
         println!("note: {n}");
     }
@@ -204,30 +206,47 @@ pub fn ls() -> Result<()> {
     }
     let mut rows = vec![vec![
         "NAME".to_string(),
-        "HOST".into(),
+        "MACHINES".into(),
         "AGENT".into(),
-        "LOGIN".into(),
+        "LOGINS".into(),
         "STATE".into(),
         "REMOTE CONTROL".into(),
         "CAN REACH".into(),
         "MEMORY".into(),
     ]];
     for s in &o.spaces {
+        let logins: Vec<String> = s
+            .machines
+            .iter()
+            .map(|m| {
+                let how = match &m.root {
+                    Some(r) if r.ask => format!("{}, root on approval", m.access),
+                    Some(r) => match r.until {
+                        Some(u) => format!(
+                            "root ({} left), then {}",
+                            ops::describe_left(u, crate::state::now()),
+                            m.access
+                        ),
+                        None => "root".into(),
+                    },
+                    None => m.access.to_string(),
+                };
+                if s.machines.len() == 1 {
+                    how
+                } else {
+                    format!("{}: {how}", m.host)
+                }
+            })
+            .collect();
         rows.push(vec![
             s.name.clone(),
-            s.host.clone(),
+            s.machines
+                .iter()
+                .map(|m| m.host.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
             agent_label(&s.agent, s.mode),
-            match &s.root {
-                Some(r) => match r.until {
-                    Some(u) => format!(
-                        "root ({} left), then {}",
-                        ops::describe_left(u, crate::state::now()),
-                        s.access
-                    ),
-                    None => "root".into(),
-                },
-                None => s.access.to_string(),
-            },
+            logins.join("; "),
             s.state.clone(),
             s.rc_name.clone(),
             if s.reachable.is_empty() {
@@ -250,61 +269,6 @@ pub fn agent_label(agent: &str, mode: crate::state::Mode) -> String {
     } else {
         agent.to_string()
     }
-}
-
-pub fn bridge_add(from: &str, to: &str, duration: Option<&str>, permanent: bool) -> Result<()> {
-    let secs = if permanent {
-        None
-    } else {
-        Some(ops::parse_duration(duration.unwrap_or("1h"))?)
-    };
-    let b = ops::bridge_add(from, to, secs)?;
-    let (_, state) = ctx::read_only()?;
-    let host = state.space(to)?.host.clone();
-    match b.until {
-        Some(u) => println!(
-            "bridge up: {from} can reach {host} until {} (removed automatically)",
-            ops::rfc3339(u)
-        ),
-        None => {
-            println!("bridge up: {from} can reach {host} until: sudo thorn bridge rm {from} {to}")
-        }
-    }
-    println!(
-        "while it lasts, {} and {host} are one trust zone for {from}'s chats",
-        state.space(from)?.host
-    );
-    Ok(())
-}
-
-pub fn bridge_rm(from: &str, to: &str) -> Result<()> {
-    ops::bridge_rm(from, to)?;
-    println!("bridge removed; open connections from {from} to {to}'s machine were cut");
-    Ok(())
-}
-
-pub fn bridge_ls() -> Result<()> {
-    let o = ops::overview(false)?;
-    if o.bridges.is_empty() {
-        println!("no bridges");
-        return Ok(());
-    }
-    let mut rows = vec![vec![
-        "FROM".to_string(),
-        "TO".into(),
-        "REACHES".into(),
-        "LASTS".into(),
-    ]];
-    for b in &o.bridges {
-        rows.push(vec![
-            b.from.clone(),
-            b.to.clone(),
-            b.host.clone(),
-            b.remaining.clone(),
-        ]);
-    }
-    print_table(&rows);
-    Ok(())
 }
 
 pub fn print_table(rows: &[Vec<String>]) {
@@ -445,13 +409,31 @@ pub fn chat_open(space: &str, id: Option<&str>, title: Option<&str>) -> Result<(
     Ok(())
 }
 
-pub fn login_as(name: &str, access: crate::state::Access) -> Result<()> {
-    println!("{}", ops::space_login(name, access)?);
+pub fn login_as(name: &str, host: Option<&str>, access: crate::state::Access) -> Result<()> {
+    println!("{}", ops::space_login(name, host, access)?);
     Ok(())
 }
 
-/// thorn root SPACE --for 8h | --forever | --ask | --off
-pub fn root(name: &str, duration: Option<&str>, forever: bool, ask: bool, off: bool) -> Result<()> {
+pub fn connect(name: &str, host: &str, access: Option<crate::state::Access>) -> Result<()> {
+    println!("{}", ops::space_connect(name, host, access)?);
+    Ok(())
+}
+
+pub fn disconnect(name: &str, host: &str) -> Result<()> {
+    println!("{}", ops::space_disconnect(name, host)?);
+    Ok(())
+}
+
+/// thorn root SPACE [--host H] [--take] --for 8h | --forever | --ask | --off
+pub fn root(
+    name: &str,
+    host: Option<&str>,
+    take: bool,
+    duration: Option<&str>,
+    forever: bool,
+    ask: bool,
+    off: bool,
+) -> Result<()> {
     let root = if off {
         None
     } else if ask {
@@ -464,7 +446,7 @@ pub fn root(name: &str, duration: Option<&str>, forever: bool, ask: bool, off: b
             None => ops::parse_root("8h")?,
         }
     };
-    println!("{}", ops::space_root(name, root)?);
+    println!("{}", ops::space_root(name, host, root, take)?);
     Ok(())
 }
 

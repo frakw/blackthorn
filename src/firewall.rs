@@ -6,12 +6,12 @@
 //!   - to loopback,
 //!   - DNS to the configured nameservers,
 //!   - HTTPS anywhere (if enabled; Claude Code needs Anthropic),
-//!   - to the address and SSH port of each host it may reach (its own
-//!     machine, and bridged ones) that is not blocked.
+//!   - to the address and SSH port of each of its machines that is not
+//!     blocked.
 //!
 //! Everything else is rejected. There is deliberately no "established
-//! connections are fine" rule there: when a host is blocked or a bridge
-//! ends, packets on connections already open to it are rejected too, so the
+//! connections are fine" rule there: when a host is blocked or taken
+//! from a space, packets on connections already open to it are rejected too, so the
 //! cut is immediate.
 //!
 //! Input: managed machines (and `never_manage`/`deny_from` addresses) can

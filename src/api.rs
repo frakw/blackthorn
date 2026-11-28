@@ -232,15 +232,17 @@ pub enum Op {
     CodexInstall {
         code: String,
     },
-    BridgeAdd {
-        from: String,
-        to: String,
-        duration: Option<String>,
+    /// Lets a space work on one more machine (admins: like making a space).
+    SpaceConnect {
+        name: String,
+        host: String,
+        access: crate::state::Access,
         code: String,
     },
-    BridgeRm {
-        from: String,
-        to: String,
+    /// Takes a machine from a space. Needs no code: it only takes away.
+    SpaceDisconnect {
+        name: String,
+        host: String,
     },
     HostScan {
         target: String,
@@ -323,19 +325,30 @@ pub enum Op {
         #[serde(default)]
         title: Option<String>,
     },
-    /// Gives a space root on its machine: for a time ("8h") or "forever".
+    /// Gives a space root on one of its machines (`host`: needed when it
+    /// has several): for a time ("8h"), "forever" or "ask". `take`: from
+    /// the space that has it there.
     SpaceRoot {
         name: String,
+        #[serde(default)]
+        host: Option<String>,
         duration: String,
+        #[serde(default)]
+        take: bool,
         code: String,
     },
     /// Takes a space's root back. Needs no code: it only takes away.
     SpaceRootOff {
         name: String,
+        #[serde(default)]
+        host: Option<String>,
     },
-    /// A space's usual login. Up (to user) takes a code; down does not.
+    /// A space's usual login on one of its machines. Up (to user) takes a
+    /// code; down does not.
     SpaceAccess {
         name: String,
+        #[serde(default)]
+        host: Option<String>,
         access: crate::state::Access,
         #[serde(default)]
         code: String,
@@ -475,7 +488,7 @@ impl Op {
     fn step_up_code(&self) -> Option<&str> {
         match self {
             Op::SpaceRm { code, .. }
-            | Op::BridgeAdd { code, .. }
+            | Op::SpaceConnect { code, .. }
             | Op::HostAdd { code, .. }
             | Op::HostRm { code, .. }
             | Op::HostRescanConfirm { code, .. }
@@ -927,6 +940,7 @@ fn need(op: &Op) -> Need {
         | Op::PasskeyAdd { .. }
         | Op::PasskeyRm { .. } => Need::Login,
         Op::SpaceNew { .. }
+        | Op::SpaceConnect { .. }
         | Op::HostScan { .. }
         | Op::HostAdd { .. }
         | Op::HostRm { .. }
@@ -972,7 +986,7 @@ fn need(op: &Op) -> Need {
         | Op::CodexAnswer { name, .. }
         | Op::CodexRename { name, .. }
         | Op::SpaceSend { name, .. }
-        | Op::SpaceRootOff { name } => one(name, Use),
+        | Op::SpaceRootOff { name, .. } => one(name, Use),
         Op::SpaceAccess { name, access, .. } => one(
             name,
             if *access == crate::state::Access::Readonly {
@@ -993,9 +1007,7 @@ fn need(op: &Op) -> Need {
         | Op::CodexArchive { name, .. }
         | Op::SpaceShare { name, .. } => one(name, Manage),
         Op::SpaceRename { old, .. } => one(old, Manage),
-        Op::BridgeAdd { from, to, .. } | Op::BridgeRm { from, to } => {
-            Need::Spaces(vec![from.clone(), to.clone()], Manage)
-        }
+        Op::SpaceDisconnect { name, .. } => one(name, Manage),
         Op::SpaceOwner { name, .. } => one(name, Owner),
     }
 }
@@ -1659,16 +1671,10 @@ fn run_op(
             ops::login_cancel(&state.space(&name)?.key);
             json(())
         }
-        Op::BridgeAdd {
-            from, to, duration, ..
-        } => {
-            let secs = match duration.as_deref().map(str::trim) {
-                None | Some("") | Some("forever") => None,
-                Some(d) => Some(ops::parse_duration(d)?),
-            };
-            json(ops::bridge_add(&from, &to, secs)?)
-        }
-        Op::BridgeRm { from, to } => json(ops::bridge_rm(&from, &to)?),
+        Op::SpaceConnect {
+            name, host, access, ..
+        } => json(ops::space_connect(&name, &host, Some(access))?),
+        Op::SpaceDisconnect { name, host } => json(ops::space_disconnect(&name, &host)?),
         Op::HostScan { target, port } => json(ops::host_scan(&target, port, client)?),
         Op::HostAdd {
             name,
@@ -1714,15 +1720,25 @@ fn run_op(
         Op::ChatOpen { name, id, title } => {
             json(ops::chat_open(&name, id.as_deref(), title.as_deref())?)
         }
-        Op::SpaceRoot { name, duration, .. } => {
+        Op::SpaceRoot {
+            name,
+            host,
+            duration,
+            take,
+            ..
+        } => {
             let root = ops::parse_root(&duration)?;
             if root.is_none() {
                 bail!("say for how long, or forever");
             }
-            json(ops::space_root(&name, root)?)
+            json(ops::space_root(&name, host.as_deref(), root, take)?)
         }
-        Op::SpaceRootOff { name } => json(ops::space_root(&name, None)?),
-        Op::SpaceAccess { name, access, .. } => json(ops::space_login(&name, access)?),
+        Op::SpaceRootOff { name, host } => {
+            json(ops::space_root(&name, host.as_deref(), None, false)?)
+        }
+        Op::SpaceAccess {
+            name, host, access, ..
+        } => json(ops::space_login(&name, host.as_deref(), access)?),
         Op::HostSetup { name, .. } => json(crate::logins::setup(&name, true)?),
         Op::Activity { name, limit } => json(crate::activity::list(&name, limit.min(500))?),
         Op::HostRename { old, new, .. } => json(ops::host_rename(&old, &new)?),
@@ -1909,7 +1925,7 @@ fn run_op(
 }
 
 /// What an account that is not a hub admin sees of the hub: the spaces
-/// it may see (and how far), their machines, bridges between them.
+/// it may see (and how far), and their machines.
 fn see_only_yours(o: &mut ops::Overview, user: &str, admin: bool) -> Result<()> {
     let (_, state) = ctx::read_only()?;
     for s in &mut o.spaces {
@@ -1930,14 +1946,12 @@ fn see_only_yours(o: &mut ops::Overview, user: &str, admin: bool) -> Result<()> 
     let machines: std::collections::BTreeSet<String> = o
         .spaces
         .iter()
-        .flat_map(|s| std::iter::once(s.host.clone()).chain(s.reachable.iter().cloned()))
+        .flat_map(|s| s.machines.iter().map(|m| m.host.clone()))
         .collect();
     o.hosts.retain(|h| machines.contains(&h.name));
     for h in &mut o.hosts {
         h.spaces.retain(|s| seen.contains(s));
     }
-    o.bridges
-        .retain(|b| seen.contains(&b.from) || seen.contains(&b.to));
     o.hub.admin_from.clear();
     o.hub.denied_inbound.clear();
     Ok(())
@@ -2051,13 +2065,16 @@ pub fn all_op_names() -> Vec<String> {
             code: s(),
         },
         Op::LoginCancel { name: s() },
-        Op::BridgeAdd {
-            from: s(),
-            to: s(),
-            duration: None,
+        Op::SpaceConnect {
+            name: s(),
+            host: s(),
+            access: Default::default(),
             code: s(),
         },
-        Op::BridgeRm { from: s(), to: s() },
+        Op::SpaceDisconnect {
+            name: s(),
+            host: s(),
+        },
         Op::HostScan {
             target: s(),
             port: 22,
@@ -2120,10 +2137,15 @@ pub fn all_op_names() -> Vec<String> {
         },
         Op::SpaceRoot {
             name: s(),
+            host: None,
             duration: s(),
+            take: false,
             code: s(),
         },
-        Op::SpaceRootOff { name: s() },
+        Op::SpaceRootOff {
+            name: s(),
+            host: None,
+        },
         Op::AskList { all: false },
         Op::AskDecide {
             id: s(),
@@ -2132,6 +2154,7 @@ pub fn all_op_names() -> Vec<String> {
         },
         Op::SpaceAccess {
             name: s(),
+            host: None,
             access: Default::default(),
             code: s(),
         },
@@ -2257,8 +2280,8 @@ pub fn all_op_names() -> Vec<String> {
             | Op::LoginStart { .. }
             | Op::LoginFinish { .. }
             | Op::LoginCancel { .. }
-            | Op::BridgeAdd { .. }
-            | Op::BridgeRm { .. }
+            | Op::SpaceConnect { .. }
+            | Op::SpaceDisconnect { .. }
             | Op::HostScan { .. }
             | Op::HostAdd { .. }
             | Op::HostRm { .. }

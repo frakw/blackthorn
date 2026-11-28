@@ -216,9 +216,10 @@ struct Seen {
 
 const RELEASE_EVERY: u64 = 6 * 3600;
 
-/// Run every minute by `thorn _tick`: report what changed. `lifted` and
-/// `ended` are the blocks and bridges that tick just let go.
-pub fn tick(state: &State, lifted: &[String], ended: &[String], root_ended: &[String]) {
+/// Run every minute by `thorn _tick`: report what changed. `lifted`: the
+/// blocks that tick just let go; `root_ended`: (space, machine) whose root
+/// time ran out.
+pub fn tick(state: &State, lifted: &[String], root_ended: &[(String, String)]) {
     let n = Notify::load();
     let attempts = take_connect_back_attempts();
     if !n.on() {
@@ -278,21 +279,15 @@ pub fn tick(state: &State, lifted: &[String], ended: &[String], root_ended: &[St
             "unlock",
         ));
     }
-    for b in ended {
-        msgs.push((
-            format!("bridge {b} ended"),
-            "The time it was given ran out.".into(),
-            "link",
-        ));
-    }
-    for s in root_ended {
+    for (s, h) in root_ended {
         let back = state
             .spaces
             .get(s)
-            .map(|x| x.access.to_string())
+            .and_then(|x| x.machine(h))
+            .map(|m| m.access.to_string())
             .unwrap_or_else(|| "its usual login".into());
         msgs.push((
-            format!("root of space {s} ended"),
+            format!("root of space {s} on {h} ended"),
             format!("Its time ran out. It goes on as {back}; its chats are still running."),
             "lock",
         ));

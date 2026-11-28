@@ -71,7 +71,7 @@ enum Cmd {
         #[arg(long)]
         no_web: bool,
     },
-    /// The hub at a glance: machines, their spaces, bridges.
+    /// The hub at a glance: machines and the spaces on them.
     Status {
         /// Machine-readable.
         #[arg(long)]
@@ -192,18 +192,28 @@ enum Cmd {
     /// Watch the machines for asks (run by blackthorn-asks.service).
     #[command(name = "_asks", hide = true)]
     AsksWatch,
-    /// Set a space's usual login on its machine: read-only or user. It
-    /// applies at once; the space and its chats go on.
+    /// Set a space's usual login on one of its machines: read-only or
+    /// user. It applies at once; the space and its chats go on.
     Access {
         name: String,
         #[arg(value_parser = ["read-only", "readonly", "user"])]
         access: String,
+        /// Which of its machines (needed when it has more than one).
+        #[arg(long)]
+        host: Option<String>,
     },
-    /// Give a space root on its machine, for a time (default 8h, at most
-    /// 72h) or until taken back; or take it back. When it ends, the space
-    /// goes back to its usual login; its chats go on.
+    /// Give a space root on one of its machines, for a time (default 8h, at
+    /// most 72h) or until taken back; or take it back. When it ends, the
+    /// space goes back to its usual login there; its chats go on. One space
+    /// at a time has root on a machine.
     Root {
         name: String,
+        /// Which of its machines (needed when it has more than one).
+        #[arg(long)]
+        host: Option<String>,
+        /// Take root over from the space that has it there.
+        #[arg(long, conflicts_with = "off")]
+        take: bool,
         #[arg(long = "for", value_name = "DURATION", conflicts_with_all = ["forever", "ask", "off"])]
         duration: Option<String>,
         #[arg(long, conflicts_with_all = ["ask", "off"])]
@@ -252,9 +262,16 @@ enum Cmd {
     /// A space's Claude chats: list, name, delete.
     #[command(subcommand)]
     Chat(ChatCmd),
-    /// Let one space reach another space's machine for a while.
-    #[command(subcommand)]
-    Bridge(BridgeCmd),
+    /// Let a space work on one more machine (default: read-only there).
+    Connect {
+        name: String,
+        host: String,
+        #[arg(long, value_parser = ["read-only", "readonly", "user"])]
+        access: Option<String>,
+    },
+    /// Take a machine from a space: its root and logins there go; its
+    /// /srv folder there stays.
+    Disconnect { name: String, host: String },
     /// Save everything blackthorn keeps (settings, machine keys, accounts,
     /// spaces with their Claude logins and chats, logs) to one file. It
     /// holds every secret on the hub: give it a password, or keep it like
@@ -286,7 +303,7 @@ enum Cmd {
         check: bool,
     },
     /// Push notifications (ntfy): a machine trying to connect back, a space
-    /// failing or needing login, blocks and bridges ending, new releases.
+    /// failing or needing login, blocks and root time ending, new releases.
     #[command(subcommand)]
     Notify(NotifyCmd),
     /// Tailscale on the hub: install it, sign in, its web interface.
@@ -327,25 +344,6 @@ enum Cmd {
     WebServe,
     #[command(name = "_totp", hide = true)]
     Totp { secret: String },
-}
-
-#[derive(Subcommand)]
-enum BridgeCmd {
-    /// `thorn bridge add fig-claude nas-claude`: fig-claude may also reach nas.
-    Add {
-        from: String,
-        to: String,
-        /// How long (30m, 2h, 1d). Default 1h.
-        #[arg(long = "for", value_name = "DURATION")]
-        duration: Option<String>,
-        /// Until removed.
-        #[arg(long, conflicts_with = "duration")]
-        permanent: bool,
-    },
-    /// End a bridge now.
-    Rm { from: String, to: String },
-    /// List bridges.
-    Ls,
 }
 
 #[derive(Subcommand)]
@@ -711,14 +709,30 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Start { names, all } => s::control(Action::Start, &names, all),
         Cmd::Stop { names, all } => s::control(Action::Stop, &names, all),
         Cmd::Restart { names, all } => s::control(Action::Restart, &names, all),
-        Cmd::Access { name, access } => s::login_as(&name, parse_access(&access)),
+        Cmd::Access { name, access, host } => {
+            s::login_as(&name, host.as_deref(), parse_access(&access))
+        }
         Cmd::Root {
             name,
+            host,
+            take,
             duration,
             forever,
             ask,
             off,
-        } => s::root(&name, duration.as_deref(), forever, ask, off),
+        } => s::root(
+            &name,
+            host.as_deref(),
+            take,
+            duration.as_deref(),
+            forever,
+            ask,
+            off,
+        ),
+        Cmd::Connect { name, host, access } => {
+            s::connect(&name, &host, access.as_deref().map(parse_access))
+        }
+        Cmd::Disconnect { name, host } => s::disconnect(&name, &host),
         Cmd::Approvals { all } => s::approvals(all),
         Cmd::Approve { id } => s::decide(&id, true, None),
         Cmd::Deny { id, reason } => s::decide(&id, false, reason.as_deref()),
@@ -843,16 +857,6 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Config(c) => match c {
             ConfigCmd::Show => config_cmd::show(),
             ConfigCmd::Set { key, value } => config_cmd::set(&key, &value),
-        },
-        Cmd::Bridge(b) => match b {
-            BridgeCmd::Add {
-                from,
-                to,
-                duration,
-                permanent,
-            } => s::bridge_add(&from, &to, duration.as_deref(), permanent),
-            BridgeCmd::Rm { from, to } => s::bridge_rm(&from, &to),
-            BridgeCmd::Ls => s::bridge_ls(),
         },
         Cmd::Host(h) => match h {
             HostCmd::Add {
@@ -1022,8 +1026,8 @@ mod tests {
             ("login_start", &["login"]),
             ("login_finish", &["login"]),
             ("login_cancel", &["login"]),
-            ("bridge_add", &["bridge", "add"]),
-            ("bridge_rm", &["bridge", "rm"]),
+            ("space_connect", &["connect"]),
+            ("space_disconnect", &["disconnect"]),
             ("host_scan", &["host", "add"]),
             ("host_add", &["host", "add"]),
             ("host_rm", &["host", "rm"]),

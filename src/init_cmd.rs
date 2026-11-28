@@ -442,22 +442,18 @@ pub fn firewall_show(planned: bool) -> Result<()> {
     Ok(())
 }
 
-/// Every minute: lift expired blocks, end expired bridges, and reload the
+/// Every minute: lift expired blocks, and reload the
 /// firewall if anything it depends on changed (such as the nameservers in
 /// /etc/resolv.conf).
 pub fn tick() -> Result<()> {
     let mut ctx = Ctx::open()?;
     let lifted = ctx.state.expire_blocks(ctx.now);
-    let ended = ctx.state.expire_bridges(ctx.now);
-    if lifted.is_empty() && ended.is_empty() {
+    if lifted.is_empty() {
         apply::firewall_rules(&ctx.cfg, &ctx.state, ctx.now, false)?;
     } else {
         ctx.commit()?;
         for h in &lifted {
             println!("block lifted: {h}");
-        }
-        for b in &ended {
-            println!("bridge ended: {b}");
         }
     }
     drop(ctx);
@@ -470,14 +466,14 @@ pub fn tick() -> Result<()> {
             Vec::new()
         }
     };
-    for s in &root_ended {
-        println!("root time up: {s} is back to its usual login");
+    for (s, h) in &root_ended {
+        println!("root time up: {s} is back to its usual login on {h}");
     }
     let (cfg, state) = crate::ctx::read_only()?;
     crate::tls::tick(&cfg);
     crate::activity::tick(&state);
     crate::reach::tick(&state);
-    crate::notify::tick(&state, &lifted, &ended, &root_ended);
+    crate::notify::tick(&state, &lifted, &root_ended);
     Ok(())
 }
 

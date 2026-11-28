@@ -6,8 +6,7 @@
 use crate::config::{Config, CLAUDE, CODEX};
 use crate::ctx::{self, Ctx};
 use crate::state::{
-    now, validate_name, validate_rc_name, Access, Block, Bridge, Host, Level, Mode, Os, Space,
-    State, Tier,
+    now, validate_name, validate_rc_name, Access, Block, Host, Level, Mode, Os, Space, State, Tier,
 };
 use crate::{apply, keys, paths, render, sys, units};
 use anyhow::{anyhow, bail, Context, Result};
@@ -24,7 +23,6 @@ pub struct Overview {
     pub hub: HubView,
     pub spaces: Vec<SpaceView>,
     pub hosts: Vec<HostView>,
-    pub bridges: Vec<BridgeView>,
     pub agents: Vec<String>,
 }
 
@@ -60,7 +58,8 @@ pub struct NetView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpaceView {
     pub name: String,
-    pub host: String,
+    /// The machines it works on, and how it stands on each.
+    pub machines: Vec<MachineView>,
     pub agent: String,
     pub mode: Mode,
     /// Claude: reachable through Remote Control.
@@ -80,31 +79,6 @@ pub struct SpaceView {
     /// The model it last answered with ("Opus 5.5"), Claude only.
     #[serde(default)]
     pub model: Option<String>,
-    /// Its usual login: read-only or user.
-    #[serde(default)]
-    pub access: Access,
-    /// How far it goes on its machine now (root while it has it).
-    #[serde(default = "default_tier")]
-    pub tier: Tier,
-    /// It has root: since, and until when (None: until taken back).
-    #[serde(default)]
-    pub root: Option<crate::state::Root>,
-    /// The login it uses on its machine now ("bt-9cf982e0", "root"); empty
-    /// when it has none there.
-    #[serde(default)]
-    pub login: String,
-    /// Other spaces with root on the same machine now.
-    #[serde(default)]
-    pub root_beside: Vec<String>,
-    /// Its folder on its machine (/srv/<name>), on a set-up machine.
-    #[serde(default)]
-    pub srv: Option<String>,
-    /// It reaches its machine now (the machine answers, the firewall lets
-    /// it through, it has a login there), and why (not), in words.
-    #[serde(default)]
-    pub linked: bool,
-    #[serde(default)]
-    pub link: String,
     /// Its extra arguments skip permission prompts (auto mode): risky with
     /// root.
     #[serde(default)]
@@ -117,6 +91,54 @@ pub struct SpaceView {
     /// How far the account asking may go with it (set by the API).
     #[serde(default)]
     pub level: Option<Level>,
+}
+
+impl SpaceView {
+    pub fn machine(&self, host: &str) -> Option<&MachineView> {
+        self.machines.iter().find(|m| m.host == host)
+    }
+
+    pub fn on(&self, host: &str) -> bool {
+        self.machine(host).is_some()
+    }
+
+    /// "fig", "fig and nas".
+    pub fn hosts_text(&self) -> String {
+        let v: Vec<&str> = self.machines.iter().map(|m| m.host.as_str()).collect();
+        crate::state::and_list(&v)
+    }
+
+    /// Has root (in any form) on some machine now.
+    pub fn rooted(&self) -> bool {
+        self.machines.iter().any(|m| m.root.is_some())
+    }
+}
+
+/// How a space stands on one of its machines.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineView {
+    pub host: String,
+    /// Its usual login: read-only or user.
+    pub access: Access,
+    /// How far it goes there now (root while it has it).
+    #[serde(default = "default_tier")]
+    pub tier: Tier,
+    /// It has root there: since, and until when (None: until taken back).
+    #[serde(default)]
+    pub root: Option<crate::state::Root>,
+    /// The login it uses there now ("bt-9cf982e0", "root"); empty when it
+    /// has none there.
+    #[serde(default)]
+    pub login: String,
+    /// Its folder there (/srv/<name>), on a set-up machine.
+    #[serde(default)]
+    pub srv: Option<String>,
+    /// It reaches the machine now (the machine answers, the firewall lets
+    /// it through, it has a login there), and why (not), in words.
+    #[serde(default)]
+    pub linked: bool,
+    #[serde(default)]
+    pub link: String,
 }
 
 fn default_tier() -> Tier {
@@ -145,8 +167,7 @@ pub struct HostView {
     pub tiers: Vec<Tier>,
     #[serde(default)]
     pub rootless_docker: bool,
-    /// Its spaces' logins there: (space, login, tier now). Spaces reaching
-    /// it through a bridge included.
+    /// Its spaces' logins there: (space, login, tier now).
     #[serde(default)]
     pub logins: Vec<(String, String, Tier)>,
     /// Changes it still needs, in words.
@@ -155,17 +176,6 @@ pub struct HostView {
     /// Why setting it up failed last.
     #[serde(default)]
     pub problem: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BridgeView {
-    pub from: String,
-    pub to: String,
-    /// The machine `from` gains.
-    pub host: String,
-    pub until: Option<u64>,
-    /// "for 52m" or "until removed".
-    pub remaining: String,
 }
 
 pub fn overview(with_version: bool) -> Result<Overview> {
@@ -202,23 +212,43 @@ pub fn overview(with_version: bool) -> Result<Overview> {
                     other => other.to_string(),
                 }
             };
-            let login = state
-                .logins(name, t)
-                .into_iter()
-                .find(|l| !l.bridged)
-                .map(|l| l.user)
-                .unwrap_or_default();
-            let blocked = state
-                .hosts
-                .get(&s.host)
-                .and_then(|h| h.block.as_ref())
-                .filter(|b| b.active(t))
-                .map(|b| describe_block(b, t));
-            let (linked, link) =
-                crate::reach::link(reaches.get(&s.host), blocked.as_deref(), &login, t);
+            let logins = state.logins(name, t);
+            let machines = s
+                .machines
+                .iter()
+                .map(|m| {
+                    let login = logins
+                        .iter()
+                        .find(|l| l.host == m.host)
+                        .map(|l| l.user.clone())
+                        .unwrap_or_default();
+                    let blocked = state
+                        .hosts
+                        .get(&m.host)
+                        .and_then(|h| h.block.as_ref())
+                        .filter(|b| b.active(t))
+                        .map(|b| describe_block(b, t));
+                    let (linked, link) =
+                        crate::reach::link(reaches.get(&m.host), blocked.as_deref(), &login, t);
+                    MachineView {
+                        host: m.host.clone(),
+                        access: m.access,
+                        tier: m.tier(t),
+                        root: m.root.clone().filter(|r| r.active(t)),
+                        login,
+                        srv: state
+                            .hosts
+                            .get(&m.host)
+                            .and_then(|h| h.accounts.get(&s.key))
+                            .and_then(|a| a.srv.clone()),
+                        linked,
+                        link,
+                    }
+                })
+                .collect();
             SpaceView {
                 name: name.clone(),
-                host: s.host.clone(),
+                machines,
                 agent: s.agent.clone(),
                 mode: s.mode,
                 remote_control: s.remote_control,
@@ -236,23 +266,6 @@ pub fn overview(with_version: bool) -> Result<Overview> {
                     .into_iter()
                     .map(|(n, _)| n.to_string())
                     .collect(),
-                access: s.access,
-                tier: s.tier(t),
-                root: s.root.clone().filter(|r| r.active(t)),
-                login,
-                root_beside: state
-                    .spaces
-                    .iter()
-                    .filter(|(n, o)| *n != name && o.host == s.host && o.tier(t) == Tier::Root)
-                    .map(|(n, _)| n.clone())
-                    .collect(),
-                srv: state
-                    .hosts
-                    .get(&s.host)
-                    .and_then(|h| h.accounts.get(&s.key))
-                    .and_then(|a| a.srv.clone()),
-                linked,
-                link,
                 unattended: unattended(&cfg.claude_args) || unattended(&s.args),
                 owner: s.owner.clone(),
                 shares: s.shares.iter().map(|(a, l)| (a.clone(), *l)).collect(),
@@ -319,27 +332,10 @@ pub fn overview(with_version: bool) -> Result<Overview> {
             problem: h.problem.as_ref().map(|p| p.text.clone()),
         })
         .collect();
-    let bridges = state
-        .bridges
-        .iter()
-        .filter(|b| b.active(t))
-        .map(|b| BridgeView {
-            from: b.from.clone(),
-            to: b.to.clone(),
-            host: state
-                .spaces
-                .get(&b.to)
-                .map(|s| s.host.clone())
-                .unwrap_or_default(),
-            until: b.until,
-            remaining: describe_until(b.until, t),
-        })
-        .collect();
     Ok(Overview {
         hub,
         spaces,
         hosts,
-        bridges,
         agents: cfg.agent_names(),
     })
 }
@@ -978,38 +974,47 @@ pub fn space_new(o: NewSpace) -> Result<NewDone> {
         )?;
     }
 
-    let space = Space {
-        key: key.clone(),
-        host: o.host.clone(),
-        agent,
-        mode: if o.single { Mode::Single } else { Mode::Server },
-        remote_control: !o.local,
-        dir: rc_name.clone(),
-        rc_name,
-        conversation: uuid::Uuid::new_v4().to_string(),
-        args: o.args,
-        created: ctx.now,
-        access,
+    let mut notes = Vec::new();
+    // One space at a time has root on a machine.
+    let holder = ctx
+        .state
+        .root_holder(&o.host, &name, ctx.now)
+        .map(str::to_string);
+    let root = match (root, holder) {
+        (Some(_), Some(other)) => {
+            notes.push(format!(
+                "no root on {}: {other} has it (one space at a time may)",
+                o.host
+            ));
+            None
+        }
+        (r, _) => r,
+    };
+    let mut space = Space::new(&key, &agent, &rc_name, ctx.now);
+    space.mode = if o.single { Mode::Single } else { Mode::Server };
+    space.remote_control = !o.local;
+    space.conversation = uuid::Uuid::new_v4().to_string();
+    space.args = o.args;
+    space.owner = o.owner.clone();
+    let mut m = crate::state::Machine::new(&o.host, access);
+    if h.setup.is_none() {
+        m.key_id.clear();
         // On a machine not set up, root is only the state's to give.
-        root: match root {
-            Some(g) if h.setup.is_none() && !g.ask => Some(crate::state::Root {
+        m.root = match root {
+            Some(g) if !g.ask => Some(crate::state::Root {
                 since: ctx.now,
                 until: g.secs.map(|s| ctx.now + s),
                 ask: false,
             }),
             _ => None,
-        },
-        until: None,
-        title: None,
-        owner: o.owner.clone(),
-        shares: Default::default(),
-    };
+        };
+    }
+    space.machines.push(m);
     let start_now = logged_in(&space);
     ctx.state.spaces.insert(name.clone(), space);
     ctx.commit()?;
     let now = ctx.now;
     drop(ctx);
-    let mut notes = Vec::new();
     if h.setup.is_some() {
         match crate::logins::make_accounts(&o.host) {
             Ok((_, waiting)) if waiting.contains(&name) => notes.push(format!(
@@ -1018,7 +1023,9 @@ pub fn space_new(o: NewSpace) -> Result<NewDone> {
             )),
             Ok(_) => {
                 if let Some(g) = root {
-                    if let Err(e) = crate::logins::grant(&name, g.secs.map(|s| now + s), g.ask) {
+                    if let Err(e) =
+                        crate::logins::grant(&name, &o.host, g.secs.map(|s| now + s), g.ask, false)
+                    {
                         notes.push(format!("root was not given: {e:#}"));
                     }
                 }
@@ -1043,7 +1050,6 @@ pub fn space_rm(name: &str, purge: bool, purge_data: bool) -> Result<Option<Path
     let _ = sys::systemctl(&["stop", &paths::agent_unit(&s.key)]);
     login_cancel(&s.key);
     ctx.state.spaces.remove(name);
-    ctx.state.bridges.retain(|b| b.from != name && b.to != name);
     crate::logins::forget(&mut ctx.state, &s.key, purge_data, None);
     let hosts: Vec<String> = ctx
         .state
@@ -1058,7 +1064,7 @@ pub fn space_rm(name: &str, purge: bool, purge_data: bool) -> Result<Option<Path
         let _ = crate::logins::do_pending(h);
     }
     if hosts.is_empty() {
-        let _ = keys::remove_space(&s.key);
+        let _ = keys::remove_space(&s.key, None);
     }
 
     let home = paths::space_home(&s.key);
@@ -1123,8 +1129,13 @@ pub fn space_rename(old: &str, new: &str, rc_name: Option<String>) -> Result<boo
     let old_rc = s.rc_name.clone();
     if let Some(rc) = rc_name.filter(|r| !r.trim().is_empty()) {
         s.rc_name = rc.trim().to_string();
-    } else if s.rc_name == old || s.rc_name == default_rc_name(&s.host, old) {
-        s.rc_name = default_rc_name(&s.host, new);
+    } else if s.rc_name == old
+        || s.hosts()
+            .iter()
+            .any(|h| s.rc_name == default_rc_name(h, old))
+    {
+        let first = s.hosts().first().map(|h| h.to_string()).unwrap_or_default();
+        s.rc_name = default_rc_name(&first, new);
     }
     validate_rc_name(&s.rc_name)?;
     if ctx
@@ -1153,14 +1164,6 @@ pub fn space_rename(old: &str, new: &str, rc_name: Option<String>) -> Result<boo
     }
     ctx.state.spaces.remove(old);
     ctx.state.spaces.insert(new.to_string(), s.clone());
-    for b in ctx.state.bridges.iter_mut() {
-        if b.from == old {
-            b.from = new.to_string();
-        }
-        if b.to == old {
-            b.to = new.to_string();
-        }
-    }
     ctx.commit()?;
     drop(ctx);
     if move_dir && was_running {
@@ -1324,57 +1327,93 @@ pub fn start_after_login(name: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// Sets a space's usual login on its machine: read-only or user. It
-/// applies at once: its open SSH connections close; the space and its
-/// chats go on. While it has root, the change shows when root ends.
-pub fn space_login(name: &str, access: Access) -> Result<String> {
-    let mut ctx = Ctx::open()?;
-    let s = ctx.state.space(name)?.clone();
-    let h = ctx.state.host(&s.host)?.clone();
+/// The machine of a space an operation is about: `host`, or its only one.
+pub fn which_machine(s: &Space, name: &str, host: Option<&str>) -> Result<String> {
+    match host.map(str::trim).filter(|h| !h.is_empty()) {
+        Some(h) if s.on(h) => Ok(h.to_string()),
+        Some(h) => bail!(
+            "{name} does not work on {h}; it works on {}",
+            s.hosts_text()
+        ),
+        None => match s.machines.as_slice() {
+            [one] => Ok(one.host.clone()),
+            [] => bail!("{name} works on no machine yet (thorn connect {name} HOST)"),
+            _ => bail!(
+                "{name} works on {}: say which (--host HOST)",
+                s.hosts_text()
+            ),
+        },
+    }
+}
+
+/// Whether a machine offers a usual login, for spaces.
+fn check_access(host: &str, h: &Host, access: Access) -> Result<()> {
     if access == Access::Admin {
         bail!("a usual login is read-only or user; root is given for a time (thorn root)");
     }
-    if !h.tiers().contains(&access.tier()) {
+    if !h.tiers().contains(&access.tier()) && !(h.setup.is_none() && h.root_login()) {
         bail!(
-            "{} has no {access} login for spaces{}",
-            s.host,
+            "{host} has no {access} login for spaces{}",
             if h.setup.is_none() {
-                format!(
-                    " yet; set the machine up first (thorn host setup {})",
-                    s.host
-                )
+                format!(" yet; set the machine up first (thorn host setup {host})")
             } else {
                 String::new()
             }
         );
     }
-    if s.access == access {
-        return Ok(format!("{name} already logs in as {access}"));
+    Ok(())
+}
+
+/// Sets a space's usual login on one of its machines: read-only or user.
+/// It applies at once: its open SSH connections close; the space and its
+/// chats go on. While it has root there, the change shows when root ends.
+pub fn space_login(name: &str, host: Option<&str>, access: Access) -> Result<String> {
+    let mut ctx = Ctx::open()?;
+    let s = ctx.state.space(name)?.clone();
+    let host = which_machine(&s, name, host)?;
+    let h = ctx.state.host(&host)?.clone();
+    check_access(&host, &h, access)?;
+    let m = s.machine(&host).expect("checked");
+    if m.access == access {
+        return Ok(format!("{name} already logs in to {host} as {access}"));
     }
-    ctx.state.spaces.get_mut(name).expect("checked").access = access;
-    let rooted = s.tier(ctx.now) == Tier::Root;
+    let rooted = m.tier(ctx.now) == Tier::Root;
+    ctx.state
+        .spaces
+        .get_mut(name)
+        .and_then(|sp| sp.machine_mut(&host))
+        .expect("checked")
+        .access = access;
     ctx.commit()?;
     drop(ctx);
     if rooted {
         return Ok(format!(
-            "{name} logs in as {access} on {} once its root ends",
-            s.host
+            "{name} logs in to {host} as {access} once its root there ends"
         ));
     }
     crate::logins::close_connections(&s.key);
-    Ok(format!("{name} now logs in as {access} on {}", s.host))
+    Ok(format!("{name} now logs in to {host} as {access}"))
 }
 
-/// Gives a space root on its machine (for a time, until taken back, or on
-/// approval), or (None) takes it back. Returns what happened.
-pub fn space_root(name: &str, root: Option<Grant>) -> Result<String> {
+/// Gives a space root on one of its machines (for a time, until taken
+/// back, or on approval), or (None) takes it back. One space at a time has
+/// root on a machine: `take` takes it from the one that has it. Returns
+/// what happened.
+pub fn space_root(
+    name: &str,
+    host: Option<&str>,
+    root: Option<Grant>,
+    take: bool,
+) -> Result<String> {
     let (_, state) = ctx::read_only()?;
     let s = state.space(name)?.clone();
+    let host = which_machine(&s, name, host)?;
+    drop(state);
     let Some(Grant { secs, ask }) = root else {
-        return Ok(if crate::logins::revoke(name)? {
-            format!("{name} has no root on {} any more", s.host)
+        return Ok(if crate::logins::revoke(name, &host)? {
+            format!("{name} has no root on {host} any more")
         } else {
-            format!("{name} had no root")
+            format!("{name} had no root on {host}")
         });
     };
     if let Some(x) = secs {
@@ -1383,28 +1422,85 @@ pub fn space_root(name: &str, root: Option<Grant>) -> Result<String> {
         }
     }
     let t = now();
-    crate::logins::grant(name, secs.map(|x| t + x), ask)?;
-    if ask {
-        return Ok(format!(
-            "{name} logs in to {} as its user; each command it wants as root waits for your \
-             approval (Approvals, or thorn approvals)",
-            s.host
-        ));
+    crate::logins::grant(name, &host, secs.map(|x| t + x), ask, take)?;
+    Ok(if ask {
+        format!(
+            "{name} logs in to {host} as its user; each command it wants as root waits for your \
+             approval (Approvals, or thorn approvals)"
+        )
+    } else {
+        match secs {
+            Some(x) => format!("{name} has root on {host} until {} UTC", rfc3339(t + x)),
+            None => format!("{name} has root on {host} until taken back"),
+        }
+    })
+}
+
+/// Lets a space work on one more machine, with a usual login there
+/// (default: read-only). Its logins there are made now (or when the
+/// machine can be reached).
+pub fn space_connect(name: &str, host: &str, access: Option<Access>) -> Result<String> {
+    let mut ctx = Ctx::open()?;
+    let s = ctx.state.space(name)?.clone();
+    let h = ctx.state.host(host)?.clone();
+    if s.on(host) {
+        bail!("{name} already works on {host}");
     }
-    let beside: Vec<&str> = state
+    let access = access.unwrap_or(Access::Readonly);
+    check_access(host, &h, access)?;
+    let mut m = crate::state::Machine::new(host, access);
+    // A machine not set up: its own logins, no key of the space's.
+    if h.setup.is_none() {
+        m.key_id.clear();
+    }
+    ctx.state
         .spaces
-        .iter()
-        .filter(|(n, o)| n.as_str() != name && o.host == s.host && o.tier(t) == Tier::Root)
-        .map(|(n, _)| n.as_str())
-        .collect();
-    let mut msg = match secs {
-        Some(x) => format!("{name} has root on {} until {} UTC", s.host, rfc3339(t + x)),
-        None => format!("{name} has root on {} until taken back", s.host),
-    };
-    if !beside.is_empty() {
-        msg.push_str(&format!("; also root there now: {}", beside.join(", ")));
+        .get_mut(name)
+        .expect("checked")
+        .machines
+        .push(m);
+    ctx.commit()?;
+    drop(ctx);
+    let mut msg = format!("{name} now works on {host} too, as {access}");
+    if h.setup.is_some() {
+        match crate::logins::make_accounts(host) {
+            Ok((_, waiting)) if waiting.iter().any(|w| w == name) => msg.push_str(&format!(
+                "; its logins there are not made yet ({host} could not be reached): blackthorn keeps trying"
+            )),
+            Ok(_) => {}
+            Err(e) => msg.push_str(&format!("; its logins there are not made yet: {e:#}")),
+        }
     }
     Ok(msg)
+}
+
+/// Takes a machine from a space: its root and logins there go (its /srv
+/// folder stays), now or when the machine can be reached. A space keeps at
+/// least one machine.
+pub fn space_disconnect(name: &str, host: &str) -> Result<String> {
+    let mut ctx = Ctx::open()?;
+    let s = ctx.state.space(name)?.clone();
+    let Some(m) = s.machine(host).cloned() else {
+        bail!("{name} does not work on {host}");
+    };
+    if s.machines.len() == 1 {
+        bail!("{host} is {name}'s only machine; remove the space instead (thorn rm {name})");
+    }
+    ctx.state
+        .spaces
+        .get_mut(name)
+        .expect("checked")
+        .machines
+        .retain(|x| x.host != host);
+    crate::logins::forget(&mut ctx.state, &s.key, false, Some(host));
+    ctx.commit()?;
+    drop(ctx);
+    crate::logins::close_connections(&s.key);
+    let _ = crate::logins::do_pending(host);
+    if !m.key_id.is_empty() {
+        let _ = keys::remove_space(&s.key, Some(&m.key_id));
+    }
+    Ok(format!("{name} no longer works on {host}"))
 }
 
 /// The text on the space's terminal right now.
@@ -2687,261 +2783,6 @@ pub fn login_cancel(key: &str) {
     }
 }
 
-// ---------------------------------------------------------------- bridges
-
-/// Lets space `from` reach the machine of space `to`, for `secs` seconds
-/// (None: until removed). Replaces an existing bridge between the two.
-pub fn bridge_add(from: &str, to: &str, secs: Option<u64>) -> Result<Bridge> {
-    let mut ctx = Ctx::open()?;
-    let f = ctx.state.space(from)?.clone();
-    let t = ctx.state.space(to)?.clone();
-    if from == to || f.host == t.host {
-        bail!("{from} already works on {}", t.host);
-    }
-    let b = Bridge {
-        from: from.into(),
-        to: to.into(),
-        since: ctx.now,
-        until: secs.map(|s| ctx.now + s),
-    };
-    ctx.state
-        .bridges
-        .retain(|x| !(x.from == from && x.to == to));
-    ctx.state.bridges.push(b.clone());
-    ctx.commit()?;
-    drop(ctx);
-    // Its read-only login there, on a machine set up for them.
-    let _ = crate::logins::make_accounts(&t.host);
-    Ok(b)
-}
-
-pub fn bridge_rm(from: &str, to: &str) -> Result<()> {
-    let mut ctx = Ctx::open()?;
-    let before = ctx.state.bridges.len();
-    ctx.state
-        .bridges
-        .retain(|x| !(x.from == from && x.to == to));
-    if ctx.state.bridges.len() == before {
-        bail!("there is no bridge from {from} to {to}");
-    }
-    let gone = crate::logins::unused(&mut ctx.state, ctx.now);
-    ctx.commit()?;
-    drop(ctx);
-    for h in gone {
-        let _ = crate::logins::do_pending(&h);
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------- hosts
-
-/// "user@100.80.0.3" or "user@[fd7a::1]" or "user@fd7a::1".
-pub fn parse_target(target: &str) -> Result<(String, IpAddr)> {
-    let Some((user, addr)) = target.rsplit_once('@') else {
-        bail!("give the host as user@address, e.g. root@100.80.0.3");
-    };
-    crate::state::validate_remote_user(user)?;
-    let addr = addr.trim_start_matches('[').trim_end_matches(']');
-    let ip: IpAddr = addr.parse().with_context(|| {
-        format!(
-            "{addr:?} is not an IP address. blackthorn stores addresses, not names, so a \
-             changed DNS record cannot redirect a space; use the host's (tailnet) IP"
-        )
-    })?;
-    Ok((user.to_string(), ip))
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Scan {
-    pub user: String,
-    pub address: IpAddr,
-    pub port: u16,
-    pub host_keys: Vec<String>,
-    pub fingerprints: Vec<String>,
-}
-
-/// Reads a machine's host keys, for you to confirm before `host_add`.
-/// `client` is the address of whoever asks (your SSH or browser connection).
-pub fn host_scan(target: &str, port: u16, client: Option<IpAddr>) -> Result<Scan> {
-    scan_target(target, port, client, None)
-}
-
-/// Reads the host keys at a registered machine's new address, for you to
-/// confirm before `host_move`.
-pub fn host_move_scan(name: &str, target: &str, port: u16, client: Option<IpAddr>) -> Result<Scan> {
-    scan_target(target, port, client, Some(name))
-}
-
-/// `moving`: the registered machine that will get this address, if any.
-fn scan_target(
-    target: &str,
-    port: u16,
-    client: Option<IpAddr>,
-    moving: Option<&str>,
-) -> Result<Scan> {
-    sys::require_root()?;
-    let (cfg, state) = ctx::read_only()?;
-    if let Some(n) = moving {
-        state.host(n)?;
-    }
-    let (user, address) = parse_target(target)?;
-    refuse_address(&cfg, address, client)?;
-    check_address_free(&state, address, port, moving)?;
-    let host_keys = keys::scan(address, port)?;
-    let fingerprints = keys::fingerprints(&host_keys)?;
-    Ok(Scan {
-        user,
-        address,
-        port,
-        host_keys,
-        fingerprints,
-    })
-}
-
-fn check_address_free(
-    state: &State,
-    address: IpAddr,
-    port: u16,
-    except: Option<&str>,
-) -> Result<()> {
-    if let Some((n, _)) = state
-        .hosts
-        .iter()
-        .find(|(n, h)| Some(n.as_str()) != except && h.address == address && h.port == port)
-    {
-        bail!("{address} port {port} is already registered as {n}");
-    }
-    Ok(())
-}
-
-/// Machines blackthorn will not manage: they would have a path back.
-fn refuse_address(cfg: &Config, address: IpAddr, client: Option<IpAddr>) -> Result<()> {
-    if cfg.never_manage.contains(&address) {
-        bail!(
-            "{address} is listed in never_manage in {}: blackthorn must have nothing to do with it",
-            paths::CONFIG_FILE
-        );
-    }
-    if cfg.inbound.admin_from.contains(&address) || client == Some(address) {
-        bail!(
-            "{address} is a device you administer the hub from. A managed machine must never \
-             be able to reach the hub, so it cannot be both; manage it from a space only if you \
-             stop using it for administration"
-        );
-    }
-    Ok(())
-}
-
-/// Registers a machine whose host keys you confirmed (from `host_scan`).
-/// The keys are read again and must not have changed. Returns the line to
-/// put in its authorized_keys.
-pub fn host_add(
-    name: &str,
-    target: &str,
-    port: u16,
-    confirmed_keys: &[String],
-    client: Option<IpAddr>,
-) -> Result<String> {
-    let mut ctx = Ctx::open()?;
-    validate_name("host", name)?;
-    if ctx.state.hosts.contains_key(name) {
-        bail!("there is already a host named {name:?}");
-    }
-    let (user, address) = parse_target(target)?;
-    refuse_address(&ctx.cfg, address, client)?;
-    let host_keys = keys::scan(address, port)?;
-    if host_keys != confirmed_keys {
-        bail!("{address}'s host keys changed since you confirmed them; scan again");
-    }
-    keys::generate(name)?;
-    ctx.state.hosts.insert(
-        name.to_string(),
-        Host {
-            address,
-            port,
-            user,
-            host_keys,
-            os: Os::Linux,
-            block: None,
-            readonly: None,
-            setup: None,
-            setup_version: 0,
-            rootless_docker: false,
-            accounts: Default::default(),
-            pending: Vec::new(),
-            problem: None,
-        },
-    );
-    ctx.commit()?;
-    authorized_keys_line(&ctx.cfg, &ctx.state, name)
-}
-
-/// Gives a registered machine a new address, login or port (for example its
-/// tailnet address instead of its LAN one), with host keys you confirmed
-/// (from `host_move_scan`). Its spaces stay; their files and firewall rules
-/// follow. Returns the new authorized_keys line, which replaces the old one
-/// on the machine.
-pub fn host_move(
-    name: &str,
-    target: &str,
-    port: u16,
-    confirmed_keys: &[String],
-    client: Option<IpAddr>,
-) -> Result<String> {
-    let mut ctx = Ctx::open()?;
-    ctx.state.host(name)?;
-    let (user, address) = parse_target(target)?;
-    refuse_address(&ctx.cfg, address, client)?;
-    check_address_free(&ctx.state, address, port, Some(name))?;
-    let host_keys = keys::scan(address, port)?;
-    if host_keys != confirmed_keys {
-        bail!("{address}'s host keys changed since you confirmed them; scan again");
-    }
-    let h = ctx.state.hosts.get_mut(name).expect("exists");
-    h.address = address;
-    h.port = port;
-    h.user = user;
-    h.host_keys = host_keys;
-    ctx.commit()?;
-    authorized_keys_line(&ctx.cfg, &ctx.state, name)
-}
-
-/// The authorized_keys line for a host, limited to the hub's addresses.
-pub fn authorized_keys_line(cfg: &Config, state: &State, name: &str) -> Result<String> {
-    let from = hub_addresses(cfg, state.host(name)?.address);
-    keys::authorized_keys_line(name, &from)
-}
-
-/// The addresses a machine sees the hub's connections come from: ssh_from
-/// if set, else the source address the kernel picks on the route to it (on
-/// a LAN and on a tailnet alike), else the hub's tailnet addresses.
-pub(crate) fn hub_addresses(cfg: &Config, target: IpAddr) -> Vec<IpAddr> {
-    if !cfg.ssh_from.is_empty() {
-        return cfg.ssh_from.clone();
-    }
-    let route = sys::output("ip", &["route", "get", &target.to_string()]);
-    match route.ok().as_deref().and_then(route_source) {
-        Some(src) => vec![src],
-        None => tailscale_ips(),
-    }
-}
-
-/// The `src` address in `ip route get` output.
-fn route_source(out: &str) -> Option<IpAddr> {
-    let words: Vec<&str> = out.split_whitespace().collect();
-    words
-        .windows(2)
-        .find(|w| w[0] == "src")
-        .and_then(|w| w[1].parse().ok())
-}
-
-pub fn host_pubkey(name: &str) -> Result<String> {
-    sys::require_root()?;
-    let (cfg, state) = ctx::read_only()?;
-    authorized_keys_line(&cfg, &state, name)
-}
-
-/// The hub's tailnet addresses, if tailscale is installed and up.
 pub fn tailscale_ips() -> Vec<IpAddr> {
     sys::output("tailscale", &["ip"])
         .map(|o| o.lines().filter_map(|l| l.trim().parse().ok()).collect())
@@ -2960,7 +2801,8 @@ pub fn host_rm(name: &str) -> Result<()> {
         .collect();
     if !users.is_empty() {
         bail!(
-            "spaces work on {name}: {}; remove them first (thorn rm <space>)",
+            "spaces work on {name}: {}; take it from them first (thorn disconnect SPACE {name}), \
+             or remove them (thorn rm SPACE)",
             users.join(", ")
         );
     }
@@ -3003,8 +2845,8 @@ pub fn host_rename(old: &str, new: &str) -> Result<()> {
     ctx.state.hosts.remove(old);
     ctx.state.hosts.insert(new.to_string(), h);
     for s in ctx.state.spaces.values_mut() {
-        if s.host == old {
-            s.host = new.to_string();
+        for m in s.machines.iter_mut().filter(|m| m.host == old) {
+            m.host = new.to_string();
         }
     }
     if let Err(e) = ctx.commit() {

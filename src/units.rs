@@ -76,7 +76,7 @@ WantedBy=multi-user.target
 fn tick_service() -> String {
     "# Installed by thorn init.
 [Unit]
-Description=blackthorn: lift expired blocks and bridges, refresh the firewall
+Description=blackthorn: lift expired blocks and root, refresh the firewall
 
 [Service]
 Type=oneshot

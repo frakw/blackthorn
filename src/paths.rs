@@ -117,12 +117,19 @@ pub fn remote_ro_user(key: &str) -> String {
     format!("bt-{key}-ro")
 }
 
-/// The keys of each space's own logins: its user (and root) login, and
-/// its read-only one. Their own folder, so no machine's name can clash.
+/// The keys of each space's own logins: its user (and root) login on each
+/// of its machines, and its read-only one. Their own folder, so no
+/// machine's name can clash.
 pub const SPACE_KEYS_DIR: &str = "/etc/blackthorn/keys/spaces";
 
-pub fn space_key_file(key: &str) -> PathBuf {
-    PathBuf::from(SPACE_KEYS_DIR).join(key)
+/// The key of a space's user (and root) login on one of its machines
+/// (`id`: the machine's key id; empty: the space's key of before v0.16).
+pub fn space_key_file(key: &str, id: &str) -> PathBuf {
+    if id.is_empty() {
+        PathBuf::from(SPACE_KEYS_DIR).join(key)
+    } else {
+        PathBuf::from(SPACE_KEYS_DIR).join(format!("{key}.{id}"))
+    }
 }
 
 pub fn space_ro_key_file(key: &str) -> PathBuf {

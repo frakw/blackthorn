@@ -40,15 +40,15 @@
       after a reboot.</p>
   </article>
   <article>
-    <h2>One machine per agent</h2>
-    <p>A space is one machine plus one agent. It can reach that machine and nothing else, enforced by
+    <h2>Only the machines you give it</h2>
+    <p>A space is one agent plus the machines you give it. It can reach those and nothing else, enforced by
       the kernel's firewall, not by asking the model. Your machines cannot connect back to the hub at all.</p>
   </article>
   <article>
     <h2>Read-only, user or root</h2>
-    <p>On your machines each space gets logins of its own: read-only, an ordinary user for its project,
+    <p>On each machine a space gets logins of its own: read-only, an ordinary user for its project,
       and root only for a time you choose, or <em>on approval</em>: each root command waits for you to
-      press Approve.</p>
+      press Approve. One space at a time has root on a machine.</p>
   </article>
   <article>
     <h2>Keys stay on the hub</h2>
@@ -57,13 +57,13 @@
   </article>
   <article>
     <h2>See everything</h2>
-    <p>A live map of machines, spaces and bridges. Every command a space runs is recorded on the hub,
+    <p>A live map of machines and spaces. Every command a space runs is recorded on the hub,
       out of the space's reach, and in the machine's own system log too.</p>
   </article>
   <article>
     <h2>Built for your phone</h2>
-    <p>The web UI works on a phone: chat with your agents, approve root commands, open a bridge to a
-      second machine for an hour, or cut a machine off with one tap. Sign-in needs a password and a
+    <p>The web UI works on a phone: chat with your agents, approve root commands, give a
+      space another machine, or cut a machine off with one tap. Sign-in needs a password and a
       code, or a passkey.</p>
   </article>
 </section>
@@ -71,8 +71,8 @@
 <section class="shots" id="screenshots">
   <h2>A look around</h2>
   <figure class="wide">
-    <img src="img/map.png" alt="The map: the hub, its spaces and the machines they reach, with a bridge and their logins" loading="lazy">
-    <figcaption>The map: which space reaches which machine, as what, and the bridges between them.</figcaption>
+    <img src="img/map.png" alt="The map: the hub, its spaces and the machines they reach, with their logins" loading="lazy">
+    <figcaption>The map: which space reaches which machines, and as what.</figcaption>
   </figure>
   <div class="pair">
     <figure>
@@ -85,7 +85,7 @@
     </figure>
     <figure>
       <img src="img/spaces.png" alt="The spaces, with their logins and whether they reach their machine" loading="lazy">
-      <figcaption>Spaces: what each may do on its machine, and for how long.</figcaption>
+      <figcaption>Spaces: what each may do on each of its machines, and for how long.</figcaption>
     </figure>
     <figure>
       <img src="img/machine.png" alt="A machine's page with the logins of each space" loading="lazy">
@@ -112,14 +112,14 @@
  ┌──────────────────── blackthorn hub ─────────────────────┐
  │ space "fig"  = its own Unix user, firewall, ssh-agent   │
  │   claude or codex ─────────── may reach fig:22 only     │
- │ space "nas"  = its own Unix user, firewall, ssh-agent   │
- │   claude or codex ─────────── may reach nas:22 only     │
- │      └─ bridge for 1h ───────────────────┐              │
+ │ space "ops"  = its own Unix user, firewall, ssh-agent   │
+ │   claude or codex ──── may reach fig:22 (read-only)     │
+ │                        and nas:22 (user)                │
  └──────────────┬──────────────────────────────────────────┘
-                │ outbound SSH only          │
-        ┌───────┴────────┐                   │
-        ▼                ▼                   ▼
-       fig              nas ◄────────────────┘
+                │ outbound SSH only
+        ┌───────┴────────┐
+        ▼                ▼
+       fig              nas
    (machines cannot connect to the hub)
 </pre>
   <ol class="steps">
@@ -127,7 +127,7 @@
       and, if you like, Tailscale, so only your devices reach it.</li>
     <li><strong>Add a machine</strong>: paste one line into its <code>authorized_keys</code>, confirm its
       fingerprint, and let blackthorn set up the logins for its spaces.</li>
-    <li><strong>Make a space</strong>: pick the machine, the agent and how far it may go. Sign the agent
+    <li><strong>Make a space</strong>: pick a machine, the agent and how far it may go. Sign the agent
       in once, then chat.</li>
   </ol>
 </section>
