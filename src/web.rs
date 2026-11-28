@@ -4202,20 +4202,15 @@ fn chats_page(c: &Ctx, flash: &Flash) -> Reply {
                         ch.title
                     },
                     ch.updated,
+                    // Listed only while the space runs, so every chat
+                    // here can be typed into: ready, like a running
+                    // Claude chat, unless Codex waits or failed.
                     match ch.state.as_str() {
                         "waiting" => "warn",
-                        "working" => "ok",
                         "error" => "bad",
-                        _ => "idle",
+                        _ => "ok",
                     },
-                    format!(
-                        "Codex{}",
-                        if label.is_empty() {
-                            String::new()
-                        } else {
-                            format!(", {label}")
-                        }
-                    ),
+                    format!("Codex · {}", if label.is_empty() { "ready" } else { label }),
                 )
             })),
             Err(e) => error(s, &e),
