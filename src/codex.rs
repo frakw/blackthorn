@@ -319,7 +319,24 @@ pub fn unwrap_shell(cmd: &str) -> String {
                 Some(c) => out.push(c),
                 None => return cmd.to_string(),
             },
-            '"' | '$' | '`' => return cmd.to_string(),
+            // Double quotes, as long as nothing in them expands.
+            '"' => loop {
+                match chars.next() {
+                    Some('"') => break,
+                    Some('\\') => match chars.next() {
+                        Some(c @ ('$' | '`' | '"' | '\\')) => out.push(c),
+                        Some('\n') => {}
+                        Some(c) => {
+                            out.push('\\');
+                            out.push(c);
+                        }
+                        None => return cmd.to_string(),
+                    },
+                    Some('$' | '`') | None => return cmd.to_string(),
+                    Some(c) => out.push(c),
+                }
+            },
+            '$' | '`' => return cmd.to_string(),
             c if c.is_whitespace() => return cmd.to_string(),
             c => out.push(c),
         }
@@ -668,6 +685,10 @@ mod tests {
         assert_eq!(
             unwrap_shell("/bin/bash -lc 'a' 'b'"),
             "/bin/bash -lc 'a' 'b'"
+        );
+        assert_eq!(
+            unwrap_shell(r#"/usr/bin/bash -lc "pwd && ssh h 'df -h; echo \"x\"'""#),
+            r#"pwd && ssh h 'df -h; echo "x"'"#
         );
         assert_eq!(unwrap_shell("git status"), "git status");
     }
