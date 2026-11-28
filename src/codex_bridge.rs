@@ -143,6 +143,25 @@ fn split_args(args: &[String]) -> (Vec<String>, Option<String>, Vec<String>) {
     (keep, model, rest)
 }
 
+/// Shows what Codex says on stderr, but not its complaint about a
+/// missing bubblewrap: the space runs Codex without its sandbox (the
+/// space's own account is the boundary), so bubblewrap is never used.
+fn pass_stderr(err: impl std::io::Read) {
+    use std::io::BufRead;
+    let mut said = false;
+    for line in std::io::BufReader::new(err).lines() {
+        let Ok(line) = line else { break };
+        if line.contains("bubblewrap") {
+            if !said {
+                said = true;
+                log("Codex runs without its own sandbox here (the space's account is the boundary), so it does not need bubblewrap");
+            }
+            continue;
+        }
+        eprintln!("{line}");
+    }
+}
+
 fn log(msg: &str) {
     let now = humantime::format_rfc3339_seconds(std::time::SystemTime::now());
     println!("{now} {msg}");
@@ -173,7 +192,7 @@ pub fn run(key: &str) -> Result<()> {
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
     {
         use std::os::unix::process::CommandExt;
         // SAFETY: prctl is async-signal-safe. Codex ends with the bridge.
@@ -196,6 +215,8 @@ pub fn run(key: &str) -> Result<()> {
         model,
     });
     let stdout = child.stdout.take().context("codex stdout")?;
+    let stderr = child.stderr.take().context("codex stderr")?;
+    std::thread::spawn(move || pass_stderr(stderr));
     {
         let b = bridge.clone();
         std::thread::spawn(move || {
@@ -703,14 +724,44 @@ fn feed(b: &Bridge, req: &Value) -> Result<Feed> {
             });
         }
     }
-    let r = b.call(
+    // Paged turns where Codex has them; some threads (or Codex versions)
+    // only answer a whole read, so fall back to that, newest last.
+    let (r, info) = match b.call(
         "thread/turns/list",
         json!({"threadId": id, "itemsView": "full", "limit": turns}),
         QUICK,
-    )?;
-    let info = b
-        .call("thread/read", json!({"threadId": id}), QUICK)
-        .unwrap_or(Value::Null);
+    ) {
+        Ok(r) => {
+            let info = b
+                .call("thread/read", json!({"threadId": id}), QUICK)
+                .unwrap_or(Value::Null);
+            (r, info)
+        }
+        Err(e) => {
+            let info = match b.call(
+                "thread/read",
+                json!({"threadId": id, "includeTurns": true}),
+                QUICK,
+            ) {
+                Ok(v) => v,
+                // A chat just started may not be readable yet: show
+                // what is live instead of an error.
+                Err(_) if b.state.lock().expect("lock").threads.contains_key(&id) => Value::Null,
+                Err(_) => return Err(e),
+            };
+            let all: Vec<Value> = info["thread"]["turns"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let skip = all.len().saturating_sub(turns as usize);
+            let mut page: Vec<Value> = all[skip..].to_vec();
+            page.reverse();
+            (
+                json!({"data": page, "nextCursor": if skip > 0 { json!("more") } else { Value::Null }}),
+                info,
+            )
+        }
+    };
     let st = b.state.lock().expect("lock");
     let live = st.threads.get(&id);
     let running = live.and_then(|l| l.turn.clone());
