@@ -2783,6 +2783,215 @@ pub fn login_cancel(key: &str) {
     }
 }
 
+// ---------------------------------------------------------------- hosts
+
+/// "user@100.80.0.3" or "user@[fd7a::1]" or "user@fd7a::1".
+pub fn parse_target(target: &str) -> Result<(String, IpAddr)> {
+    let Some((user, addr)) = target.rsplit_once('@') else {
+        bail!("give the host as user@address, e.g. root@100.80.0.3");
+    };
+    crate::state::validate_remote_user(user)?;
+    let addr = addr.trim_start_matches('[').trim_end_matches(']');
+    let ip: IpAddr = addr.parse().with_context(|| {
+        format!(
+            "{addr:?} is not an IP address. blackthorn stores addresses, not names, so a \
+             changed DNS record cannot redirect a space; use the host's (tailnet) IP"
+        )
+    })?;
+    Ok((user.to_string(), ip))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Scan {
+    pub user: String,
+    pub address: IpAddr,
+    pub port: u16,
+    pub host_keys: Vec<String>,
+    pub fingerprints: Vec<String>,
+}
+
+/// Reads a machine's host keys, for you to confirm before `host_add`.
+/// `client` is the address of whoever asks (your SSH or browser connection).
+pub fn host_scan(target: &str, port: u16, client: Option<IpAddr>) -> Result<Scan> {
+    scan_target(target, port, client, None)
+}
+
+/// Reads the host keys at a registered machine's new address, for you to
+/// confirm before `host_move`.
+pub fn host_move_scan(name: &str, target: &str, port: u16, client: Option<IpAddr>) -> Result<Scan> {
+    scan_target(target, port, client, Some(name))
+}
+
+/// `moving`: the registered machine that will get this address, if any.
+fn scan_target(
+    target: &str,
+    port: u16,
+    client: Option<IpAddr>,
+    moving: Option<&str>,
+) -> Result<Scan> {
+    sys::require_root()?;
+    let (cfg, state) = ctx::read_only()?;
+    if let Some(n) = moving {
+        state.host(n)?;
+    }
+    let (user, address) = parse_target(target)?;
+    refuse_address(&cfg, address, client)?;
+    check_address_free(&state, address, port, moving)?;
+    let host_keys = keys::scan(address, port)?;
+    let fingerprints = keys::fingerprints(&host_keys)?;
+    Ok(Scan {
+        user,
+        address,
+        port,
+        host_keys,
+        fingerprints,
+    })
+}
+
+fn check_address_free(
+    state: &State,
+    address: IpAddr,
+    port: u16,
+    except: Option<&str>,
+) -> Result<()> {
+    if let Some((n, _)) = state
+        .hosts
+        .iter()
+        .find(|(n, h)| Some(n.as_str()) != except && h.address == address && h.port == port)
+    {
+        bail!("{address} port {port} is already registered as {n}");
+    }
+    Ok(())
+}
+
+/// Machines blackthorn will not manage: they would have a path back.
+fn refuse_address(cfg: &Config, address: IpAddr, client: Option<IpAddr>) -> Result<()> {
+    if cfg.never_manage.contains(&address) {
+        bail!(
+            "{address} is listed in never_manage in {}: blackthorn must have nothing to do with it",
+            paths::CONFIG_FILE
+        );
+    }
+    if cfg.inbound.admin_from.contains(&address) || client == Some(address) {
+        bail!(
+            "{address} is a device you administer the hub from. A managed machine must never \
+             be able to reach the hub, so it cannot be both; manage it from a space only if you \
+             stop using it for administration"
+        );
+    }
+    Ok(())
+}
+
+/// Registers a machine whose host keys you confirmed (from `host_scan`).
+/// The keys are read again and must not have changed. Returns the line to
+/// put in its authorized_keys.
+pub fn host_add(
+    name: &str,
+    target: &str,
+    port: u16,
+    confirmed_keys: &[String],
+    client: Option<IpAddr>,
+) -> Result<String> {
+    let mut ctx = Ctx::open()?;
+    validate_name("host", name)?;
+    if ctx.state.hosts.contains_key(name) {
+        bail!("there is already a host named {name:?}");
+    }
+    let (user, address) = parse_target(target)?;
+    refuse_address(&ctx.cfg, address, client)?;
+    let host_keys = keys::scan(address, port)?;
+    if host_keys != confirmed_keys {
+        bail!("{address}'s host keys changed since you confirmed them; scan again");
+    }
+    keys::generate(name)?;
+    ctx.state.hosts.insert(
+        name.to_string(),
+        Host {
+            address,
+            port,
+            user,
+            host_keys,
+            os: Os::Linux,
+            block: None,
+            readonly: None,
+            setup: None,
+            setup_version: 0,
+            rootless_docker: false,
+            accounts: Default::default(),
+            pending: Vec::new(),
+            problem: None,
+        },
+    );
+    ctx.commit()?;
+    authorized_keys_line(&ctx.cfg, &ctx.state, name)
+}
+
+/// Gives a registered machine a new address, login or port (for example its
+/// tailnet address instead of its LAN one), with host keys you confirmed
+/// (from `host_move_scan`). Its spaces stay; their files and firewall rules
+/// follow. Returns the new authorized_keys line, which replaces the old one
+/// on the machine.
+pub fn host_move(
+    name: &str,
+    target: &str,
+    port: u16,
+    confirmed_keys: &[String],
+    client: Option<IpAddr>,
+) -> Result<String> {
+    let mut ctx = Ctx::open()?;
+    ctx.state.host(name)?;
+    let (user, address) = parse_target(target)?;
+    refuse_address(&ctx.cfg, address, client)?;
+    check_address_free(&ctx.state, address, port, Some(name))?;
+    let host_keys = keys::scan(address, port)?;
+    if host_keys != confirmed_keys {
+        bail!("{address}'s host keys changed since you confirmed them; scan again");
+    }
+    let h = ctx.state.hosts.get_mut(name).expect("exists");
+    h.address = address;
+    h.port = port;
+    h.user = user;
+    h.host_keys = host_keys;
+    ctx.commit()?;
+    authorized_keys_line(&ctx.cfg, &ctx.state, name)
+}
+
+/// The authorized_keys line for a host, limited to the hub's addresses.
+pub fn authorized_keys_line(cfg: &Config, state: &State, name: &str) -> Result<String> {
+    let from = hub_addresses(cfg, state.host(name)?.address);
+    keys::authorized_keys_line(name, &from)
+}
+
+/// The addresses a machine sees the hub's connections come from: ssh_from
+/// if set, else the source address the kernel picks on the route to it (on
+/// a LAN and on a tailnet alike), else the hub's tailnet addresses.
+pub(crate) fn hub_addresses(cfg: &Config, target: IpAddr) -> Vec<IpAddr> {
+    if !cfg.ssh_from.is_empty() {
+        return cfg.ssh_from.clone();
+    }
+    let route = sys::output("ip", &["route", "get", &target.to_string()]);
+    match route.ok().as_deref().and_then(route_source) {
+        Some(src) => vec![src],
+        None => tailscale_ips(),
+    }
+}
+
+/// The `src` address in `ip route get` output.
+fn route_source(out: &str) -> Option<IpAddr> {
+    let words: Vec<&str> = out.split_whitespace().collect();
+    words
+        .windows(2)
+        .find(|w| w[0] == "src")
+        .and_then(|w| w[1].parse().ok())
+}
+
+pub fn host_pubkey(name: &str) -> Result<String> {
+    sys::require_root()?;
+    let (cfg, state) = ctx::read_only()?;
+    authorized_keys_line(&cfg, &state, name)
+}
+
+/// The hub's tailnet addresses, if tailscale is installed and up.
 pub fn tailscale_ips() -> Vec<IpAddr> {
     sys::output("tailscale", &["ip"])
         .map(|o| o.lines().filter_map(|l| l.trim().parse().ok()).collect())
@@ -2884,20 +3093,34 @@ pub fn host_check(name: &str) -> Result<Os> {
     sys::require_root()?;
     let (_, state) = ctx::read_only()?;
     let h = state.host(name)?.clone();
-    let out = crate::remote::ssh(name, &h, &paths::key_file(name), &h.user, "uname -s", None)?;
-    if !out.status.success() {
+    let run = |cmd: &str| crate::remote::ssh(name, &h, &paths::key_file(name), &h.user, cmd, None);
+    let out = run("uname -s")?;
+    // 255: ssh itself failed (not let in, not reached).
+    if out.status.code() == Some(255) {
         bail!(
             "could not log in to {name}: {}\nis the line from `thorn host pubkey {name}` in its authorized_keys?",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let uname = String::from_utf8_lossy(&out.stdout);
-    let os = Os::from_uname(&uname).with_context(|| {
-        format!(
-            "logged in, but {name} runs {:?}; blackthorn supports Linux and macOS machines",
-            uname.trim()
-        )
-    })?;
+    let uname = String::from_utf8_lossy(&out.stdout).to_string();
+    let os = match Os::from_uname(&uname) {
+        Some(os) if out.status.success() => os,
+        _ => {
+            // No uname: Windows, in cmd.exe or PowerShell?
+            let ver = run("cmd /c ver")?;
+            let echo = run("echo %OS%")?;
+            Os::from_windows(
+                &String::from_utf8_lossy(&ver.stdout),
+                &String::from_utf8_lossy(&echo.stdout),
+            )
+            .with_context(|| {
+                format!(
+                    "logged in, but {name} runs {:?}; blackthorn supports Linux, macOS and Windows machines",
+                    uname.trim()
+                )
+            })?
+        }
+    };
     if os != h.os {
         let mut ctx = Ctx::open()?;
         if let Some(host) = ctx.state.hosts.get_mut(name) {

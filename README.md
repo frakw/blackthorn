@@ -17,7 +17,7 @@ anything important.
    come back after a reboot.
 2. **Many machines from one place.** Sign in to Claude on the hub only. The
    machines it works on need an SSH server and one line in
-   `authorized_keys`. Linux and macOS.
+   `authorized_keys`. Linux, macOS and Windows.
 3. **One-way isolation, simple permissions.** A space is *one agent + the
    machines you give it*. It can reach those machines and nothing else; the
    machines cannot reach the hub at all. Cut a machine off from everything
@@ -93,8 +93,10 @@ from those only.
   because they cannot start Remote Control.
 - For Codex spaces: a ChatGPT plan with Codex (device code sign-in allowed
   for your account or workspace), or an OpenAI API key.
-- Machines to manage (Linux or macOS), reachable from the hub at a fixed IP
-  address. A Tailscale or Headscale tailnet works well.
+- Machines to manage (Linux, macOS or Windows with OpenSSH Server),
+  reachable from the hub at a fixed IP address. A Tailscale or Headscale
+  tailnet works well. Logins of each space's own are for Linux machines;
+  see [macOS and Windows machines](#macos-and-windows-machines).
 
 ## Install
 
@@ -455,6 +457,32 @@ root. To set it up anyway, `thorn host setup NAME --print` prints the
 script; run it there as root (it also lets blackthorn's key log in as
 root), then `thorn host setup NAME --verify`. Run the setup again after
 the machine moves address.
+
+### macOS and Windows machines
+
+blackthorn manages macOS and Windows machines too, more simply: their
+spaces log in as the account blackthorn was given there, with everything
+it may do (its files, its keys, `sudo` if it needs no password). Logins of
+each space's own, root for a time and root on approval are for Linux
+machines. Give blackthorn an account made for it, with only what its
+spaces need.
+
+- **macOS**: turn on Remote Login (System Settings → General → Sharing),
+  then add blackthorn's key line to that account's
+  `~/.ssh/authorized_keys`. Spaces are told it is macOS (zsh, BSD tools).
+- **Windows**: install OpenSSH Server (Settings → System → Optional
+  features), start the `sshd` service and set it to start automatically.
+  For an administrator account the key line goes in
+  `C:\ProgramData\ssh\administrators_authorized_keys`, which only
+  Administrators and SYSTEM may change; for another account, in its
+  `%USERPROFILE%\.ssh\authorized_keys`. The machine's page in the web UI
+  has the PowerShell commands for both.
+
+`thorn host check NAME` (or Check login on its page) finds out which it is,
+and on Windows whether its SSH server runs commands in cmd.exe or
+PowerShell; the spaces' instructions say so, with how to quote for it. The
+commands a space runs there are recorded on the hub as on any machine, but
+not in the machine's own log.
 
 ### What a space did
 

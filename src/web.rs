@@ -3028,10 +3028,38 @@ fn host_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
         "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '{}' >> ~/.ssh/authorized_keys",
         line.replace('\'', "")
     );
+    // Windows' OpenSSH reads an administrator's keys from one file of its
+    // own, which only Administrators and SYSTEM may change.
+    let win_admin = format!(
+        "Add-Content -Encoding ascii C:\\ProgramData\\ssh\\administrators_authorized_keys '{}'; \
+         icacls.exe C:\\ProgramData\\ssh\\administrators_authorized_keys /inheritance:r /grant \
+         '*S-1-5-32-544:F' /grant '*S-1-5-18:F'",
+        line.replace('\'', "")
+    );
+    let win_user = format!(
+        "New-Item -Force -ItemType Directory $HOME\\.ssh | Out-Null; Add-Content -Encoding ascii \
+         $HOME\\.ssh\\authorized_keys '{}'",
+        line.replace('\'', "")
+    );
+    let others = format!(
+        "<details class=\"more\"{}><summary>On macOS or Windows</summary>\
+         <p><b>macOS</b>: turn on Remote Login (System Settings → General → Sharing), then add the line as \
+         above.</p><p><b>Windows</b>: install OpenSSH Server (Settings → System → Optional features), start the \
+         <code>sshd</code> service and set it to start automatically. If {user} is an administrator, its key \
+         goes in a file of its own: run this in PowerShell as administrator:</p>{}\
+         <p class=\"hint\">Otherwise, as {user}, in PowerShell:</p>{}\
+         <p class=\"hint\">On macOS and Windows its spaces log in as {user}, with all it may do: logins of each \
+         space's own are for Linux machines. Check login tells blackthorn which it is (and on Windows, whether \
+         commands run in cmd.exe or PowerShell).</p></details>",
+        if h.os == crate::state::Os::Linux { "" } else { " open" },
+        copyable("keywinadmin", &win_admin),
+        copyable("keywinuser", &win_user),
+        user = esc(&h.user)
+    );
     b.push_str(&format!(
         "<section class=\"card\"><h2>Key</h2><p>blackthorn logs in to {} with its own key. Put this line in \
          <code>~{}/.ssh/authorized_keys</code> there:</p>{}\
-         <p class=\"hint\">Or run this on {} as {}:</p>{}<div class=\"buttons\">{}{}</div></section>",
+         <p class=\"hint\">Or run this on {} as {}:</p>{}{others}<div class=\"buttons\">{}{}</div></section>",
         esc(&h.name),
         esc(&h.user),
         copyable("keyline", &line),
@@ -3109,6 +3137,19 @@ fn logins_card(c: &Ctx, h: &HostView) -> String {
         )
     };
     let mut b = String::new();
+    if h.os != crate::state::Os::Linux && h.setup.is_none() {
+        b.push_str(&format!(
+            "<p>{} runs {}: its spaces log in as <b>{}</b>, the login blackthorn was given, with all it may do \
+             (its files, its keys, sudo if it may use it without a password). Logins of each space's own \
+             (read-only, user, root for a time) are for Linux machines.</p><p class=\"hint\">A login made for \
+             blackthorn alone, with only what its spaces need, keeps the rest of the machine out of their \
+             reach.</p>",
+            esc(&h.name),
+            h.os,
+            esc(&h.user)
+        ));
+        return format!("<section class=\"card\" id=\"logins\"><h2>Logins</h2>{b}</section>");
+    }
     match h.setup {
         Some(t) => {
             b.push_str(&format!(

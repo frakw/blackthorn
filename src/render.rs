@@ -128,6 +128,17 @@ pub fn instructions(space_name: &str, state: &State, now: u64) -> String {
             );
         }
         out.push('\n');
+        if logins.iter().any(|l| l.h.os.windows()) {
+            out.push_str(
+                "### Windows machines\n\n\
+                 A Windows host runs your command in the shell its SSH server uses (named above): \
+                 cmd.exe or PowerShell, not a POSIX shell, so `ls`, `grep` and `cat` may not exist. \
+                 Quote for that shell, and prefer PowerShell for anything more than one command: \
+                 `ssh <host> 'powershell -NoProfile -Command \"Get-Service | Where Status -eq Running\"'`. \
+                 `scp <host>:C:/path/to/file /tmp/` copies files (forward slashes work). You log in as \
+                 the account blackthorn was given there, with all it may do.\n\n",
+            );
+        }
         let own = |t: Tier| logins.iter().any(|l| l.tier == t);
         // Its own logins on a machine set up for them: (host, /srv folder).
         let theirs: Vec<(&str, Option<String>)> = logins

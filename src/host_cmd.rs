@@ -20,6 +20,11 @@ pub fn add(name: &str, target: &str, port: u16, yes: bool) -> Result<()> {
         scan.user
     );
     print_line(&line);
+    println!(
+        "(macOS: turn on Remote Login first. Windows: an administrator's key goes in \
+         C:\\ProgramData\\ssh\\administrators_authorized_keys instead; the machine's page in the \
+         web UI has the commands.)"
+    );
     println!("then check it with: sudo thorn host check {name}");
     if scan.user == "root" {
         println!(

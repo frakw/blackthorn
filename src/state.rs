@@ -28,6 +28,11 @@ pub enum Os {
     #[default]
     Linux,
     Macos,
+    /// Windows, its SSH server running commands in cmd.exe (its default).
+    Windows,
+    /// Windows, its SSH server running commands in PowerShell.
+    #[serde(rename = "windows-powershell")]
+    WindowsPowershell,
 }
 
 impl Os {
@@ -37,7 +42,32 @@ impl Os {
             Os::Macos => {
                 "macOS (zsh, BSD userland: flags of sed, grep, date, stat differ from GNU)"
             }
+            Os::Windows => {
+                "Windows (commands run in cmd.exe: no POSIX tools; for PowerShell, \
+                 `ssh <host> 'powershell -NoProfile -Command \"...\"'`; paths like C:\\Users)"
+            }
+            Os::WindowsPowershell => {
+                "Windows (commands run in PowerShell: no POSIX tools; paths like C:\\Users)"
+            }
         }
+    }
+
+    pub fn windows(self) -> bool {
+        matches!(self, Os::Windows | Os::WindowsPowershell)
+    }
+
+    /// What `cmd /c ver` and then `echo %OS%` print on a Windows machine:
+    /// Windows, and which shell its SSH server runs commands in (cmd.exe
+    /// expands %OS%; PowerShell does not).
+    pub fn from_windows(ver: &str, echo: &str) -> Option<Os> {
+        if !ver.contains("Windows") {
+            return None;
+        }
+        Some(if echo.trim() == "Windows_NT" {
+            Os::Windows
+        } else {
+            Os::WindowsPowershell
+        })
     }
 
     /// From the output of `uname -s`.
@@ -55,6 +85,8 @@ impl std::fmt::Display for Os {
         f.write_str(match self {
             Os::Linux => "linux",
             Os::Macos => "macos",
+            Os::Windows => "windows",
+            Os::WindowsPowershell => "windows (PowerShell)",
         })
     }
 }
@@ -1195,6 +1227,14 @@ since = 1
         assert_eq!(Os::from_uname("Linux\n"), Some(Os::Linux));
         assert_eq!(Os::from_uname("Darwin"), Some(Os::Macos));
         assert_eq!(Os::from_uname("MINGW64_NT"), None);
+        let ver = "\r\nMicrosoft Windows [Version 10.0.26100.2314]\r\n";
+        assert_eq!(Os::from_windows(ver, "Windows_NT\r\n"), Some(Os::Windows));
+        assert_eq!(
+            Os::from_windows(ver, "%OS%\r\n"),
+            Some(Os::WindowsPowershell)
+        );
+        assert_eq!(Os::from_windows("bash: cmd: command not found", ""), None);
+        assert!(Os::WindowsPowershell.windows() && !Os::Macos.windows());
     }
 
     #[test]
