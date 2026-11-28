@@ -5,7 +5,7 @@ coding agents live. They keep running there, you reach them from your phone
 or laptop, and each one can work on exactly one of your machines, over SSH,
 one way only.
 
-Status: **early (v0.16)**. It works and is tested end to end, but expect
+Status: **early (v0.17)**. It works and is tested end to end, but expect
 changes. Read [THREAT_MODEL.md](THREAT_MODEL.md) before trusting it with
 anything important.
 
@@ -292,7 +292,7 @@ restores the old settings at any time.
 | `thorn new HOST [--agent A] [--name N] [--access user\|read-only] [--root 8h\|forever\|no] [--single] [--local] [--arg A]...` | Create a space on a machine |
 | `thorn login SPACE [--api-key]` | Sign a Claude or Codex space in, then start it (Codex: a device code, or an API key on standard input) |
 | `thorn codex status` / `install` | OpenAI's Codex on the hub: its version; install or update it |
-| `thorn codex chats\|show\|new\|send\|stop\|answer\|rename\|archive SPACE ...` | A Codex space's chats: list, read, start, write, stop, answer what Codex asks |
+| `thorn codex chats\|show\|new\|send\|stop\|answer\|rename\|archive\|models SPACE ...` | A Codex space's chats: list, read, start, write (with `--file`, `--model`, `--effort`), stop, answer what Codex asks; the models it offers |
 | `thorn start\|stop\|restart SPACE... \| --all` | Control spaces |
 | `thorn connect SPACE HOST [--access read-only\|user]` / `thorn disconnect SPACE HOST` | Let a space work on one more machine (read-only by default); take one from it |
 | `thorn access SPACE user\|read-only [--host H]` | A space's usual login on one of its machines; applies at once |
@@ -357,13 +357,26 @@ conversation of its own, and continue any of them later. The page shows
 what Codex says, the commands it runs with their output, and the files it
 changes; when Codex asks to run something, the chat shows what and offers
 **Allow once**, **Allow for this chat**, **Decline** or **Decline and
-stop**. The same from the command line:
+stop**.
+
+Add files to a message with **+**, by dropping them on the box, or by
+pasting a picture. Files are saved in the space's work folder, under
+`.uploads/`, with the same 10 MB limit as Claude chats. Codex shows
+pictures to the model. For any other file, Codex gets its path and opens
+it itself.
+
+Each chat has its own model and reasoning effort, picked under the
+message box from the models your Codex account offers. A change applies
+from your next message. The same from the command line:
 
 ```sh
 sudo thorn codex chats fig-codex
 sudo thorn codex new fig-codex "Why is nginx restarting?"
 sudo thorn codex show fig-codex 0199a2         # the start of a chat's id
 sudo thorn codex send fig-codex 0199a2 "Check the logs from last night too"
+sudo thorn codex send fig-codex 0199a2 "What is this?" --file shot.png
+sudo thorn codex models fig-codex              # its models and efforts
+sudo thorn codex send fig-codex 0199a2 "Think harder" --model gpt-5.5 --effort high
 sudo thorn codex answer fig-codex 0199a2 1 accept
 ```
 

@@ -11,7 +11,7 @@
 //! Codex runs without its own sandbox and asks before what it is unsure of
 //! (as the space's terminal Codex did): the space is the sandbox.
 
-use crate::codex::{self, Ask, Chat, Feed, Item, Question};
+use crate::codex::{self, Ask, Chat, Feed, Item, Question, With};
 use crate::paths;
 use crate::render::Launch;
 use anyhow::{bail, Context, Result};
@@ -42,6 +42,8 @@ struct Live {
     items: Vec<Value>,
     notice: String,
     name: Option<String>,
+    /// A model and effort asked for while a turn ran: for the next one.
+    want: Option<With>,
 }
 
 /// A request from Codex waiting on a person.
@@ -62,6 +64,8 @@ struct State {
     next_ask: u64,
     /// Threads Codex has loaded (it can take a message without a resume).
     loaded: HashSet<String>,
+    /// The models Codex offers, as last read, and when.
+    models: Option<(std::time::Instant, Vec<codex::Model>)>,
 }
 
 impl State {
@@ -469,12 +473,121 @@ fn thread_id(req: &Value) -> Result<String> {
     Ok(id.to_string())
 }
 
-fn text_input(req: &Value) -> Result<Value> {
+/// What comes with a message (see codex::With).
+fn with_of(req: &Value) -> With {
+    serde_json::from_value(req["with"].clone()).unwrap_or_default()
+}
+
+/// A message for Codex: its text, then each file, a picture shown to the
+/// model, any other file named for it to open.
+fn text_input(b: &Bridge, req: &Value, with: &With) -> Result<Value> {
     let text = req["text"].as_str().unwrap_or("");
-    if text.trim().is_empty() || text.len() > codex::MAX_MESSAGE {
+    if (text.trim().is_empty() && with.files.is_empty()) || text.len() > codex::MAX_MESSAGE {
         bail!("nothing to send, or too much");
     }
-    Ok(json!([{"type": "text", "text": text, "text_elements": []}]))
+    let mut input = Vec::new();
+    if !text.trim().is_empty() {
+        input.push(json!({"type": "text", "text": text, "text_elements": []}));
+    }
+    for f in &with.files {
+        if !codex::upload_ok(f) {
+            bail!("not a file added here: {f}");
+        }
+        let path = std::path::Path::new(&b.workdir).join(f);
+        if !path.is_file() {
+            bail!("{f} is not there any more");
+        }
+        if codex::is_picture(f) {
+            input.push(json!({"type": "localImage", "path": path.display().to_string()}));
+        } else {
+            input.push(json!({"type": "text", "text": codex::file_note(f), "text_elements": []}));
+        }
+    }
+    Ok(Value::Array(input))
+}
+
+/// A new turn, with the model and effort asked for (now, or while the
+/// last turn ran).
+fn start_turn(b: &Bridge, id: &str, input: Value, with: &With) -> Result<Value> {
+    let want = b
+        .state
+        .lock()
+        .expect("lock")
+        .threads
+        .get_mut(id)
+        .and_then(|l| l.want.take());
+    let mut params = json!({"threadId": id, "input": input});
+    let model = Some(with.model.as_str()).filter(|m| !m.is_empty()).or(want
+        .as_ref()
+        .map(|w| w.model.as_str())
+        .filter(|m| !m.is_empty()));
+    let effort = Some(with.effort.as_str()).filter(|m| !m.is_empty()).or(want
+        .as_ref()
+        .map(|w| w.effort.as_str())
+        .filter(|m| !m.is_empty()));
+    if let Some(m) = model {
+        params["model"] = json!(m);
+    }
+    if let Some(e) = effort {
+        params["effort"] = json!(e);
+    }
+    b.call("turn/start", params, SLOW)
+}
+
+/// The models Codex offers, read again every ten minutes.
+fn models(b: &Bridge) -> Result<Vec<codex::Model>> {
+    if let Some((at, list)) = &b.state.lock().expect("lock").models {
+        if at.elapsed() < Duration::from_secs(600) {
+            return Ok(list.clone());
+        }
+    }
+    let mut list = Vec::new();
+    let mut cursor = Value::Null;
+    for _ in 0..10 {
+        let r = b.call("model/list", json!({"cursor": cursor}), QUICK)?;
+        for m in r["data"].as_array().into_iter().flatten() {
+            if m["hidden"].as_bool().unwrap_or(false) {
+                continue;
+            }
+            let id = m["model"]
+                .as_str()
+                .or_else(|| m["id"].as_str())
+                .unwrap_or("")
+                .to_string();
+            if id.is_empty() {
+                continue;
+            }
+            list.push(codex::Model {
+                name: m["displayName"].as_str().unwrap_or(&id).to_string(),
+                id,
+                default: m["isDefault"].as_bool().unwrap_or(false),
+                efforts: m["supportedReasoningEfforts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| {
+                        e["reasoningEffort"]
+                            .as_str()
+                            .or_else(|| e.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect(),
+                default_effort: m["defaultReasoningEffort"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+                images: m["inputModalities"]
+                    .as_array()
+                    .map_or(true, |a| a.iter().any(|x| x == "image")),
+            });
+        }
+        cursor = r["nextCursor"].clone();
+        if !cursor.is_string() {
+            break;
+        }
+    }
+    b.state.lock().expect("lock").models = Some((std::time::Instant::now(), list.clone()));
+    Ok(list)
 }
 
 const QUICK: Duration = Duration::from_secs(15);
@@ -484,11 +597,15 @@ fn handle(b: &Bridge, req: &Value) -> Result<Value> {
     match req["op"].as_str().unwrap_or("") {
         "list" => Ok(serde_json::to_value(list(b)?)?),
         "feed" => Ok(serde_json::to_value(feed(b, req)?)?),
+        "models" => Ok(serde_json::to_value(models(b)?)?),
         "new" => {
-            let input = text_input(req)?;
+            let with = with_of(req);
+            let input = text_input(b, req, &with)?;
             let mut params =
                 json!({"cwd": b.workdir, "approvalPolicy": APPROVAL, "sandbox": SANDBOX});
-            if let Some(m) = &b.model {
+            if !with.model.is_empty() {
+                params["model"] = json!(with.model);
+            } else if let Some(m) = &b.model {
                 params["model"] = json!(m);
             }
             let r = b.call("thread/start", params, SLOW)?;
@@ -497,13 +614,14 @@ fn handle(b: &Bridge, req: &Value) -> Result<Value> {
                 bail!("Codex did not start a chat");
             }
             b.state.lock().expect("lock").loaded.insert(id.clone());
-            b.call("turn/start", json!({"threadId": id, "input": input}), SLOW)?;
+            start_turn(b, &id, input, &with)?;
             log(&format!("chat {}: started from the hub", short(&id)));
             Ok(json!({"id": id}))
         }
         "send" => {
             let id = thread_id(req)?;
-            let input = text_input(req)?;
+            let with = with_of(req);
+            let input = text_input(b, req, &with)?;
             load(b, &id)?;
             let turn = b
                 .state
@@ -513,12 +631,22 @@ fn handle(b: &Bridge, req: &Value) -> Result<Value> {
                 .get(&id)
                 .and_then(|l| l.turn.clone());
             match turn {
-                Some(t) => b.call(
-                    "turn/steer",
-                    json!({"threadId": id, "expectedTurnId": t, "input": input}),
-                    SLOW,
-                )?,
-                None => b.call("turn/start", json!({"threadId": id, "input": input}), SLOW)?,
+                Some(t) => {
+                    // A turn under way keeps its model: a new one is for
+                    // the next turn.
+                    if !with.model.is_empty() || !with.effort.is_empty() {
+                        b.state.lock().expect("lock").live(&id).want = Some(With {
+                            files: Vec::new(),
+                            ..with.clone()
+                        });
+                    }
+                    b.call(
+                        "turn/steer",
+                        json!({"threadId": id, "expectedTurnId": t, "input": input}),
+                        SLOW,
+                    )?
+                }
+                None => start_turn(b, &id, input, &with)?,
             };
             Ok(json!({}))
         }
@@ -580,8 +708,24 @@ fn load(b: &Bridge, id: &str) -> Result<()> {
     }
     let mut params = json!({"threadId": id, "excludeTurns": true,
         "approvalPolicy": APPROVAL, "sandbox": SANDBOX});
-    if let Some(m) = &b.model {
-        params["model"] = json!(m);
+    // The chat goes on with the model and effort it last had; the
+    // space's model only for a chat that never had one.
+    let last = b
+        .call("thread/read", json!({"threadId": id}), QUICK)
+        .unwrap_or(Value::Null);
+    match last["thread"]["model"].as_str().filter(|m| !m.is_empty()) {
+        Some(m) => params["model"] = json!(m),
+        None => {
+            if let Some(m) = &b.model {
+                params["model"] = json!(m);
+            }
+        }
+    }
+    if let Some(e) = last["thread"]["reasoningEffort"]
+        .as_str()
+        .filter(|e| !e.is_empty())
+    {
+        params["config"] = json!({"model_reasoning_effort": e});
     }
     b.call("thread/resume", params, SLOW)?;
     b.state.lock().expect("lock").loaded.insert(id.to_string());
@@ -799,6 +943,10 @@ fn feed(b: &Bridge, req: &Value) -> Result<Feed> {
             .collect(),
         notice: live.map(|l| l.notice.clone()).unwrap_or_default(),
         model: info["thread"]["model"].as_str().unwrap_or("").to_string(),
+        effort: info["thread"]["reasoningEffort"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
         level: None,
     })
 }

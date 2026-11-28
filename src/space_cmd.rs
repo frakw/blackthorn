@@ -591,8 +591,13 @@ pub fn codex_show(space: &str, chat: &str, turns: u32) -> Result<()> {
     for it in &f.items {
         match it.kind.as_str() {
             "user" => println!(
-                "\n> {}{}",
+                "\n> {}{}{}",
                 it.text.replace('\n', "\n> "),
+                if it.files.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n  (files: {})", it.files.join(", "))
+                },
                 it.by
                     .as_ref()
                     .map(|b| format!("\n  (sent by {b})"))
@@ -633,16 +638,74 @@ pub fn codex_show(space: &str, chat: &str, turns: u32) -> Result<()> {
     Ok(())
 }
 
-pub fn codex_new(space: &str, text: &str) -> Result<()> {
-    let id = crate::codex::new(space, text, &by_cli())?;
+/// The files saved for the space, and the model and effort, to send.
+fn codex_with(
+    space: &str,
+    files: &[std::path::PathBuf],
+    model: Option<String>,
+    effort: Option<String>,
+) -> Result<crate::codex::With> {
+    let mut with = crate::codex::With {
+        model: model.unwrap_or_default(),
+        effort: effort.unwrap_or_default(),
+        ..Default::default()
+    };
+    for f in files {
+        let data = std::fs::read(f).with_context(|| format!("reading {}", f.display()))?;
+        let name = f
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let at = crate::codex::upload(space, &name, &data, &by_cli())?;
+        println!("added {at}");
+        with.files.push(at);
+    }
+    Ok(with)
+}
+
+pub fn codex_new(
+    space: &str,
+    text: &str,
+    files: &[std::path::PathBuf],
+    model: Option<String>,
+    effort: Option<String>,
+) -> Result<()> {
+    let with = codex_with(space, files, model, effort)?;
+    let id = crate::codex::new(space, text, &with, &by_cli())?;
     println!("started chat {id}");
     Ok(())
 }
 
-pub fn codex_send(space: &str, chat: &str, text: &str) -> Result<()> {
+pub fn codex_send(
+    space: &str,
+    chat: &str,
+    text: &str,
+    files: &[std::path::PathBuf],
+    model: Option<String>,
+    effort: Option<String>,
+) -> Result<()> {
     let id = codex_chat(space, chat)?;
-    crate::codex::send(space, &id, text, &by_cli())?;
+    let with = codex_with(space, files, model, effort)?;
+    crate::codex::send(space, &id, text, &with, &by_cli())?;
     println!("sent");
+    Ok(())
+}
+
+pub fn codex_models(space: &str) -> Result<()> {
+    let list = crate::codex::models(space)?;
+    if list.is_empty() {
+        println!("Codex offers no list of models here");
+    }
+    for m in list {
+        println!(
+            "{}{}  {}  efforts: {}{}",
+            m.id,
+            if m.default { " (default)" } else { "" },
+            m.name,
+            m.efforts.join(", "),
+            if m.images { "" } else { "  (no pictures)" }
+        );
+    }
     Ok(())
 }
 

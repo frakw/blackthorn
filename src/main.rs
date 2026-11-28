@@ -395,14 +395,23 @@ enum CodexCmd {
         turns: u32,
     },
     /// Start a chat with its first message.
-    New { space: String, text: String },
+    New {
+        space: String,
+        text: String,
+        #[command(flatten)]
+        with: CodexWith,
+    },
     /// Send a message to a chat (while Codex works: more for what it is
     /// doing).
     Send {
         space: String,
         chat: String,
         text: String,
+        #[command(flatten)]
+        with: CodexWith,
     },
+    /// The models Codex offers in a space, and their efforts.
+    Models { space: String },
     /// Stop what Codex is doing in a chat.
     Stop { space: String, chat: String },
     /// Answer what Codex asks (see `show` for its number): accept, session
@@ -424,6 +433,21 @@ enum CodexCmd {
     },
     /// Archive a chat: Codex keeps it, out of the list.
     Archive { space: String, chat: String },
+}
+
+/// What goes with a message to Codex besides its text.
+#[derive(clap::Args)]
+struct CodexWith {
+    /// A file to add (saved in the space's .uploads; a picture is shown
+    /// to the model). Repeat for more.
+    #[arg(long = "file")]
+    files: Vec<std::path::PathBuf>,
+    /// The model, from here on in this chat (see `thorn codex models`).
+    #[arg(long)]
+    model: Option<String>,
+    /// The reasoning effort, from here on in this chat.
+    #[arg(long)]
+    effort: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -826,8 +850,16 @@ fn run(cli: Cli) -> Result<()> {
             CodexCmd::Install => config_cmd::codex_install(),
             CodexCmd::Chats { space } => s::codex_chats(&space),
             CodexCmd::Show { space, chat, turns } => s::codex_show(&space, &chat, turns),
-            CodexCmd::New { space, text } => s::codex_new(&space, &text),
-            CodexCmd::Send { space, chat, text } => s::codex_send(&space, &chat, &text),
+            CodexCmd::New { space, text, with } => {
+                s::codex_new(&space, &text, &with.files, with.model, with.effort)
+            }
+            CodexCmd::Send {
+                space,
+                chat,
+                text,
+                with,
+            } => s::codex_send(&space, &chat, &text, &with.files, with.model, with.effort),
+            CodexCmd::Models { space } => s::codex_models(&space),
             CodexCmd::Stop { space, chat } => s::codex_stop(&space, &chat),
             CodexCmd::Answer {
                 space,
@@ -1080,6 +1112,8 @@ mod tests {
             ("codex_feed", &["codex", "show"]),
             ("codex_new", &["codex", "new"]),
             ("codex_send", &["codex", "send"]),
+            ("codex_upload", &["codex", "send"]),
+            ("codex_models", &["codex", "models"]),
             ("codex_stop", &["codex", "stop"]),
             ("codex_answer", &["codex", "answer"]),
             ("codex_rename", &["codex", "rename"]),

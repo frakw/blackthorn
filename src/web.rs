@@ -1699,12 +1699,35 @@ fn chat_items_html(items: &[crate::chat::Item]) -> String {
     for it in items {
         match it.kind.as_str() {
             "user" => out.push_str(&format!(
-                "<div class=\"msg user\">{}<div class=\"bubble\">{}</div></div>",
+                "<div class=\"msg user\">{}{}{}</div>",
                 it.by
                     .as_ref()
                     .map(|b| format!("<span class=\"by\">{}</span>", esc(b)))
                     .unwrap_or_default(),
-                esc(&it.text)
+                if it.text.is_empty() {
+                    String::new()
+                } else {
+                    format!("<div class=\"bubble\">{}</div>", esc(&it.text))
+                },
+                if it.files.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "<div class=\"sent-files\">{}</div>",
+                        it.files
+                            .iter()
+                            .map(|f| format!(
+                                "<span class=\"sent-file\">{}{}</span>",
+                                if crate::codex::is_picture(f) || f == "picture" {
+                                    "🖼 "
+                                } else {
+                                    "📎 "
+                                },
+                                esc(f)
+                            ))
+                            .collect::<String>()
+                    )
+                }
             )),
             "assistant" => out.push_str(&format!(
                 "<div class=\"msg assistant\">{}</div>",
@@ -4353,11 +4376,24 @@ fn codex_chats_card(c: &Ctx, s: &SpaceView) -> String {
     } else if !c.chat {
         unlock_form(c, &format!("/space/{n}/codex-unlock"), "a Codex")
     } else {
+        let models = get::<Vec<crate::codex::Model>>(
+            c,
+            Op::CodexModels {
+                name: s.name.clone(),
+            },
+        )
+        .unwrap_or_default();
         format!(
             "<form method=\"post\" action=\"/space/{n}/codex-new\" class=\"stack codex-new\">{}\
              <label>New chat <textarea name=\"text\" rows=\"2\" required placeholder=\"What should Codex do?\"></textarea></label>\
-             <div><button class=\"primary\">Start chat</button></div></form>",
-            csrf(c)
+             {}<div><button class=\"primary\">Start chat</button></div>\
+             <p class=\"hint\">Add files and pictures in the chat, once it has started.</p></form>",
+            csrf(c),
+            if models.is_empty() {
+                String::new()
+            } else {
+                codex_model_picker(&models, "", "", false)
+            }
         )
     };
     format!(
@@ -4640,14 +4676,20 @@ fn codex_page(
     } else if !c.chat {
         unlock_form(c, &format!("{here}/unlock"), "a Codex")
     } else {
+        let models = get::<Vec<crate::codex::Model>>(c, Op::CodexModels { name: name.into() })
+            .unwrap_or_default();
         format!(
             "<form method=\"post\" action=\"{here}/send\" id=\"composer\" class=\"composer\">{}\
-             <div class=\"composer-row\"><textarea name=\"text\" id=\"chat-text\" rows=\"1\" \
-             placeholder=\"Message Codex\" required></textarea>\
+             <div id=\"attached\" class=\"attached\"></div>\
+             <div class=\"composer-row\">\
+             <button type=\"button\" class=\"plus\" id=\"attach\" aria-label=\"Add files or pictures\" \
+             title=\"Add files or pictures\" hidden>+</button>\
+             <textarea name=\"text\" id=\"chat-text\" rows=\"1\" placeholder=\"Message Codex\"></textarea>\
              <button class=\"primary send\">Send</button></div>\
-             <div class=\"composer-foot\"><span class=\"hint\">{}</span></div></form>",
+             <div class=\"composer-foot\">{}</div>\
+             <input type=\"file\" id=\"chat-file\" multiple hidden></form>",
             csrf(c),
-            esc(&feed.model)
+            codex_model_picker(&models, &feed.model, &feed.effort, true),
         )
     };
     let rename = if may {
@@ -4777,9 +4819,22 @@ fn codex_post(
                     name: name.into(),
                     id: id.into(),
                     text: f(form, "text").into(),
+                    with: codex_with(form),
                 },
             ),
             "sent",
+            &here,
+        ),
+        "upload" => answer(
+            get(
+                c,
+                Op::CodexUpload {
+                    name: name.into(),
+                    filename: f(form, "filename").into(),
+                    data: f(form, "data").into(),
+                },
+            ),
+            "saved",
             &here,
         ),
         "stop" => answer(
@@ -4874,6 +4929,106 @@ fn unlock(c: &Ctx, form: &HashMap<String, String>, to: &str) -> Reply {
     }
 }
 
+/// Choosing the model and effort: two selects (`model`, `effort`) with
+/// what Codex offers, the chat's own chosen. Each model's efforts ride on
+/// its option, for the page's script to offer only those. Without a list
+/// from Codex: the model's name. `live`: the chat page, where a change
+/// takes effect with the next message.
+fn codex_model_picker(
+    models: &[crate::codex::Model],
+    model: &str,
+    effort: &str,
+    live: bool,
+) -> String {
+    if models.is_empty() {
+        return format!("<span class=\"hint\">{}</span>", esc(model));
+    }
+    let current = models
+        .iter()
+        .find(|m| m.id == model)
+        .or_else(|| models.iter().find(|m| m.default))
+        .or(models.first());
+    let mut opts = String::new();
+    if !model.is_empty() && !models.iter().any(|m| m.id == model) {
+        opts.push_str(&format!(
+            "<option value=\"{0}\" selected>{0}</option>",
+            esc(model)
+        ));
+    }
+    if !live {
+        opts.push_str("<option value=\"\">Default model</option>");
+    }
+    for m in models {
+        opts.push_str(&format!(
+            "<option value=\"{}\" data-efforts=\"{}\" data-effort=\"{}\"{}>{}{}</option>",
+            esc(&m.id),
+            esc(&m.efforts.join(" ")),
+            esc(&m.default_effort),
+            if live && current.is_some_and(|c| c.id == m.id) && (model.is_empty() || model == m.id)
+            {
+                " selected"
+            } else {
+                ""
+            },
+            esc(&m.name),
+            if m.images { "" } else { " (no pictures)" }
+        ));
+    }
+    let efforts: Vec<String> = match current {
+        Some(m) if live && !m.efforts.is_empty() => m.efforts.clone(),
+        _ => models
+            .iter()
+            .flat_map(|m| m.efforts.iter().cloned())
+            .fold(Vec::new(), |mut v, e| {
+                if !v.contains(&e) {
+                    v.push(e);
+                }
+                v
+            }),
+    };
+    let mut eopts = if live {
+        String::new()
+    } else {
+        "<option value=\"\">Default effort</option>".to_string()
+    };
+    if live && !effort.is_empty() && !efforts.iter().any(|e| e == effort) {
+        eopts.push_str(&format!(
+            "<option value=\"{0}\" selected>{0}</option>",
+            esc(effort)
+        ));
+    }
+    for e in &efforts {
+        eopts.push_str(&format!(
+            "<option value=\"{0}\"{1}>{0}</option>",
+            esc(e),
+            if live && e == effort { " selected" } else { "" }
+        ));
+    }
+    format!(
+        "<div class=\"codex-model\"><label>Model <select name=\"model\" class=\"model-pick\">{opts}</select></label>\
+         <label>Effort <select name=\"effort\" class=\"effort-pick\">{eopts}</select></label>{}</div>",
+        if live {
+            "<span class=\"hint model-note\" hidden>from your next message</span>"
+        } else {
+            ""
+        }
+    )
+}
+
+/// The files (one path a line), model and effort sent with a message.
+fn codex_with(form: &HashMap<String, String>) -> crate::codex::With {
+    crate::codex::With {
+        files: f(form, "files")
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect(),
+        model: f(form, "model").trim().into(),
+        effort: f(form, "effort").trim().into(),
+    }
+}
+
 /// Starts a Codex chat and opens it.
 fn codex_new(c: &Ctx, name: &str, form: &HashMap<String, String>) -> Reply {
     let n = url_encode(name);
@@ -4882,6 +5037,7 @@ fn codex_new(c: &Ctx, name: &str, form: &HashMap<String, String>) -> Reply {
         Op::CodexNew {
             name: name.into(),
             text: f(form, "text").into(),
+            with: codex_with(form),
         },
     ) {
         Ok(id) if crate::codex::id_ok(&id) => {

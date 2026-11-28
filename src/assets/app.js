@@ -1105,13 +1105,157 @@ document.querySelectorAll("time[data-local]").forEach(function (t) {
     text.style.height = Math.min(text.scrollHeight, window.innerHeight * 0.4) + "px";
   };
   text.addEventListener("input", grow);
+
+  var post = function (url, fields) {
+    var body = new URLSearchParams();
+    Object.keys(fields).forEach(function (k) { body.set(k, fields[k]); });
+    body.set("csrf", csrf);
+    body.set("js", "1");
+    return fetch(url, { method: "POST", body: body, credentials: "same-origin" })
+      .then(json)
+      .then(function (j) {
+        if (j.error) throw new Error(j.error);
+        return j;
+      });
+  };
+
+  // The model and effort: sent with the next message only once changed;
+  // the efforts offered are the chosen model's.
+  var modelSel = form.querySelector(".model-pick");
+  var effortSel = form.querySelector(".effort-pick");
+  var note = form.querySelector(".model-note");
+  var changed = false;
+  if (modelSel && effortSel) {
+    modelSel.addEventListener("change", function () {
+      var o = modelSel.selectedOptions[0];
+      var list = ((o && o.getAttribute("data-efforts")) || "").split(" ").filter(Boolean);
+      if (list.length) {
+        var keep = effortSel.value;
+        var want = list.indexOf(keep) >= 0 ? keep : (o.getAttribute("data-effort") || list[0]);
+        effortSel.innerHTML = "";
+        list.forEach(function (e) {
+          var opt = document.createElement("option");
+          opt.value = e;
+          opt.textContent = e;
+          if (e === want) opt.selected = true;
+          effortSel.appendChild(opt);
+        });
+      }
+      changed = true;
+      if (note) note.hidden = false;
+    });
+    effortSel.addEventListener("change", function () { changed = true; if (note) note.hidden = false; });
+  }
+
+  // Files for the next message, saved in the space as they are added:
+  // { name, path (once saved), preview (a picture), error }.
+  var attach = document.getElementById("attach");
+  var fileInput = document.getElementById("chat-file");
+  var attached = document.getElementById("attached");
+  var files = [];
+  var pending = 0;
+  var uploadUrl = form.action.replace(/\/send$/, "/upload");
+  var drawFiles = function () {
+    attached.innerHTML = "";
+    files.forEach(function (f) {
+      var card = document.createElement("div");
+      card.className = "att" + (f.preview ? " pic" : "") + (f.error ? " bad" : "");
+      if (f.preview) {
+        var img = document.createElement("img");
+        img.src = f.preview;
+        img.alt = f.name;
+        card.appendChild(img);
+      }
+      var label = document.createElement("span");
+      label.className = "att-name";
+      label.textContent = f.error ? f.name + ": " + f.error : (f.path ? f.name : f.name + " …");
+      card.appendChild(label);
+      var x = document.createElement("button");
+      x.type = "button";
+      x.className = "att-x";
+      x.setAttribute("aria-label", "Remove " + f.name);
+      x.textContent = "×";
+      x.addEventListener("click", function () {
+        files.splice(files.indexOf(f), 1);
+        drawFiles();
+      });
+      card.appendChild(x);
+      attached.appendChild(card);
+    });
+  };
+  var upload = function (blob) {
+    var f = { name: blob.name || "pasted.png", path: null, preview: null, error: null };
+    files.push(f);
+    if (blob.size > 10 * 1024 * 1024) {
+      f.error = "over 10 MB";
+      drawFiles();
+      return;
+    }
+    drawFiles();
+    pending += 1;
+    var r = new FileReader();
+    r.onload = function () {
+      var url = String(r.result);
+      if (/^data:image\//.test(url)) { f.preview = url; drawFiles(); }
+      post(uploadUrl, { filename: f.name, data: url.replace(/^data:[^,]*,/, "") })
+        .then(function (j) { f.path = j.data; })
+        .catch(function (err) { f.error = err.message; })
+        .then(function () { pending -= 1; drawFiles(); });
+    };
+    r.onerror = function () { pending -= 1; f.error = "could not be read"; drawFiles(); };
+    r.readAsDataURL(blob);
+  };
+  if (attach && fileInput && attached) {
+    attach.hidden = false;
+    attach.addEventListener("click", function () { fileInput.click(); });
+    fileInput.addEventListener("change", function () {
+      Array.prototype.forEach.call(fileInput.files, upload);
+      fileInput.value = "";
+    });
+    text.addEventListener("paste", function (e) {
+      var list = e.clipboardData && e.clipboardData.files;
+      if (list && list.length) {
+        e.preventDefault();
+        Array.prototype.forEach.call(list, upload);
+      }
+    });
+    form.addEventListener("dragover", function (e) {
+      if (e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types, "Files") >= 0) {
+        e.preventDefault();
+        form.classList.add("dropping");
+      }
+    });
+    form.addEventListener("dragleave", function () { form.classList.remove("dropping"); });
+    form.addEventListener("drop", function (e) {
+      form.classList.remove("dropping");
+      if (e.dataTransfer && e.dataTransfer.files.length) {
+        e.preventDefault();
+        Array.prototype.forEach.call(e.dataTransfer.files, upload);
+      }
+    });
+  }
+
   var send = function () {
-    if (!text.value.trim()) return;
+    var ready = files.filter(function (f) { return f.path; });
+    if (!text.value.trim() && !ready.length) return;
+    if (pending) { showError("A file is still being added."); return; }
+    var fields = {
+      text: text.value,
+      files: ready.map(function (f) { return f.path; }).join("\n")
+    };
+    if (changed && modelSel) {
+      fields.model = modelSel.value;
+      fields.effort = effortSel ? effortSel.value : "";
+    }
     var button = form.querySelector(".send");
     button.disabled = true;
-    postForm(form)
+    post(form.action, fields)
       .then(function () {
         text.value = "";
+        files = [];
+        if (attached) drawFiles();
+        changed = false;
+        if (note) note.hidden = true;
         grow();
         showError("");
         lively = true;

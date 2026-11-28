@@ -53,6 +53,74 @@ pub struct Item {
     /// Who sent a message from the hub (set by the hub, from its log).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
+    /// Files that came with a message: pictures and other files, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+}
+
+/// What goes with a message besides its text: files saved for the space
+/// (paths from `upload`), and the model and effort from here on in the
+/// chat (empty: as it is).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct With {
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub effort: String,
+}
+
+/// A model Codex offers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Model {
+    /// What to ask for ("gpt-…").
+    pub id: String,
+    /// Its name to show.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub default: bool,
+    /// The reasoning efforts it takes, and the one it uses unless told.
+    #[serde(default)]
+    pub efforts: Vec<String>,
+    #[serde(default)]
+    pub default_effort: String,
+    /// It takes pictures.
+    #[serde(default)]
+    pub images: bool,
+}
+
+/// How a file sent with a message reads to Codex, when it is not a
+/// picture shown to the model: the model opens it from the space.
+pub fn file_note(path: &str) -> String {
+    format!("[file: {path}]")
+}
+
+/// The file in a `file_note`.
+fn file_of_note(text: &str) -> Option<&str> {
+    text.strip_prefix("[file: ")?
+        .strip_suffix(']')
+        .filter(|p| p.starts_with(".uploads/") && !p.contains('\n'))
+}
+
+/// A path `upload` gave: in .uploads, nothing climbing out of it.
+pub fn upload_ok(path: &str) -> bool {
+    path.strip_prefix(".uploads/").is_some_and(|f| {
+        !f.is_empty()
+            && f.len() <= 400
+            && !f.starts_with('.')
+            && f.chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    })
+}
+
+/// Whether a file is a picture the model can be shown, by its name.
+pub fn is_picture(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    [".png", ".jpg", ".jpeg", ".gif", ".webp"]
+        .iter()
+        .any(|e| p.ends_with(e))
 }
 
 /// Something Codex waits on an answer for.
@@ -133,6 +201,9 @@ pub struct Feed {
     pub notice: String,
     #[serde(default)]
     pub model: String,
+    /// The reasoning effort the chat uses.
+    #[serde(default)]
+    pub effort: String,
     /// How far the account asking may go with the space (set by the API).
     #[serde(default)]
     pub level: Option<crate::state::Level>,
@@ -159,17 +230,39 @@ fn s(v: &Value) -> String {
 }
 
 /// The text of a user message's parts.
-fn user_text(content: &Value) -> String {
+/// A message's text, and the files that came with it.
+fn user_text(content: &Value) -> (String, Vec<String>) {
     let mut parts = Vec::new();
+    let mut files = Vec::new();
+    let name = |p: &str| -> String {
+        let f = p.rsplit('/').next().unwrap_or(p);
+        // Saved as <yyyymmdd>-<hhmmss>-<name>.
+        let b = f.as_bytes();
+        let stamped = b.len() > 16
+            && b[8] == b'-'
+            && b[15] == b'-'
+            && b[..15]
+                .iter()
+                .enumerate()
+                .all(|(i, c)| i == 8 || c.is_ascii_digit());
+        clip(if stamped { &f[16..] } else { f }, 200)
+    };
     for c in content.as_array().into_iter().flatten() {
         match c["type"].as_str().unwrap_or("") {
-            "text" => parts.push(s(&c["text"])),
-            "image" | "localImage" => parts.push("[image]".into()),
+            "text" => {
+                let t = s(&c["text"]);
+                match file_of_note(t.trim()) {
+                    Some(p) => files.push(name(p)),
+                    None => parts.push(t),
+                }
+            }
+            "localImage" => files.push(name(&s(&c["path"]))),
+            "image" => files.push("picture".into()),
             "mention" | "skill" => parts.push(format!("@{}", s(&c["name"]))),
             _ => {}
         }
     }
-    parts.join("\n")
+    (parts.join("\n"), files)
 }
 
 /// The files of a file change: ("update path", the diffs).
@@ -204,7 +297,9 @@ pub fn item(v: &Value) -> Option<Item> {
     match v["type"].as_str().unwrap_or("") {
         "userMessage" => {
             it.kind = "user".into();
-            it.text = clip(&user_text(&v["content"]), MAX_TEXT);
+            let (text, files) = user_text(&v["content"]);
+            it.text = clip(&text, MAX_TEXT);
+            it.files = files.into_iter().take(20).collect();
         }
         "agentMessage" => {
             it.kind = "agent".into();
@@ -509,26 +604,115 @@ pub fn feed(name: &str, id: &str, since: u64, turns: u32) -> Result<Feed> {
     Ok(f)
 }
 
+/// Checks what goes with a message: files `upload` saved, a model and
+/// effort Codex could name.
+fn check_with(with: &With) -> Result<()> {
+    if with.files.len() > 20 {
+        bail!("up to 20 files a message");
+    }
+    if let Some(f) = with.files.iter().find(|f| !upload_ok(f)) {
+        bail!("not a file added here: {f}");
+    }
+    let word = |w: &str| {
+        w.len() <= 80
+            && w.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '/'))
+    };
+    if !word(with.model.as_str()) || !word(with.effort.as_str()) {
+        bail!("no such model or effort");
+    }
+    Ok(())
+}
+
+/// The message to send: its text (may be empty when files come with it).
+fn check_text<'a>(text: &'a str, with: &With) -> Result<&'a str> {
+    if text.trim().is_empty() && !with.files.is_empty() {
+        return Ok("");
+    }
+    check_message(text)
+}
+
+/// What the log says of a message's files and model.
+fn with_note(with: &With) -> String {
+    let mut note = Vec::new();
+    if !with.files.is_empty() {
+        note.push(format!("added {}", with.files.join(", ")));
+    }
+    if !with.model.is_empty() || !with.effort.is_empty() {
+        note.push(format!(
+            "model {}{}",
+            if with.model.is_empty() {
+                "as before"
+            } else {
+                &with.model
+            },
+            if with.effort.is_empty() {
+                String::new()
+            } else {
+                format!(", effort {}", with.effort)
+            }
+        ));
+    }
+    note.join("; ")
+}
+
 /// Starts a chat with its first message; its id.
-pub fn new(name: &str, text: &str, by: &str) -> Result<String> {
-    let text = check_message(text)?;
+pub fn new(name: &str, text: &str, with: &With, by: &str) -> Result<String> {
+    check_with(with)?;
+    let text = check_text(text, with)?;
     let s = space(name)?;
-    let v = call(&s.key, json!({"op": "new", "text": text}), SLOW)?;
+    let v = call(
+        &s.key,
+        json!({"op": "new", "text": text, "with": with}),
+        SLOW,
+    )?;
     let id = v["id"].as_str().unwrap_or("").to_string();
     check_id(&id)?;
-    crate::activity::record(&s.key, &id, by, text, "")?;
+    crate::activity::record(&s.key, &id, by, text, &with_note(with))?;
     Ok(id)
 }
 
 /// Sends a message: a new turn, or (while Codex works) more for the turn
 /// it is on.
-pub fn send(name: &str, id: &str, text: &str, by: &str) -> Result<()> {
+pub fn send(name: &str, id: &str, text: &str, with: &With, by: &str) -> Result<()> {
     check_id(id)?;
-    let text = check_message(text)?;
+    check_with(with)?;
+    let text = check_text(text, with)?;
     let s = space(name)?;
-    call(&s.key, json!({"op": "send", "id": id, "text": text}), SLOW)?;
-    crate::activity::record(&s.key, id, by, text, "")?;
+    call(
+        &s.key,
+        json!({"op": "send", "id": id, "text": text, "with": with}),
+        SLOW,
+    )?;
+    crate::activity::record(&s.key, id, by, text, &with_note(with))?;
     Ok(())
+}
+
+/// Saves a file for the space's chats, as the space's user, in .uploads
+/// in its folder: the path to send with a message.
+pub fn upload(name: &str, filename: &str, data: &[u8], by: &str) -> Result<String> {
+    let s = space(name)?;
+    let rel = crate::chat::save_upload(&s, filename, data)?;
+    crate::activity::record(&s.key, "", by, "", &format!("added the file {rel}"))?;
+    Ok(rel)
+}
+
+/// The models Codex offers (what the bridge read from it, bounded).
+pub fn models(name: &str) -> Result<Vec<Model>> {
+    let s = space(name)?;
+    let mut list: Vec<Model> =
+        serde_json::from_value(call(&s.key, json!({"op": "models"}), SLOW)?)?;
+    list.truncate(100);
+    for m in &mut list {
+        m.id = clip(&m.id, 80);
+        m.name = clip(&m.name, 80);
+        m.efforts.truncate(12);
+        for e in &mut m.efforts {
+            *e = clip(e, 40);
+        }
+        m.default_effort = clip(&m.default_effort, 40);
+    }
+    Ok(list)
 }
 
 pub fn stop(name: &str, id: &str, by: &str) -> Result<()> {
@@ -612,10 +796,19 @@ mod tests {
         let v = json!({"type": "userMessage", "id": "u1", "content": [
             {"type": "text", "text": "hi"}, {"type": "localImage", "path": "/x.png"}]});
         let it = item(&v).unwrap();
-        assert_eq!(
-            (it.kind.as_str(), it.text.as_str()),
-            ("user", "hi\n[image]")
-        );
+        assert_eq!((it.kind.as_str(), it.text.as_str()), ("user", "hi"));
+        assert_eq!(it.files, vec!["x.png"]);
+        let v = json!({"type": "userMessage", "id": "u2", "content": [
+            {"type": "text", "text": "look"},
+            {"type": "localImage", "path": "/w/.uploads/20261129-101500-shot.png"},
+            {"type": "text", "text": "[file: .uploads/20261129-101501-notes.txt]"}]});
+        let it = item(&v).unwrap();
+        assert_eq!(it.text, "look");
+        assert_eq!(it.files, vec!["shot.png", "notes.txt"]);
+        assert!(upload_ok(".uploads/20261129-101501-notes.txt"));
+        assert!(!upload_ok(".uploads/../x"));
+        assert!(!upload_ok("/etc/passwd"));
+        assert!(!upload_ok(".uploads/a/b"));
 
         let v = json!({"type": "commandExecution", "id": "c1", "command": "ls -la",
             "cwd": "/w", "commandActions": [], "status": "completed",

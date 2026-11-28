@@ -48,7 +48,8 @@ def now():
 
 def view(t):
     return {"id": t["id"], "name": t.get("name"), "preview": t.get("preview", ""),
-            "createdAt": t["created"], "updatedAt": t["updated"], "model": "gpt-fake",
+            "createdAt": t["created"], "updatedAt": t["updated"], "model": t.get("model", "gpt-fake"),
+            "reasoningEffort": t.get("effort", "medium"),
             "status": {"type": "idle"}, "cwd": t.get("cwd", "/"), "turns": []}
 
 
@@ -70,14 +71,15 @@ def turn_of(t, tid):
     return next(x for x in t["turns"] if x["id"] == tid)
 
 
-def start_turn(t, text):
+def start_turn(t, text, content=None):
     turn = {"id": str(uuid.uuid4()), "status": "inProgress", "items": []}
     t["turns"].append(turn)
     t["active"] = turn["id"]
     if not t.get("preview"):
         t["preview"] = text
     note("turn/started", {"threadId": t["id"], "turn": dict(turn, items=[])})
-    item(t, turn, {"type": "userMessage", "id": str(uuid.uuid4()), "content": [{"type": "text", "text": text}]})
+    item(t, turn, {"type": "userMessage", "id": str(uuid.uuid4()),
+                   "content": content or [{"type": "text", "text": text}]})
     if text.startswith("run"):
         rid = next_id[0]
         next_id[0] += 1
@@ -124,6 +126,8 @@ def handle(m):
         with open(ARGS, "a") as f:
             f.write("thread/start approvalPolicy=%s sandbox=%s\n" % (p.get("approvalPolicy"), p.get("sandbox")))
         t = {"id": str(uuid.uuid4()), "created": now(), "updated": now(), "turns": [], "cwd": p.get("cwd")}
+        if p.get("model"):
+            t["model"] = p["model"]
         threads[t["id"]] = t
         save()
         note("thread/started", {"thread": view(t)})
@@ -153,10 +157,31 @@ def handle(m):
         threads[p["threadId"]]["archived"] = True
         save()
         r = {}
+    elif method == "model/list":
+        r = {"data": [
+            {"id": "gpt-fake", "model": "gpt-fake", "displayName": "GPT Fake", "isDefault": True, "hidden": False,
+             "description": "", "defaultReasoningEffort": "medium", "inputModalities": ["text", "image"],
+             "supportedReasoningEfforts": [{"reasoningEffort": e, "description": ""} for e in ("low", "medium", "high")]},
+            {"id": "gpt-fake-mini", "model": "gpt-fake-mini", "displayName": "GPT Fake Mini", "isDefault": False,
+             "hidden": False, "description": "", "defaultReasoningEffort": "low", "inputModalities": ["text"],
+             "supportedReasoningEfforts": [{"reasoningEffort": e, "description": ""} for e in ("minimal", "low")]},
+            {"id": "gpt-hidden", "model": "gpt-hidden", "displayName": "Hidden", "isDefault": False, "hidden": True,
+             "description": "", "defaultReasoningEffort": "low", "supportedReasoningEfforts": []}],
+            "nextCursor": None}
     elif method == "turn/start":
         t = threads[p["threadId"]]
-        text = "\n".join(x.get("text", "") for x in p.get("input", []))
-        turn = start_turn(t, text)
+        if p.get("model"):
+            t["model"] = p["model"]
+        if p.get("effort"):
+            t["effort"] = p["effort"]
+        inp = p.get("input", [])
+        with open(ARGS, "a") as f:
+            for x in inp:
+                if x.get("type") == "localImage":
+                    f.write("image %s exists=%s\n" % (x["path"], os.path.isfile(x["path"])))
+            f.write("turn/start model=%s effort=%s\n" % (t.get("model", "gpt-fake"), t.get("effort", "medium")))
+        text = "\n".join(x.get("text", "") for x in inp if x.get("type") == "text")
+        turn = start_turn(t, text, inp)
         r = {"turn": dict(turn, items=[])}
     elif method == "turn/steer":
         t = threads[p["threadId"]]

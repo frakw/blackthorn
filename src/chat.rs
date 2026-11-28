@@ -711,12 +711,20 @@ pub fn key(name: &str, id: &str, key: &str, by: &str) -> Result<()> {
 /// chat's folder. Its path there, to mention as @path.
 pub fn upload(name: &str, id: &str, filename: &str, data: &[u8], by: &str) -> Result<String> {
     sys::require_root()?;
-    if data.len() > MAX_UPLOAD {
-        bail!("files up to {} MB", MAX_UPLOAD >> 20);
-    }
     let (_, state) = ctx::read_only()?;
     let s = state.space(name)?;
     let (chat, _) = locate(s, id)?;
+    let rel = save_upload(s, filename, data)?;
+    crate::activity::record(&s.key, &chat, by, "", &format!("added the file {rel}"))?;
+    Ok(rel)
+}
+
+/// Saves a file, as the space's user, in .uploads in its folder: the
+/// path there (.uploads/<time>-<name>).
+pub fn save_upload(s: &crate::state::Space, filename: &str, data: &[u8]) -> Result<String> {
+    if data.len() > MAX_UPLOAD {
+        bail!("files up to {} MB", MAX_UPLOAD >> 20);
+    }
     let clean: String = filename
         .rsplit(['/', '\\'])
         .next()
@@ -760,7 +768,6 @@ pub fn upload(name: &str, id: &str, filename: &str, data: &[u8], by: &str) -> Re
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    crate::activity::record(&s.key, &chat, by, "", &format!("added the file {rel}"))?;
     Ok(rel)
 }
 

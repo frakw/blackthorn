@@ -151,12 +151,28 @@ pub enum Op {
     CodexNew {
         name: String,
         text: String,
+        /// Files added, and the model and effort chosen.
+        #[serde(default)]
+        with: crate::codex::With,
     },
     /// Sends a message to a Codex chat (needs the chat unlock).
     CodexSend {
         name: String,
         id: String,
         text: String,
+        #[serde(default)]
+        with: crate::codex::With,
+    },
+    /// Saves a file for a Codex space's chats (base64; needs the chat
+    /// unlock). Its path, to send with a message.
+    CodexUpload {
+        name: String,
+        filename: String,
+        data: String,
+    },
+    /// The models Codex offers in a space, and their efforts.
+    CodexModels {
+        name: String,
     },
     /// Stops what Codex is doing in a chat (needs the chat unlock).
     CodexStop {
@@ -455,6 +471,7 @@ impl Op {
                 | Op::ChatCommands { .. }
                 | Op::CodexChats { .. }
                 | Op::CodexFeed { .. }
+                | Op::CodexModels { .. }
                 | Op::SpaceScreen { .. }
                 | Op::HostPubkey { .. }
                 | Op::ConfigShow
@@ -480,6 +497,7 @@ impl Op {
                 | Op::AskDecide { .. }
                 | Op::CodexNew { .. }
                 | Op::CodexSend { .. }
+                | Op::CodexUpload { .. }
                 | Op::CodexStop { .. }
                 | Op::CodexAnswer { .. }
         )
@@ -974,6 +992,7 @@ fn need(op: &Op) -> Need {
         | Op::ChatList { name }
         | Op::CodexChats { name }
         | Op::CodexFeed { name, .. }
+        | Op::CodexModels { name }
         | Op::Activity { name, .. } => one(name, View),
         Op::ChatSend { name, .. }
         | Op::ChatKey { name, .. }
@@ -982,6 +1001,7 @@ fn need(op: &Op) -> Need {
         | Op::ChatStop { name, .. }
         | Op::CodexNew { name, .. }
         | Op::CodexSend { name, .. }
+        | Op::CodexUpload { name, .. }
         | Op::CodexStop { name, .. }
         | Op::CodexAnswer { name, .. }
         | Op::CodexRename { name, .. }
@@ -1485,8 +1505,25 @@ fn run_op(
             f.level = st.space(&name)?.level(user, admin);
             json(f)
         }
-        Op::CodexNew { name, text } => json(crate::codex::new(&name, &text, user)?),
-        Op::CodexSend { name, id, text } => json(crate::codex::send(&name, &id, &text, user)?),
+        Op::CodexNew { name, text, with } => json(crate::codex::new(&name, &text, &with, user)?),
+        Op::CodexSend {
+            name,
+            id,
+            text,
+            with,
+        } => json(crate::codex::send(&name, &id, &text, &with, user)?),
+        Op::CodexUpload {
+            name,
+            filename,
+            data,
+        } => {
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data.trim())
+                .context("the file did not arrive whole")?;
+            json(crate::codex::upload(&name, &filename, &bytes, user)?)
+        }
+        Op::CodexModels { name } => json(crate::codex::models(&name)?),
         Op::CodexStop { name, id } => json(crate::codex::stop(&name, &id, user)?),
         Op::CodexAnswer {
             name,
@@ -2216,12 +2253,20 @@ pub fn all_op_names() -> Vec<String> {
         Op::CodexNew {
             name: s(),
             text: s(),
+            with: Default::default(),
         },
         Op::CodexSend {
             name: s(),
             id: s(),
             text: s(),
+            with: Default::default(),
         },
+        Op::CodexUpload {
+            name: s(),
+            filename: s(),
+            data: s(),
+        },
+        Op::CodexModels { name: s() },
         Op::CodexStop { name: s(), id: s() },
         Op::CodexAnswer {
             name: s(),
@@ -2313,6 +2358,8 @@ pub fn all_op_names() -> Vec<String> {
             | Op::CodexFeed { .. }
             | Op::CodexNew { .. }
             | Op::CodexSend { .. }
+            | Op::CodexUpload { .. }
+            | Op::CodexModels { .. }
             | Op::CodexStop { .. }
             | Op::CodexAnswer { .. }
             | Op::CodexRename { .. }

@@ -517,3 +517,13 @@ ul.on-machines a { color: var(--ink); }
 #machines .machine h3 { margin: 0 0 4px; font-size: 15px; display: flex; align-items: center; gap: 6px; }
 #machines .machine p { margin: 4px 0; }
 #machines .add-machine { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 6px; }
+
+/* Codex chats: files sent with a message, choosing the model. */
+.sent-files { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; margin-top: 4px; }
+.sent-file { font-size: 13px; color: var(--dim); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 999px; padding: 2px 10px; max-width: 100%; overflow-wrap: anywhere; }
+.codex-model { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; font-size: 13.5px; color: var(--dim); }
+.codex-model label { display: inline-flex; align-items: center; gap: 6px; }
+.codex-model select { font-size: 13.5px; padding: 3px 6px; }
+.codex-new .codex-model { font-size: 14px; }
+.composer.dropping { outline: 2px dashed var(--accent); outline-offset: 4px; }

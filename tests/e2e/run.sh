@@ -747,6 +747,36 @@ case "$r" in *"ok=answered"*) ok "allowing it on the web";; *) fail "codex answe
 for _ in $(seq 10); do thorn codex show t1-codex "$cid2" | grep -q "t1 is up" && break; sleep 1; done
 thorn codex show t1-codex "$cid2" | grep -q "\$ ssh t1 uptime (exit 0)" && ok "runs it" || fail "codex ran: $(thorn codex show t1-codex "$cid2" 2>&1)"
 thorn log t1-codex | grep -q "Codex asked: allowed once" && ok "and the answer is in the space's log" || fail "codex answer log: $(thorn log t1-codex 2>&1 | tail -5)"
+
+say "codex files and models"
+web_json() { local path=$1; shift; admin curl -s -b /tmp/jar -c /tmp/jar --data-urlencode "csrf=$C" --data-urlencode "js=1" "$@" "http://$HUB:7180$path"; }
+models=$(thorn codex models t1-codex)
+echo "$models" | grep -q "^gpt-fake (default)" && echo "$models" | grep -q "^gpt-fake-mini .*(no pictures)" && ok "thorn codex models lists what Codex offers" || fail "codex models: $models"
+echo "$models" | grep -q "gpt-hidden" && fail "a hidden model is listed" || ok "but not its hidden models"
+page=$(web_get "/space/t1-codex/codex/$cid2")
+echo "$page" | grep -q 'data-efforts="minimal low"' && ok "the chat page offers the models and their efforts" || fail "codex model picker: $(echo "$page" | grep -o 'class="codex-model".\{0,600\}')"
+echo "$page" | grep -q 'id="chat-file"' && ok "and adding files" || fail "codex file input"
+# A 1x1 PNG.
+png=iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==
+r=$(web_json "/space/t1-codex/codex/$cid2/upload" --data-urlencode "filename=dot.png" --data-urlencode "data=$png")
+up=$(echo "$r" | grep -o '"data":"[^"]*"' | cut -d'"' -f4)
+case "$up" in .uploads/*-dot.png) ok "a picture is saved in the space";; *) fail "codex upload: $r";; esac
+hub test -f "/var/lib/blackthorn/spaces/$kc/t1-codex/$up" && [ "$(hub stat -c %U "/var/lib/blackthorn/spaces/$kc/t1-codex/$up")" = "$(hub stat -c %U "/var/lib/blackthorn/spaces/$kc/t1-codex")" ] && ok "as the space's user, in its folder" || fail "codex upload owner"
+r=$(web_json "/space/t1-codex/codex/$cid2/send" --data-urlencode "text=look at this" --data-urlencode "files=$up" --data-urlencode "model=gpt-fake-mini" --data-urlencode "effort=low")
+echo "$r" | grep -q '"ok":"sent"' && ok "a message goes with the picture and another model" || fail "codex send with: $r"
+for _ in $(seq 10); do hub grep -q "turn/start model=gpt-fake-mini effort=low" "/var/lib/blackthorn/spaces/$kc/fake-codex.args" && break; sleep 1; done
+hub grep -q "turn/start model=gpt-fake-mini effort=low" "/var/lib/blackthorn/spaces/$kc/fake-codex.args" && ok "Codex gets the model and effort" || fail "codex model: $(hub cat "/var/lib/blackthorn/spaces/$kc/fake-codex.args")"
+hub grep -q "image /var/lib/blackthorn/spaces/$kc/t1-codex/$up exists=True" "/var/lib/blackthorn/spaces/$kc/fake-codex.args" && ok "and the picture, to show the model" || fail "codex image: $(hub cat "/var/lib/blackthorn/spaces/$kc/fake-codex.args")"
+r=$(web_json "/space/t1-codex/codex/$cid2/send" --data-urlencode "text=x" --data-urlencode "files=../../etc/passwd")
+echo "$r" | grep -q '"error"' && ok "a path out of .uploads is refused" || fail "codex bad file: $r"
+hub sh -c 'echo "some notes" > /tmp/notes.txt'
+thorn codex send t1-codex "$cid2" "read the notes" --file /tmp/notes.txt | grep -q "^added .uploads/.*-notes.txt" && ok "thorn codex send --file adds a file" || fail "codex send --file"
+for _ in $(seq 10); do thorn codex show t1-codex "$cid2" | grep -q "notes.txt" && break; sleep 1; done
+show=$(thorn codex show t1-codex "$cid2")
+echo "$show" | grep -q "files: dot.png" && echo "$show" | grep -q "files: notes.txt" && ok "the chat shows the files sent" || fail "codex files shown: $show"
+web_get "/space/t1-codex/codex/$cid2" | grep -q 'class="sent-file">🖼 dot.png' && ok "and its page too" || fail "codex files on page"
+hub tail -1 "/var/lib/blackthorn/spaces/$kc/fake-codex.args" | grep -q "turn/start model=gpt-fake-mini effort=low" && ok "the chat keeps its model" || fail "codex model kept: $(hub tail -3 "/var/lib/blackthorn/spaces/$kc/fake-codex.args")"
+web_get "/space/t1-codex/codex/$cid2" | grep -q '<option value="gpt-fake-mini" data-efforts="minimal low" data-effort="low" selected>' && ok "and its page shows the model it uses" || fail "codex model shown: $(web_get "/space/t1-codex/codex/$cid2" | grep -o 'class="codex-model".\{0,600\}')"
 thorn codex send t1-codex "$cid" "slow work please" >/dev/null
 for _ in $(seq 10); do thorn codex chats t1-codex | grep -q "(working)" && break; sleep 1; done
 thorn codex chats t1-codex | grep "${cid}" | grep -q "(working)" && ok "a chat at work says so" || fail "codex working: $(thorn codex chats t1-codex)"
