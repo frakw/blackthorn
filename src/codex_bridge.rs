@@ -636,7 +636,7 @@ fn ask_of(p: &Pending, live: Option<&Live>) -> Ask {
         "item/commandExecution/requestApproval" | "execCommandApproval" => {
             a.kind = "command".into();
             a.text = match &q["command"] {
-                Value::String(s) => s.clone(),
+                Value::String(s) => codex::unwrap_shell(s),
                 v => crate::activity::argv_text(v).unwrap_or_default(),
             };
             let mut d = format!("in {}", q["cwd"].as_str().unwrap_or("?"));

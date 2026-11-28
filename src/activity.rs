@@ -258,34 +258,33 @@ pub fn codex_thread_id(name: &str) -> Option<String> {
 /// "response_item", "payload": a function call (exec_command {cmd},
 /// shell_command {command}, shell {command: [argv]}) or a local shell call
 /// (action.command: [argv])}.
+///
+/// Newer Codex (0.172) also records each finished item as an event
+/// ({"type": "event_msg", "payload": {"type": "item_completed", "item":
+/// {"type": "CommandExecution", "command": [argv]}}}), and in its "code
+/// mode" runs commands from a script, so no function call names them: when
+/// the text has such events, the commands are read from those alone.
 pub fn codex_commands(text: &str, chat: &str) -> Vec<Entry> {
     let mut out = Vec::new();
+    let events = text.contains("\"item_completed\"");
     for line in text.lines() {
-        if !line.contains("\"response_item\"") {
+        let wanted = if events {
+            line.contains("\"CommandExecution\"")
+        } else {
+            line.contains("\"response_item\"")
+        };
+        if !wanted {
             continue;
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if v["type"] != "response_item" {
-            continue;
-        }
-        let p = &v["payload"];
-        let cmd = match p["type"].as_str() {
-            Some("function_call") => {
-                let args: serde_json::Value = p["arguments"]
-                    .as_str()
-                    .and_then(|a| serde_json::from_str(a).ok())
-                    .unwrap_or_else(|| p["arguments"].clone());
-                match p["name"].as_str() {
-                    Some("exec_command") => args["cmd"].as_str().map(str::to_string),
-                    Some("shell_command") => args["command"].as_str().map(str::to_string),
-                    Some("shell") => argv_text(&args["command"]),
-                    _ => None,
-                }
-            }
-            Some("local_shell_call") => argv_text(&p["action"]["command"]),
-            _ => None,
+        let cmd = if events {
+            codex_event(&v)
+        } else if v["type"] == "response_item" {
+            codex_call(&v["payload"])
+        } else {
+            None
         };
         let Some(cmd) = cmd else { continue };
         let t = v["timestamp"]
@@ -305,6 +304,42 @@ pub fn codex_commands(text: &str, chat: &str) -> Vec<Entry> {
         });
     }
     out
+}
+
+/// The command of a finished CommandExecution item event.
+fn codex_event(v: &serde_json::Value) -> Option<String> {
+    let p = &v["payload"];
+    let item = &p["item"];
+    if v["type"] != "event_msg"
+        || p["type"] != "item_completed"
+        || item["type"] != "CommandExecution"
+    {
+        return None;
+    }
+    match &item["command"] {
+        serde_json::Value::String(s) => Some(crate::codex::unwrap_shell(s)),
+        c => argv_text(c),
+    }
+}
+
+/// The command of a function call in a Codex rollout.
+fn codex_call(p: &serde_json::Value) -> Option<String> {
+    match p["type"].as_str() {
+        Some("function_call") => {
+            let args: serde_json::Value = p["arguments"]
+                .as_str()
+                .and_then(|a| serde_json::from_str(a).ok())
+                .unwrap_or_else(|| p["arguments"].clone());
+            match p["name"].as_str() {
+                Some("exec_command") => args["cmd"].as_str().map(str::to_string),
+                Some("shell_command") => args["command"].as_str().map(str::to_string),
+                Some("shell") => argv_text(&args["command"]),
+                _ => None,
+            }
+        }
+        Some("local_shell_call") => argv_text(&p["action"]["command"]),
+        _ => None,
+    }
 }
 
 /// An argv as one command line: the script of `bash -lc SCRIPT` (how Codex
@@ -483,6 +518,24 @@ mod tests {
         assert_eq!(v[0].host(), Some("fig"));
         assert_eq!(v[0].t, 1795593605);
         assert_eq!(v[0].chat, "0199a213");
+    }
+
+    #[test]
+    fn finds_codex_commands_in_events() {
+        // Code mode: the command is in a script, and in the item event.
+        let text = concat!(
+            r#"{"timestamp":"2026-11-28T09:59:29Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"tools.exec_command({cmd: \"touch a\"})"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-28T09:59:30.101Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"exec-1","command":["/bin/bash","-lc","touch approved.txt"]}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-28T09:59:31Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"touch approved.txt\"}","call_id":"c1"}}"#,
+            "\n",
+        );
+        let cmds: Vec<String> = codex_commands(text, "01a22198")
+            .into_iter()
+            .map(|e| e.cmd)
+            .collect();
+        assert_eq!(cmds, vec!["touch approved.txt"], "once, from the event");
     }
 
     #[test]

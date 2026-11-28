@@ -229,7 +229,7 @@ pub fn item(v: &Value) -> Option<Item> {
         }
         "commandExecution" => {
             it.kind = "command".into();
-            it.text = clip(&s(&v["command"]), MAX_OUTPUT);
+            it.text = clip(&unwrap_shell(&s(&v["command"])), MAX_OUTPUT);
             it.detail = tail(&s(&v["aggregatedOutput"]), MAX_OUTPUT);
             it.exit = v["exitCode"].as_i64();
         }
@@ -287,6 +287,44 @@ pub fn item(v: &Value) -> Option<Item> {
         _ => return None,
     }
     Some(it)
+}
+
+/// `/bin/bash -lc 'SCRIPT'` (how Codex shows the commands it runs) as
+/// SCRIPT; anything else as it is.
+pub fn unwrap_shell(cmd: &str) -> String {
+    let shells = [
+        "/bin/bash -lc ",
+        "bash -lc ",
+        "/usr/bin/bash -lc ",
+        "/bin/sh -c ",
+        "sh -c ",
+        "/bin/zsh -lc ",
+    ];
+    let Some(rest) = shells.iter().find_map(|p| cmd.strip_prefix(p)) else {
+        return cmd.to_string();
+    };
+    // Single-quoted parts and \' between them: 'it'\''s' is it's.
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => loop {
+                match chars.next() {
+                    Some('\'') => break,
+                    Some(c) => out.push(c),
+                    None => return cmd.to_string(),
+                }
+            },
+            '\\' => match chars.next() {
+                Some(c) => out.push(c),
+                None => return cmd.to_string(),
+            },
+            '"' | '$' | '`' => return cmd.to_string(),
+            c if c.is_whitespace() => return cmd.to_string(),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The end of a long output, where the outcome is.
@@ -610,6 +648,28 @@ mod tests {
         let t = tail(&s, MAX_OUTPUT);
         assert!(t.ends_with("THE END"));
         assert!(t.starts_with("… (7 characters before)"));
+    }
+
+    #[test]
+    fn shell_unwrapped() {
+        assert_eq!(
+            unwrap_shell("/bin/bash -lc 'touch approved.txt'"),
+            "touch approved.txt"
+        );
+        assert_eq!(
+            unwrap_shell(r"/bin/bash -lc 'echo '\''hi'\'''"),
+            "echo 'hi'"
+        );
+        assert_eq!(unwrap_shell("/bin/bash -lc ls"), "ls");
+        assert_eq!(
+            unwrap_shell(r#"/bin/bash -lc "ls $HOME""#),
+            r#"/bin/bash -lc "ls $HOME""#
+        );
+        assert_eq!(
+            unwrap_shell("/bin/bash -lc 'a' 'b'"),
+            "/bin/bash -lc 'a' 'b'"
+        );
+        assert_eq!(unwrap_shell("git status"), "git status");
     }
 
     #[test]
