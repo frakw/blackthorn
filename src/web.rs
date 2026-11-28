@@ -4230,50 +4230,6 @@ fn chats_page(c: &Ctx, flash: &Flash) -> Reply {
     Reply::Html(200, page(c, "Chats", &b, flash))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn model_names() {
-        assert_eq!(model_label("claude-opus-5-5"), "Opus 5.5");
-        assert_eq!(model_label("claude-haiku-4-5-20251001"), "Haiku 4.5");
-        assert_eq!(model_label("claude-3-5-sonnet-20241022"), "Sonnet 3.5");
-        assert_eq!(model_label("opus[1m]"), "Opus");
-        assert_eq!(model_button("", "", ""), "Default model");
-        assert_eq!(
-            model_button("claude-fable-5-2", "", "high"),
-            "Fable 5.2 · high"
-        );
-    }
-
-    #[test]
-    fn messages_go_before_the_anchor() {
-        let at = |r: Reply| match r {
-            Reply::Redirect(to, _) => to,
-            _ => panic!("not a redirect"),
-        };
-        assert_eq!(
-            at(back("/space/a#chats", Ok("chat stopped".into()))),
-            "/space/a?ok=chat%20stopped#chats"
-        );
-        assert_eq!(at(back("/settings", Err("no".into()))), "/settings?err=no");
-        assert_eq!(at(back("/x?y=1#z", Ok("k".into()))), "/x?y=1&ok=k#z");
-    }
-
-    #[test]
-    fn forms() {
-        let f = parse_form("a=1&b=hello+world&c=%E2%9C%93&d=&e");
-        assert_eq!(f["a"], "1");
-        assert_eq!(f["b"], "hello world");
-        assert_eq!(f["c"], "✓");
-        assert_eq!(f["d"], "");
-        assert_eq!(f["e"], "");
-        assert!(parse_form("x=%ZZ").is_empty());
-        assert!(parse_form("x=%4").is_empty());
-    }
-}
-
 // ---------------------------------------------------------- Codex chats
 //
 // Codex spaces have chats of their own (see codex.rs): a list on the space
@@ -4885,5 +4841,49 @@ fn codex_new(c: &Ctx, name: &str, form: &HashMap<String, String>) -> Reply {
             Err("Codex did not start a chat".into()),
         ),
         Err(e) => back(&format!("/space/{n}#chats"), Err(e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_names() {
+        assert_eq!(model_label("claude-opus-5-5"), "Opus 5.5");
+        assert_eq!(model_label("claude-haiku-4-5-20251001"), "Haiku 4.5");
+        assert_eq!(model_label("claude-3-5-sonnet-20241022"), "Sonnet 3.5");
+        assert_eq!(model_label("opus[1m]"), "Opus");
+        assert_eq!(model_button("", "", ""), "Default model");
+        assert_eq!(
+            model_button("claude-fable-5-2", "", "high"),
+            "Fable 5.2 · high"
+        );
+    }
+
+    #[test]
+    fn messages_go_before_the_anchor() {
+        let at = |r: Reply| match r {
+            Reply::Redirect(to, _) => to,
+            _ => panic!("not a redirect"),
+        };
+        assert_eq!(
+            at(back("/space/a#chats", Ok("chat stopped".into()))),
+            "/space/a?ok=chat%20stopped#chats"
+        );
+        assert_eq!(at(back("/settings", Err("no".into()))), "/settings?err=no");
+        assert_eq!(at(back("/x?y=1#z", Ok("k".into()))), "/x?y=1&ok=k#z");
+    }
+
+    #[test]
+    fn forms() {
+        let f = parse_form("a=1&b=hello+world&c=%E2%9C%93&d=&e");
+        assert_eq!(f["a"], "1");
+        assert_eq!(f["b"], "hello world");
+        assert_eq!(f["c"], "✓");
+        assert_eq!(f["d"], "");
+        assert_eq!(f["e"], "");
+        assert!(parse_form("x=%ZZ").is_empty());
+        assert!(parse_form("x=%4").is_empty());
     }
 }

@@ -381,7 +381,6 @@ fn notice(b: &Bridge, method: &str, p: &Value) {
             st.pending.retain(|x| x.thread != thread);
             drop(st);
             log(&format!("chat {}: turn {how}", short(&thread)));
-            return;
         }
         "item/started" | "item/completed" => {
             let l = st.live(&thread);
