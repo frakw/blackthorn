@@ -3,7 +3,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::net::IpAddr;
@@ -495,20 +495,6 @@ impl Space {
     /// "fig", "fig and nas", "fig, nas and pine".
     pub fn hosts_text(&self) -> String {
         and_list(&self.hosts())
-    }
-
-    /// Asks for each root command on some machine now.
-    pub fn asks_anywhere(&self, now: u64) -> bool {
-        self.machines.iter().any(|m| m.asks(now))
-    }
-
-    /// The highest it goes anywhere now.
-    pub fn top_tier(&self, now: u64) -> Tier {
-        self.machines
-            .iter()
-            .map(|m| m.tier(now))
-            .max()
-            .unwrap_or(Tier::ReadOnly)
     }
 
     /// How far `user` may go with this space (`admin`: a hub admin).
