@@ -10,6 +10,8 @@
 //!   same conversation.
 //! - Claude without Remote Control: one local conversation, like single
 //!   mode, reached only through the hub's terminal.
+//! - Codex: the hub's bridge (`thorn _codex`), which runs `codex
+//!   app-server`; restarted whenever it exits.
 //! - Other agents: restarted whenever they exit.
 //!
 //! Restarts back off from 5 seconds up to five minutes.
@@ -51,7 +53,16 @@ pub fn run(key: &str) -> Result<()> {
         } else {
             launch.workdir.clone().into()
         };
-        let status = Command::new(&launch.bin)
+        // Codex runs behind the hub's bridge, which starts it.
+        let (prog, args) = if launch.kind == LaunchKind::Codex {
+            let me = std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "/usr/local/bin/thorn".into());
+            (me, vec!["_codex".to_string(), key.to_string()])
+        } else {
+            (launch.bin.clone(), args)
+        };
+        let status = Command::new(&prog)
             .current_dir(&workdir)
             .args(&args)
             .env("SSH_AUTH_SOCK", paths::agent_socket(key))
@@ -71,8 +82,8 @@ pub fn run(key: &str) -> Result<()> {
                 );
                 return Ok(());
             }
-            Ok(s) => eprintln!("blackthorn: {} exited with {s}", launch.bin),
-            Err(e) => eprintln!("blackthorn: could not run {}: {e}", launch.bin),
+            Ok(s) => eprintln!("blackthorn: {prog} exited with {s}"),
+            Err(e) => eprintln!("blackthorn: could not run {prog}: {e}"),
         }
         if started.elapsed() > Duration::from_secs(600) {
             failures = 0;
@@ -115,7 +126,7 @@ pub fn agent_args(launch: &Launch, resume: bool) -> Vec<String> {
             args.push("--remote-control".into());
             args.extend(remote_control_prefix(launch));
         }
-        LaunchKind::Command => {}
+        LaunchKind::Command | LaunchKind::Codex => {}
     }
     args.extend(launch.args.iter().cloned());
     args

@@ -274,6 +274,9 @@ pub enum LaunchKind {
     ClaudeSingle,
     /// Any other agent: a command in the terminal.
     Command,
+    /// Codex behind the hub's bridge (`thorn _codex`), its chats on the
+    /// web page.
+    Codex,
 }
 
 pub fn launch(name: &str, space: &Space, cfg: &Config) -> Launch {
@@ -289,9 +292,9 @@ pub fn launch(name: &str, space: &Space, cfg: &Config) -> Launch {
         )
     } else if space.agent == crate::config::CODEX {
         (
-            LaunchKind::Command,
+            LaunchKind::Codex,
             cfg.codex_bin.display().to_string(),
-            CODEX_ARGS.iter().map(|a| a.to_string()).collect(),
+            Vec::new(),
         )
     } else {
         match cfg.agents.get(&space.agent) {
@@ -319,15 +322,6 @@ pub fn launch(name: &str, space: &Space, cfg: &Config) -> Launch {
         title: space.title.clone().unwrap_or_default(),
     }
 }
-
-/// Codex runs without its own sandbox (the space is the sandbox: its own
-/// user, firewall and logins) and asks before commands it is unsure of.
-pub const CODEX_ARGS: [&str; 4] = [
-    "--sandbox",
-    "danger-full-access",
-    "--ask-for-approval",
-    "on-request",
-];
 
 /// ~/.codex/config.toml for a new Codex space: no update checks (the hub
 /// updates Codex), sign-in kept in a file in its home, its work folder
@@ -559,19 +553,10 @@ mod tests {
         codex.agent = crate::config::CODEX.into();
         codex.args = vec!["-m".into(), "gpt-6.1".into()];
         let l = launch("x", &codex, &cfg);
-        assert_eq!(l.kind, LaunchKind::Command);
+        assert_eq!(l.kind, LaunchKind::Codex);
         assert_eq!(l.bin, crate::config::CODEX_BIN);
-        assert_eq!(
-            l.args,
-            vec![
-                "--sandbox",
-                "danger-full-access",
-                "--ask-for-approval",
-                "on-request",
-                "-m",
-                "gpt-6.1"
-            ]
-        );
+        // The bridge sets the sandbox and approvals; the model is the space's.
+        assert_eq!(l.args, vec!["-m", "gpt-6.1"]);
     }
 
     #[test]

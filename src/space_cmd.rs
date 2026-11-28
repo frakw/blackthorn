@@ -548,3 +548,159 @@ pub fn decide(id: &str, approve: bool, reason: Option<&str>) -> Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------- Codex chats
+
+fn by_cli() -> String {
+    format!(
+        "hub:{}",
+        std::env::var("SUDO_USER").unwrap_or_else(|_| "root".into())
+    )
+}
+
+/// A chat's whole id from its start.
+fn codex_chat(space: &str, chat: &str) -> Result<String> {
+    if crate::codex::id_ok(chat) {
+        return Ok(chat.to_string());
+    }
+    let chat = chat.trim().to_ascii_lowercase();
+    let found: Vec<String> = crate::codex::chats(space)?
+        .into_iter()
+        .map(|c| c.id)
+        .filter(|id| !chat.is_empty() && id.starts_with(&chat))
+        .collect();
+    match found.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => anyhow::bail!("no chat in {space} starts with {chat}"),
+        _ => anyhow::bail!("more than one chat starts with {chat}: give more of its id"),
+    }
+}
+
+pub fn codex_chats(space: &str) -> Result<()> {
+    let chats = crate::codex::chats(space)?;
+    if chats.is_empty() {
+        println!("no chats in {space} yet: thorn codex new {space} MESSAGE");
+    }
+    let now = crate::state::now();
+    for c in chats {
+        let state = crate::codex::state_label(&c.state);
+        println!(
+            "{}  {:>8} ago  {}{}",
+            c.id,
+            ago(now.saturating_sub(c.updated)),
+            c.title,
+            if state.is_empty() {
+                String::new()
+            } else {
+                format!("  ({state})")
+            }
+        );
+    }
+    Ok(())
+}
+
+pub fn codex_show(space: &str, chat: &str, turns: u32) -> Result<()> {
+    let id = codex_chat(space, chat)?;
+    let f = crate::codex::feed(space, &id, 0, turns)?;
+    println!("# {}", f.title);
+    if f.more {
+        println!("(earlier turns left out: --turns N for more)");
+    }
+    for it in &f.items {
+        match it.kind.as_str() {
+            "user" => println!(
+                "\n> {}{}",
+                it.text.replace('\n', "\n> "),
+                it.by
+                    .as_ref()
+                    .map(|b| format!("\n  (sent by {b})"))
+                    .unwrap_or_default()
+            ),
+            "agent" | "plan" => println!("\n{}", it.text),
+            "command" => {
+                let exit = it.exit.map(|e| format!(" (exit {e})")).unwrap_or_default();
+                println!("\n$ {}{exit}", it.text);
+            }
+            "files" => println!("\nchanged files:\n{}", it.text),
+            "reasoning" => {}
+            _ => println!("\n[{}] {}", it.kind, it.text),
+        }
+    }
+    for a in &f.asks {
+        println!(
+            "\nCodex asks ({}), number {}:\n{}\n{}",
+            a.kind, a.key, a.text, a.detail
+        );
+        for q in &a.questions {
+            let opts: Vec<&str> = q.options.iter().map(|(l, _)| l.as_str()).collect();
+            println!("  {}: {} [{}]", q.id, q.question, opts.join(" / "));
+        }
+        println!(
+            "answer: sudo thorn codex answer {space} {} {} accept|session|decline|cancel",
+            &id[..8],
+            a.key
+        );
+    }
+    let state = crate::codex::state_label(&f.state);
+    if !state.is_empty() {
+        println!("\n({state})");
+    }
+    if !f.notice.is_empty() {
+        println!("\n{}", f.notice);
+    }
+    Ok(())
+}
+
+pub fn codex_new(space: &str, text: &str) -> Result<()> {
+    let id = crate::codex::new(space, text, &by_cli())?;
+    println!("started chat {id}");
+    Ok(())
+}
+
+pub fn codex_send(space: &str, chat: &str, text: &str) -> Result<()> {
+    let id = codex_chat(space, chat)?;
+    crate::codex::send(space, &id, text, &by_cli())?;
+    println!("sent");
+    Ok(())
+}
+
+pub fn codex_stop(space: &str, chat: &str) -> Result<()> {
+    let id = codex_chat(space, chat)?;
+    crate::codex::stop(space, &id, &by_cli())?;
+    println!("stopped");
+    Ok(())
+}
+
+pub fn codex_answer(
+    space: &str,
+    chat: &str,
+    ask: u64,
+    decision: &str,
+    answers: &[String],
+) -> Result<()> {
+    let id = codex_chat(space, chat)?;
+    let mut map = std::collections::BTreeMap::new();
+    for a in answers {
+        let Some((k, v)) = a.split_once('=') else {
+            anyhow::bail!("--answer takes ID=ANSWER");
+        };
+        map.insert(k.to_string(), v.to_string());
+    }
+    crate::codex::answer(space, &id, ask, decision, &map, &by_cli())?;
+    println!("answered");
+    Ok(())
+}
+
+pub fn codex_rename(space: &str, chat: &str, name: &str) -> Result<()> {
+    let id = codex_chat(space, chat)?;
+    crate::codex::rename(space, &id, name)?;
+    println!("renamed");
+    Ok(())
+}
+
+pub fn codex_archive(space: &str, chat: &str) -> Result<()> {
+    let id = codex_chat(space, chat)?;
+    crate::codex::archive(space, &id)?;
+    println!("archived chat {}", &id[..8]);
+    Ok(())
+}

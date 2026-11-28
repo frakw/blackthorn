@@ -146,11 +146,22 @@ pub fn space_files(cfg: &Config, state: &State, name: &str, s: &Space, now: u64)
         )?;
     }
 
+    let launch = render::launch(name, s, cfg);
+    let before: Option<render::Launch> = std::fs::read_to_string(paths::launch_file(&s.key))
+        .ok()
+        .and_then(|t| toml::from_str(&t).ok());
     sys::write_file(
         &paths::launch_file(&s.key),
-        &toml::to_string(&render::launch(name, s, cfg))?,
+        &toml::to_string(&launch)?,
         0o644,
         None,
     )?;
+    // A Codex space from before v0.15 runs Codex in its terminal: restart
+    // it once, into the bridge, so its chats show on the web page.
+    if launch.kind == render::LaunchKind::Codex
+        && before.is_some_and(|b| b.kind != render::LaunchKind::Codex)
+    {
+        let _ = sys::systemctl(&["try-restart", &paths::space_unit(&s.key)]);
+    }
     Ok(())
 }

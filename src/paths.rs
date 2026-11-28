@@ -87,6 +87,11 @@ pub fn tmux_socket(key: &str) -> PathBuf {
     space_runtime(key).join("tmux.sock")
 }
 
+/// Where a Codex space's bridge listens (see codex.rs).
+pub fn codex_socket(key: &str) -> PathBuf {
+    space_runtime(key).join("codex.sock")
+}
+
 /// tmux server used while a space signs in from the web UI.
 pub fn login_socket(key: &str) -> PathBuf {
     PathBuf::from("/run/blackthorn-login")

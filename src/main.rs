@@ -6,6 +6,8 @@ mod apply;
 mod asks;
 mod backup;
 mod chat;
+mod codex;
+mod codex_bridge;
 mod config;
 mod config_cmd;
 mod ctx;
@@ -313,6 +315,8 @@ enum Cmd {
 
     #[command(name = "_run", hide = true)]
     Run { key: String },
+    #[command(name = "_codex", hide = true)]
+    CodexBridge { key: String },
     #[command(name = "_load-keys", hide = true)]
     LoadKeys { key: String },
     #[command(name = "_tick", hide = true)]
@@ -381,6 +385,47 @@ enum CodexCmd {
     /// Install or update it with OpenAI's installer (into /opt/codex).
     /// Codex spaces use the new version once restarted.
     Install,
+    /// List a Codex space's chats, latest first. CHAT below may be the
+    /// start of a chat's id.
+    Chats { space: String },
+    /// Print a chat: its messages, commands and what Codex waits on.
+    Show {
+        space: String,
+        chat: String,
+        /// How many of its latest turns.
+        #[arg(long, default_value_t = 20)]
+        turns: u32,
+    },
+    /// Start a chat with its first message.
+    New { space: String, text: String },
+    /// Send a message to a chat (while Codex works: more for what it is
+    /// doing).
+    Send {
+        space: String,
+        chat: String,
+        text: String,
+    },
+    /// Stop what Codex is doing in a chat.
+    Stop { space: String, chat: String },
+    /// Answer what Codex asks (see `show` for its number): accept, session
+    /// (and the same again in this chat), decline, or cancel (and stop).
+    Answer {
+        space: String,
+        chat: String,
+        ask: u64,
+        decision: String,
+        /// For questions: ID=ANSWER, repeated.
+        #[arg(long = "answer")]
+        answers: Vec<String>,
+    },
+    /// Name a chat.
+    Rename {
+        space: String,
+        chat: String,
+        name: String,
+    },
+    /// Archive a chat: Codex keeps it, out of the list.
+    Archive { space: String, chat: String },
 }
 
 #[derive(Subcommand)]
@@ -765,6 +810,20 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Codex(c) => match c {
             CodexCmd::Status => config_cmd::codex_status(),
             CodexCmd::Install => config_cmd::codex_install(),
+            CodexCmd::Chats { space } => s::codex_chats(&space),
+            CodexCmd::Show { space, chat, turns } => s::codex_show(&space, &chat, turns),
+            CodexCmd::New { space, text } => s::codex_new(&space, &text),
+            CodexCmd::Send { space, chat, text } => s::codex_send(&space, &chat, &text),
+            CodexCmd::Stop { space, chat } => s::codex_stop(&space, &chat),
+            CodexCmd::Answer {
+                space,
+                chat,
+                ask,
+                decision,
+                answers,
+            } => s::codex_answer(&space, &chat, ask, &decision, &answers),
+            CodexCmd::Rename { space, chat, name } => s::codex_rename(&space, &chat, &name),
+            CodexCmd::Archive { space, chat } => s::codex_archive(&space, &chat),
         },
         Cmd::Tailscale(t) => match t {
             TailscaleCmd::Status => config_cmd::tailscale_status(),
@@ -893,6 +952,7 @@ fn run(cli: Cli) -> Result<()> {
         },
         Cmd::Apply => init_cmd::apply_all(),
         Cmd::Run { key } => runner::run(&key),
+        Cmd::CodexBridge { key } => codex_bridge::run(&key),
         Cmd::LoadKeys { key } => init_cmd::load_keys(&key),
         Cmd::Tick => init_cmd::tick(),
         Cmd::Api => api::serve(),
@@ -1012,6 +1072,14 @@ mod tests {
             ("login_api_key", &["login"]),
             ("codex_show", &["codex", "status"]),
             ("codex_install", &["codex", "install"]),
+            ("codex_chats", &["codex", "chats"]),
+            ("codex_feed", &["codex", "show"]),
+            ("codex_new", &["codex", "new"]),
+            ("codex_send", &["codex", "send"]),
+            ("codex_stop", &["codex", "stop"]),
+            ("codex_answer", &["codex", "answer"]),
+            ("codex_rename", &["codex", "rename"]),
+            ("codex_archive", &["codex", "archive"]),
         ];
         // Operations that exist only because of the web: sessions.
         // Passkeys are made and used in a browser.

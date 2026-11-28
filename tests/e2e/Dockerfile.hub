@@ -1,10 +1,11 @@
 # A throwaway blackthorn hub for tests: Debian with systemd as PID 1, plus
-# sshd and the TOTP PAM module for the `thorn harden ssh` test.
+# sshd and the TOTP PAM module for the `thorn harden ssh` test, and Python
+# for the stand-in Codex app-server (fake-codex).
 FROM debian:trixie
 RUN apt-get update \
  && apt-get install -y --no-install-recommends systemd systemd-sysv tmux openssh-client \
       openssh-server libpam-google-authenticator nftables passwd util-linux procps \
-      iproute2 ca-certificates curl hostname openssl \
+      iproute2 ca-certificates curl hostname openssl python3 \
  && rm -rf /var/lib/apt/lists/* \
  && useradd -m -s /bin/bash admin && install -d -o admin -g admin -m 700 /home/admin/.ssh
 STOPSIGNAL SIGRTMIN+3

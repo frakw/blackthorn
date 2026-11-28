@@ -5,7 +5,7 @@ coding agents live. They keep running there, you reach them from your phone
 or laptop, and each one can work on exactly one of your machines, over SSH,
 one way only.
 
-Status: **early (v0.14)**. It works and is tested end to end, but expect
+Status: **early (v0.15)**. It works and is tested end to end, but expect
 changes. Read [THREAT_MODEL.md](THREAT_MODEL.md) before trusting it with
 anything important.
 
@@ -276,6 +276,7 @@ restores the old settings at any time.
 | `thorn new HOST [--agent A] [--name N] [--access user\|read-only] [--root 8h\|forever\|no] [--single] [--local] [--arg A]...` | Create a space on a machine |
 | `thorn login SPACE [--api-key]` | Sign a Claude or Codex space in, then start it (Codex: a device code, or an API key on standard input) |
 | `thorn codex status` / `install` | OpenAI's Codex on the hub: its version; install or update it |
+| `thorn codex chats\|show\|new\|send\|stop\|answer\|rename\|archive SPACE ...` | A Codex space's chats: list, read, start, write, stop, answer what Codex asks |
 | `thorn start\|stop\|restart SPACE... \| --all` | Control spaces |
 | `thorn access SPACE user\|read-only` | A space's usual login on its machine; applies at once |
 | `thorn root SPACE [--for 8h \| --forever \| --ask \| --off]` | Give a space root for a time (at most 72h), until taken back, or on approval; take it back |
@@ -334,10 +335,27 @@ echo "$OPENAI_API_KEY" | sudo thorn login fig-codex --api-key   # or a key
 
 A Codex space reads its instructions from `AGENTS.md`, runs Codex without
 Codex's own sandbox (the space already is one: its own user, firewall and
-logins) and with Codex asking before commands it is unsure of. You use it
-through the web UI's terminal view or `thorn attach`; OpenAI's phone
-remote control needs their desktop app, so it is not offered. The commands
-it runs are recorded like Claude's.
+logins) and with Codex asking before commands it is unsure of. Its chats
+are on its page in the web UI: start as many as you like, each a
+conversation of its own, and continue any of them later. The page shows
+what Codex says, the commands it runs with their output, and the files it
+changes; when Codex asks to run something, the chat shows what and offers
+**Allow once**, **Allow for this chat**, **Decline** or **Decline and
+stop**. The same from the command line:
+
+```sh
+sudo thorn codex chats fig-codex
+sudo thorn codex new fig-codex "Why is nginx restarting?"
+sudo thorn codex show fig-codex 0199a2         # the start of a chat's id
+sudo thorn codex send fig-codex 0199a2 "Check the logs from last night too"
+sudo thorn codex answer fig-codex 0199a2 1 accept
+```
+
+Behind the page, the space runs `codex app-server` (Codex's own interface
+for programs, the one its editor extensions use) through a small bridge
+the hub reaches over a socket; the space's terminal shows the bridge's log.
+OpenAI's phone remote control needs their desktop app, so it is not
+offered. The commands it runs are recorded like Claude's.
 
 Other terminal agents can run in a space too; you use them through
 `thorn attach`, the web UI's terminal view, or `thorn screen`/`send`.

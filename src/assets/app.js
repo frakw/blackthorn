@@ -988,3 +988,146 @@ document.querySelectorAll("time[data-local]").forEach(function (t) {
     if (j.model_label) modelBtn.textContent = j.model_label + (current.effort ? " · " + current.effort : "");
   };
 })();
+
+// A Codex chat's page: redrawn whenever the chat changes (parts opened
+// stay open), messages and answers sent without leaving the page.
+(function () {
+  "use strict";
+  var pageEl = document.querySelector(".codex-page");
+  if (!pageEl) return;
+  var log = document.getElementById("chat-log");
+  var stateEl = document.getElementById("chat-state");
+  var titleEl = document.getElementById("chat-title");
+  var feedUrl = pageEl.getAttribute("data-feed");
+  var csrf = pageEl.getAttribute("data-csrf");
+  var version = pageEl.getAttribute("data-version") || "0";
+  var lively = false;
+  var timer = null;
+
+  var nearBottom = function () {
+    return window.innerHeight + window.scrollY >= document.body.scrollHeight - 120;
+  };
+  var toBottom = function () { window.scrollTo(0, document.body.scrollHeight); };
+  toBottom();
+
+  var showError = function (msg) {
+    var p = document.getElementById("chat-error");
+    if (!p) {
+      p = document.createElement("pre");
+      p.id = "chat-error";
+      p.className = "flash err";
+      stateEl.parentNode.insertBefore(p, stateEl);
+    }
+    p.textContent = msg;
+    p.hidden = !msg;
+  };
+
+  var json = function (r) {
+    if (r.redirected && new URL(r.url).pathname === "/login") {
+      window.location.assign("/login");
+      throw new Error("logged out");
+    }
+    return r.json();
+  };
+
+  var postForm = function (form, submitter) {
+    var body = new URLSearchParams(new FormData(form));
+    if (submitter && submitter.name) body.set(submitter.name, submitter.value);
+    body.set("csrf", csrf);
+    body.set("js", "1");
+    return fetch(form.action, { method: "POST", body: body, credentials: "same-origin" })
+      .then(json)
+      .then(function (j) {
+        if (j.error) throw new Error(j.error);
+        return j;
+      });
+  };
+
+  var reading = false, again = false;
+  var poll = function () {
+    if (timer) window.clearTimeout(timer);
+    timer = null;
+    if (reading) { again = true; return; }
+    reading = true;
+    again = false;
+    var stick = nearBottom();
+    fetch(feedUrl + "&since=" + encodeURIComponent(version), { credentials: "same-origin" })
+      .then(json)
+      .then(function (j) {
+        if (j.error || j.same) return;
+        version = String(j.version);
+        var open = {};
+        log.querySelectorAll("details[open][data-id]").forEach(function (d) { open[d.getAttribute("data-id")] = true; });
+        log.innerHTML = j.html;
+        log.querySelectorAll("details[data-id]").forEach(function (d) {
+          if (open[d.getAttribute("data-id")]) d.open = true;
+        });
+        if (stateEl.innerHTML !== j.state_html) {
+          stateEl.innerHTML = j.state_html;
+          wire();
+        }
+        if (j.title && titleEl) titleEl.textContent = j.title;
+        lively = j.state === "working" || j.state === "waiting";
+        if (stick) toBottom();
+      })
+      .catch(function () { /* try again later */ })
+      .then(function () {
+        reading = false;
+        if (again) poll();
+        else if (!document.hidden) timer = window.setTimeout(poll, lively ? 1200 : 4000);
+      });
+  };
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) poll(); });
+
+  // Answers and Stop, without leaving the page.
+  var wire = function () {
+    stateEl.querySelectorAll("form.codex-answer, form.codex-stop").forEach(function (f) {
+      f.addEventListener("submit", function (e) {
+        e.preventDefault();
+        f.querySelectorAll("button").forEach(function (b) { b.disabled = true; });
+        postForm(f, e.submitter)
+          .then(function () { showError(""); window.setTimeout(poll, 300); })
+          .catch(function (err) {
+            showError(err.message);
+            f.querySelectorAll("button").forEach(function (b) { b.disabled = false; });
+          });
+      });
+    });
+  };
+  wire();
+  timer = window.setTimeout(poll, 1000);
+
+  var form = document.getElementById("composer");
+  if (!form) return;
+  var text = document.getElementById("chat-text");
+  var grow = function () {
+    text.style.height = "auto";
+    text.style.height = Math.min(text.scrollHeight, window.innerHeight * 0.4) + "px";
+  };
+  text.addEventListener("input", grow);
+  var send = function () {
+    if (!text.value.trim()) return;
+    var button = form.querySelector(".send");
+    button.disabled = true;
+    postForm(form)
+      .then(function () {
+        text.value = "";
+        grow();
+        showError("");
+        lively = true;
+        window.setTimeout(poll, 400);
+      })
+      .catch(function (err) { showError(err.message); })
+      .then(function () { button.disabled = false; text.focus(); });
+  };
+  form.addEventListener("submit", function (e) { e.preventDefault(); send(); });
+  // Enter sends on a computer (Shift+Enter: a new line); on a phone the
+  // button does.
+  var coarse = window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
+  text.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229 && !coarse) {
+      e.preventDefault();
+      send();
+    }
+  });
+})();

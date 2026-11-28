@@ -1,8 +1,191 @@
 #!/bin/sh
 # Stands in for OpenAI's Codex CLI in tests: signs in with a device code
-# (by itself, after a moment) or an API key starting "sk-", and otherwise
-# records how it was started and writes one session transcript with a
-# command in it.
+# (by itself, after a moment) or an API key starting "sk-"; `app-server`
+# speaks a small part of Codex's app-server protocol (the Python below).
+APP_SERVER=$(cat <<'PY'
+# The app-server: JSON-RPC a line at a time. Chats are kept in
+# ~/.codex/fake-threads.json. What a message says decides the turn:
+#   "run ..."  asks to run `ssh t1 uptime`, then runs it or not;
+#   "slow ..." works until stopped;
+#   anything else is answered at once ("You said: ...").
+import json, os, sys, time, uuid
+
+HOME = os.environ["HOME"]
+STORE = os.path.join(HOME, ".codex", "fake-threads.json")
+ARGS = os.path.join(HOME, "fake-codex.args")
+
+
+def load():
+    try:
+        with open(STORE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+threads = load()
+pending = {}  # our request id -> (thread, turn)
+next_id = [1000]
+
+
+def save():
+    with open(STORE, "w") as f:
+        json.dump(threads, f)
+
+
+def out(m):
+    sys.stdout.write(json.dumps(m) + "\n")
+    sys.stdout.flush()
+
+
+def note(method, params):
+    out({"method": method, "params": params})
+
+
+def now():
+    return int(time.time())
+
+
+def view(t):
+    return {"id": t["id"], "name": t.get("name"), "preview": t.get("preview", ""),
+            "createdAt": t["created"], "updatedAt": t["updated"], "model": "gpt-fake",
+            "status": {"type": "idle"}, "cwd": t.get("cwd", "/"), "turns": []}
+
+
+def item(t, turn, it):
+    turn["items"].append(it)
+    t["updated"] = now()
+    save()
+    note("item/completed", {"threadId": t["id"], "turnId": turn["id"], "item": it, "completedAtMs": now() * 1000})
+
+
+def finish(t, turn, status="completed"):
+    turn["status"] = status
+    t["active"] = None
+    save()
+    note("turn/completed", {"threadId": t["id"], "turn": turn})
+
+
+def turn_of(t, tid):
+    return next(x for x in t["turns"] if x["id"] == tid)
+
+
+def start_turn(t, text):
+    turn = {"id": str(uuid.uuid4()), "status": "inProgress", "items": []}
+    t["turns"].append(turn)
+    t["active"] = turn["id"]
+    if not t.get("preview"):
+        t["preview"] = text
+    note("turn/started", {"threadId": t["id"], "turn": dict(turn, items=[])})
+    item(t, turn, {"type": "userMessage", "id": str(uuid.uuid4()), "content": [{"type": "text", "text": text}]})
+    if text.startswith("run"):
+        rid = next_id[0]
+        next_id[0] += 1
+        pending[rid] = (t["id"], turn["id"])
+        out({"id": rid, "method": "item/commandExecution/requestApproval",
+             "params": {"threadId": t["id"], "turnId": turn["id"], "itemId": "cmd-" + turn["id"],
+                        "command": "ssh t1 uptime", "cwd": t.get("cwd", "/"), "startedAtMs": now() * 1000}})
+    elif text.startswith("slow"):
+        note("item/started", {"threadId": t["id"], "turnId": turn["id"],
+                              "item": {"type": "agentMessage", "id": "a-" + turn["id"], "text": ""}})
+        note("item/agentMessage/delta", {"threadId": t["id"], "turnId": turn["id"],
+                                         "itemId": "a-" + turn["id"], "delta": "Working on it"})
+    else:
+        item(t, turn, {"type": "agentMessage", "id": str(uuid.uuid4()), "text": "You said: **" + text + "**"})
+        finish(t, turn)
+    return turn
+
+
+def handle(m):
+    method, p, mid = m.get("method"), m.get("params") or {}, m.get("id")
+    if method is None and mid in pending:  # an answer to our request
+        tid, turnid = pending.pop(mid)
+        t = threads[tid]
+        turn = turn_of(t, turnid)
+        decision = (m.get("result") or {}).get("decision")
+        note("serverRequest/resolved", {"threadId": tid, "requestId": mid})
+        if decision in ("accept", "acceptForSession"):
+            item(t, turn, {"type": "commandExecution", "id": "cmd-" + turnid, "command": "ssh t1 uptime",
+                           "cwd": "/", "commandActions": [], "status": "completed",
+                           "aggregatedOutput": " 10:00:00 up 1 day,  load average: 0.01\n", "exitCode": 0})
+            item(t, turn, {"type": "agentMessage", "id": str(uuid.uuid4()), "text": "t1 is up 1 day."})
+        else:
+            item(t, turn, {"type": "commandExecution", "id": "cmd-" + turnid, "command": "ssh t1 uptime",
+                           "cwd": "/", "commandActions": [], "status": "declined"})
+            item(t, turn, {"type": "agentMessage", "id": str(uuid.uuid4()), "text": "I did not run it."})
+        finish(t, turn, "interrupted" if decision == "cancel" else "completed")
+        return
+    if method == "initialized" or mid is None:
+        return
+    r = None
+    if method == "initialize":
+        r = {"userAgent": "fake", "codexHome": os.path.join(HOME, ".codex")}
+    elif method == "thread/start":
+        with open(ARGS, "a") as f:
+            f.write("thread/start approvalPolicy=%s sandbox=%s\n" % (p.get("approvalPolicy"), p.get("sandbox")))
+        t = {"id": str(uuid.uuid4()), "created": now(), "updated": now(), "turns": [], "cwd": p.get("cwd")}
+        threads[t["id"]] = t
+        save()
+        note("thread/started", {"thread": view(t)})
+        r = {"thread": view(t)}
+    elif method in ("thread/resume", "thread/read"):
+        t = threads.get(p.get("threadId"))
+        if not t:
+            out({"id": mid, "error": {"code": -32600, "message": "no such thread"}})
+            return
+        r = {"thread": view(t)}
+    elif method == "thread/list":
+        ts = sorted(threads.values(), key=lambda t: t["updated"], reverse=True)
+        r = {"data": [view(t) for t in ts if t.get("preview") and not t.get("archived")], "nextCursor": None}
+    elif method == "thread/turns/list":
+        t = threads.get(p.get("threadId"))
+        if not t:
+            out({"id": mid, "error": {"code": -32600, "message": "no such thread"}})
+            return
+        r = {"data": list(reversed(t["turns"]))[: p.get("limit") or 30], "nextCursor": None}
+    elif method == "thread/name/set":
+        t = threads[p["threadId"]]
+        t["name"] = p["name"]
+        save()
+        note("thread/name/updated", {"threadId": t["id"], "threadName": p["name"]})
+        r = {}
+    elif method == "thread/archive":
+        threads[p["threadId"]]["archived"] = True
+        save()
+        r = {}
+    elif method == "turn/start":
+        t = threads[p["threadId"]]
+        text = "\n".join(x.get("text", "") for x in p.get("input", []))
+        turn = start_turn(t, text)
+        r = {"turn": dict(turn, items=[])}
+    elif method == "turn/steer":
+        t = threads[p["threadId"]]
+        turn = turn_of(t, p["expectedTurnId"])
+        text = "\n".join(x.get("text", "") for x in p.get("input", []))
+        item(t, turn, {"type": "userMessage", "id": str(uuid.uuid4()), "content": [{"type": "text", "text": text}]})
+        r = {"turnId": turn["id"]}
+    elif method == "turn/interrupt":
+        t = threads[p["threadId"]]
+        turn = turn_of(t, p["turnId"])
+        for rid, (tid, turnid) in list(pending.items()):
+            if turnid == turn["id"]:
+                del pending[rid]
+        finish(t, turn, "interrupted")
+        r = {}
+    else:
+        out({"id": mid, "error": {"code": -32601, "message": "fake codex: no " + str(method)}})
+        return
+    out({"id": mid, "result": r})
+
+
+for line in sys.stdin:
+    try:
+        handle(json.loads(line))
+    except Exception as e:
+        sys.stderr.write("fake codex: %r\n" % e)
+PY
+)
+
 case "$1 $2" in
   "--version "*) echo "codex-cli 0.0.0 (fake)"; exit 0 ;;
   "login --device-auth")
@@ -31,6 +214,9 @@ f="$d/rollout-2026-11-25T08-00-05-0199a213-81c0-7800-8aa1-bbab2a035a53.jsonl"
 if [ ! -e "$f" ]; then
   echo '{"timestamp":"2026-11-25T08:00:00.000Z","type":"session_meta","payload":{"id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}}' >> "$f"
   echo '{"timestamp":"2026-11-25T08:00:05.120Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ssh t1 uptime\"}","call_id":"c1"}}' >> "$f"
+fi
+if [ "$1" = app-server ]; then
+  exec python3 -c "$APP_SERVER"
 fi
 printf '› '
 while IFS= read -r line; do printf '%s\n› ' "$line"; done

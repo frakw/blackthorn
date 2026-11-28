@@ -309,7 +309,7 @@ pub fn codex_commands(text: &str, chat: &str) -> Vec<Entry> {
 
 /// An argv as one command line: the script of `bash -lc SCRIPT` (how Codex
 /// runs commands), else the words joined.
-fn argv_text(v: &serde_json::Value) -> Option<String> {
+pub(crate) fn argv_text(v: &serde_json::Value) -> Option<String> {
     let a: Vec<&str> = v.as_array()?.iter().filter_map(|x| x.as_str()).collect();
     match a.as_slice() {
         [] => None,

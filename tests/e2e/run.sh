@@ -708,8 +708,50 @@ echo "$page" | grep -q 'FAKE-0042' && ok "web sign-in shows the device code" || 
 echo "$page" | grep -q 'https://auth.openai.example/codex/device' && ok "and the page to enter it on" || fail "device page link"
 r=$(web_post /space/t1-codex/login-finish --data-urlencode "csrf=$C")
 case "$r" in *"ok=signed"*) ok "it finishes once the code is entered";; *) fail "codex sign-in: $r";; esac
-sleep 3
-hub grep -q -- "--sandbox danger-full-access --ask-for-approval on-request" "/var/lib/blackthorn/spaces/$kc/fake-codex.args" && ok "Codex runs without its own sandbox, asking first" || fail "codex args: $(hub cat "/var/lib/blackthorn/spaces/$kc/fake-codex.args" 2>&1)"
+for _ in $(seq 30); do thorn codex chats t1-codex >/dev/null 2>&1 && break; sleep 1; done
+thorn codex chats t1-codex | grep -q "no chats in t1-codex yet" && ok "the space runs Codex behind the bridge" || fail "codex bridge: $(thorn codex chats t1-codex 2>&1); $(thorn screen t1-codex 2>&1 | tail -5)"
+
+say "codex chats"
+out=$(thorn codex new t1-codex "hello codex")
+cid=$(echo "$out" | awk '/started chat/{print $3}')
+[ -n "$cid" ] && ok "thorn codex new starts a chat" || fail "codex new: $out"
+hub grep -q "thread/start approvalPolicy=on-request sandbox=danger-full-access" "/var/lib/blackthorn/spaces/$kc/fake-codex.args" && ok "Codex runs without its own sandbox, asking first" || fail "codex args: $(hub cat "/var/lib/blackthorn/spaces/$kc/fake-codex.args" 2>&1)"
+for _ in $(seq 10); do thorn codex show t1-codex "$cid" | grep -q "You said" && break; sleep 1; done
+thorn codex show t1-codex "${cid%%-*}" | grep -q "You said: \*\*hello codex\*\*" && ok "and shows Codex's answer (by the start of its id too)" || fail "codex show: $(thorn codex show t1-codex "$cid" 2>&1)"
+thorn codex show t1-codex "$cid" | grep -q "sent by hub:" && ok "with who sent the message" || fail "codex sender: $(thorn codex show t1-codex "$cid" 2>&1)"
+web_get /space/t1-codex | grep -q "/space/t1-codex/codex/$cid" && ok "the space page lists the chat" || fail "codex chats card: $(web_get /space/t1-codex | grep -o 'id="chats".\{0,800\}')"
+web_get "/space/t1-codex/codex/$cid" | grep -q "<strong>hello codex</strong>" && ok "the chat page shows Codex's answer as Markdown" || fail "codex page: $(web_get "/space/t1-codex/codex/$cid" | head -c 1500)"
+web_get "/space/t1-codex/codex/$cid/feed?turns=30&since=0" | grep -q '"version"' && ok "and its feed" || fail "codex feed: $(web_get "/space/t1-codex/codex/$cid/feed?turns=30&since=0")"
+C=$(csrf)
+r=$(web_post /space/t1-codex/codex-unlock --data-urlencode "csrf=$C" --data-urlencode "password=$PASSWORD" --data-urlencode "code=$(fresh_code $WEB_SECRET)")
+case "$r" in *"ok=unlocked"*) ok "the space page unlocks this browser for Codex";; *) fail "codex unlock: $r";; esac
+r=$(web_post /space/t1-codex/codex-new --data-urlencode "csrf=$C" --data-urlencode "text=run uptime on t1")
+cid2=${r##*/codex/}
+case "$r" in */space/t1-codex/codex/*) ok "a chat started on the web opens its page";; *) fail "codex web new: $r";; esac
+for _ in $(seq 10); do web_get "/space/t1-codex/codex/$cid2" | grep -q "Codex asks to run" && break; sleep 1; done
+page=$(web_get "/space/t1-codex/codex/$cid2")
+echo "$page" | grep -q "Codex asks to run" && echo "$page" | grep -q "ssh t1 uptime" && ok "what Codex asks to run shows" || fail "codex ask: $(echo "$page" | grep -o 'id="chat-state".\{0,1500\}')"
+echo "$page" | grep -q "Allow once" && ok "with buttons to answer" || fail "codex ask buttons"
+thorn codex chats t1-codex | grep -q "(waiting for you)" && ok "the list says it waits" || fail "codex waiting: $(thorn codex chats t1-codex)"
+ask=$(echo "$page" | grep -o 'name="ask" value="[0-9]*"' | head -1 | cut -d'"' -f4)
+r=$(web_post "/space/t1-codex/codex/$cid2/answer" --data-urlencode "csrf=$C" --data-urlencode "ask=$ask" --data-urlencode "decision=accept")
+case "$r" in *"ok=answered"*) ok "allowing it on the web";; *) fail "codex answer: $r";; esac
+for _ in $(seq 10); do thorn codex show t1-codex "$cid2" | grep -q "t1 is up" && break; sleep 1; done
+thorn codex show t1-codex "$cid2" | grep -q "\$ ssh t1 uptime (exit 0)" && ok "runs it" || fail "codex ran: $(thorn codex show t1-codex "$cid2" 2>&1)"
+thorn log t1-codex | grep -q "Codex asked: allowed once" && ok "and the answer is in the space's log" || fail "codex answer log: $(thorn log t1-codex 2>&1 | tail -5)"
+thorn codex send t1-codex "$cid" "slow work please" >/dev/null
+for _ in $(seq 10); do thorn codex chats t1-codex | grep -q "(working)" && break; sleep 1; done
+thorn codex chats t1-codex | grep "${cid}" | grep -q "(working)" && ok "a chat at work says so" || fail "codex working: $(thorn codex chats t1-codex)"
+web_get "/space/t1-codex/codex/$cid" | grep -q "Codex is working" && ok "and its page offers Stop" || fail "codex working page"
+thorn codex stop t1-codex "$cid" >/dev/null && ok "thorn codex stop stops it" || fail "codex stop"
+for _ in $(seq 10); do thorn codex show t1-codex "$cid" | grep -q "\[note\] stopped" && break; sleep 1; done
+thorn codex show t1-codex "$cid" | grep -q "\[note\] stopped" && ok "and the chat says it stopped" || fail "codex stopped: $(thorn codex show t1-codex "$cid" 2>&1)"
+thorn codex rename t1-codex "$cid" "Greeting" >/dev/null
+thorn codex chats t1-codex | grep "$cid" | grep -q "Greeting" && ok "chats can be renamed" || fail "codex rename: $(thorn codex chats t1-codex)"
+web_get /chats | grep -q "/space/t1-codex/codex/$cid2" && ok "the Chats page lists Codex chats" || fail "codex on chats page"
+thorn codex archive t1-codex "$cid" >/dev/null
+thorn codex chats t1-codex | grep -q "$cid" && fail "an archived chat is still listed" || ok "an archived chat leaves the list"
+web_get /space/t1-codex | grep -q 'placeholder="type a line' && fail "a Codex space offers typing into its terminal" || ok "a Codex space's terminal is only a log"
 thorn new t1 --agent codex --name t1-cx2 --root no >/dev/null
 out=$(echo "not-a-key-but-long-enough-to-pass" | thorni login t1-cx2 --api-key 2>&1) && fail "a bad API key was taken" || ok "a key Codex refuses is refused"
 echo "sk-test-0123456789abcdefghij" | thorni login t1-cx2 --api-key >/dev/null && ok "thorn login --api-key signs a Codex space in" || fail "api key login"

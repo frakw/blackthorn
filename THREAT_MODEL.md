@@ -187,7 +187,13 @@ Know these before you rely on it.
     Whoever can change that script or those releases can run code on your
     hub, as with Tailscale's installer. Codex runs in its spaces without
     its own sandbox: the space's user, firewall and logins are the limits,
-    as for Claude Code.
+    as for Claude Code. Its chats go through a bridge (`thorn _codex`)
+    that runs as the space user, so the space can say anything there: the
+    hub reaches its socket only if it is the space user's own socket (not
+    a link), reads bounded answers, shows them escaped, and keeps who sent
+    what in the space's log, which the space cannot write. Codex asking
+    before a command is Codex's own care, not a limit: the space could run
+    the command anyway.
 
 14. **Availability is not protected.** A space can exhaust memory or CPU,
     or kill its own agent. Spaces are separate units, so this affects

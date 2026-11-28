@@ -456,6 +456,9 @@ fn route(
         ("GET", ["space", _, "chat", id]) => chat_page(&c, &name, id, &flash),
         ("GET", ["space", _, "chat", id, "feed"]) => chat_feed(&c, &name, id, query),
         ("POST", ["space", _, "chat", id, action]) => chat_post(&c, &name, id, action, form),
+        ("GET", ["space", _, "codex", id]) => codex_page(&c, &name, id, query, &flash),
+        ("GET", ["space", _, "codex", id, "feed"]) => codex_feed(&c, &name, id, query),
+        ("POST", ["space", _, "codex", id, action]) => codex_post(&c, &name, id, action, form),
 
         ("GET", ["hosts"]) => hosts_page(&c, &flash),
         ("POST", ["hosts", "scan"]) => host_scan(&c, form),
@@ -574,6 +577,8 @@ fn route(
             let space = f(form, "space").to_string();
             if space.is_empty() {
                 back("/chats", Err("choose a space".into()))
+            } else if f(form, "agent") == "codex" {
+                space_post(&c, &space, "codex-new", form)
             } else {
                 space_post(&c, &space, "chat-new", form)
             }
@@ -1369,6 +1374,8 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
 
     if claude {
         b.push_str(&chats_card(c, s));
+    } else if s.agent == crate::config::CODEX {
+        b.push_str(&codex_chats_card(c, s));
     }
     if claude || s.agent == crate::config::CODEX {
         b.push_str(&activity_card(c, s));
@@ -1384,7 +1391,11 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
             )
         })
         .collect();
-    let where_chats = if !claude {
+    let codex = s.agent == crate::config::CODEX;
+    let where_chats = if codex {
+        "Codex runs here behind the hub's bridge, which logs what happens; talk to it in the chats above."
+            .to_string()
+    } else if !claude {
         "The agent runs here.".to_string()
     } else if s.remote_control {
         format!(
@@ -1398,7 +1409,7 @@ fn space_page(c: &Ctx, name: &str, flash: &Flash) -> Reply {
         "<section class=\"card\"><h2>Terminal</h2><p class=\"hint\">What the space's terminal shows, refreshed every \
          few seconds. {where_chats}</p>\
          <pre class=\"screen\" id=\"screen\" data-src=\"/space/{n}/screen\">…</pre>{}</section>",
-        if can_use {
+        if can_use && !codex {
             format!(
                 "<form method=\"post\" action=\"/space/{n}/send\" class=\"send typing\">{}<input name=\"text\" \
                  placeholder=\"type a line, Enter sends it\" autocomplete=\"off\"><button>Send</button></form>\
@@ -2511,6 +2522,8 @@ fn space_post(c: &Ctx, name: &str, action: &str, form: &HashMap<String, String>)
         back(&here, r.map(|v| v.join("; ")))
     };
     match action {
+        "codex-new" => codex_new(c, name, form),
+        "codex-unlock" => unlock(c, form, &here),
         "start" => control(Action::Start),
         "stop" => control(Action::Stop),
         "restart" => control(Action::Restart),
@@ -4071,8 +4084,21 @@ fn chats_page(c: &Ctx, flash: &Flash) -> Reply {
         .iter()
         .filter(|s| s.agent == crate::config::CLAUDE)
         .collect();
-    let mut rows: Vec<(&SpaceView, ops::Chat)> = Vec::new();
+    let codex: Vec<&SpaceView> = o
+        .spaces
+        .iter()
+        .filter(|s| s.agent == crate::config::CODEX)
+        .collect();
+    // (space, link, title, last written, dot, what it is doing)
+    let mut rows: Vec<(&SpaceView, String, String, u64, &str, String)> = Vec::new();
     let mut errors = String::new();
+    let mut error = |s: &SpaceView, e: &str| {
+        errors.push_str(&format!(
+            "<p class=\"t-bad\">{}: {}</p>",
+            esc(&s.name),
+            esc(e)
+        ))
+    };
     for s in &claude {
         match get::<Vec<ops::Chat>>(
             c,
@@ -4080,35 +4106,99 @@ fn chats_page(c: &Ctx, flash: &Flash) -> Reply {
                 name: s.name.clone(),
             },
         ) {
-            Ok(v) => rows.extend(v.into_iter().map(|ch| (*s, ch))),
-            Err(e) => errors.push_str(&format!(
-                "<p class=\"t-bad\">{}: {}</p>",
-                esc(&s.name),
-                esc(&e)
-            )),
+            Ok(v) => rows.extend(v.into_iter().map(|ch| {
+                (
+                    *s,
+                    format!("/space/{}/chat/{}", url_encode(&s.name), url_encode(&ch.id)),
+                    if ch.title.is_empty() {
+                        "(no name yet)".to_string()
+                    } else {
+                        ch.title
+                    },
+                    ch.modified,
+                    if ch.running { "ok" } else { "idle" },
+                    if ch.running { "running" } else { "not running" }.to_string(),
+                )
+            })),
+            Err(e) => error(s, &e),
         }
     }
-    rows.sort_by_key(|r| std::cmp::Reverse(r.1.modified));
+    for s in codex.iter().filter(|s| s.state == "running") {
+        match get::<Vec<crate::codex::Chat>>(
+            c,
+            Op::CodexChats {
+                name: s.name.clone(),
+            },
+        ) {
+            Ok(v) => rows.extend(v.into_iter().map(|ch| {
+                let label = crate::codex::state_label(&ch.state);
+                (
+                    *s,
+                    format!(
+                        "/space/{}/codex/{}",
+                        url_encode(&s.name),
+                        url_encode(&ch.id)
+                    ),
+                    if ch.title.is_empty() {
+                        "(no message yet)".to_string()
+                    } else {
+                        ch.title
+                    },
+                    ch.updated,
+                    match ch.state.as_str() {
+                        "waiting" => "warn",
+                        "working" => "ok",
+                        "error" => "bad",
+                        _ => "idle",
+                    },
+                    format!(
+                        "Codex{}",
+                        if label.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", {label}")
+                        }
+                    ),
+                )
+            })),
+            Err(e) => error(s, &e),
+        }
+    }
+    rows.sort_by_key(|r| std::cmp::Reverse(r.3));
     let mut b = String::from("<h1>Chats</h1>");
-    let usable: String = claude
-        .iter()
-        .filter(|s| s.level.map_or(true, |l| l >= crate::state::Level::Use))
-        .map(|s| {
-            format!(
-                "<option value=\"{}\">{} (on {})</option>",
-                esc(&s.name),
-                esc(&s.name),
-                esc(&s.host)
-            )
-        })
-        .collect();
-    if usable.is_empty() {
-        b.push_str("<p class=\"hint\">No space here can have chats yet: make a Claude space under <a href=\"/spaces\">Spaces</a>.</p>");
-    } else {
+    let usable = |list: &[&SpaceView]| -> String {
+        list.iter()
+            .filter(|s| s.level.map_or(true, |l| l >= crate::state::Level::Use))
+            .map(|s| {
+                format!(
+                    "<option value=\"{}\">{} (on {})</option>",
+                    esc(&s.name),
+                    esc(&s.name),
+                    esc(&s.host)
+                )
+            })
+            .collect()
+    };
+    let (claude_opts, codex_opts) = (usable(&claude), usable(&codex));
+    if claude_opts.is_empty() && codex_opts.is_empty() {
+        b.push_str("<p class=\"hint\">No space here can have chats yet: make a Claude or Codex space under <a href=\"/spaces\">Spaces</a>.</p>");
+    }
+    if !claude_opts.is_empty() {
         b.push_str(&format!(
-            "<details class=\"card add\"{}><summary>+ New chat</summary><form method=\"post\" action=\"/chats\" class=\"stack\">{}\
-             <div class=\"fields\"><label>Space <select name=\"space\" required>{usable}</select></label>\
+            "<details class=\"card add\"{}><summary>+ New Claude chat</summary><form method=\"post\" action=\"/chats\" class=\"stack\">{}\
+             <div class=\"fields\"><label>Space <select name=\"space\" required>{claude_opts}</select></label>\
              <label>Name <input name=\"title\" maxlength=\"80\" placeholder=\"what it is for\"></label></div>\
+             <div><button class=\"primary\">Start chat</button></div></form></details>",
+            if rows.is_empty() { " open" } else { "" },
+            csrf(c)
+        ));
+    }
+    if !codex_opts.is_empty() {
+        b.push_str(&format!(
+            "<details class=\"card add\"{}><summary>+ New Codex chat</summary><form method=\"post\" action=\"/chats\" class=\"stack\">{}\
+             <input type=\"hidden\" name=\"agent\" value=\"codex\">\
+             <label>Space <select name=\"space\" required>{codex_opts}</select></label>\
+             <label>Message <textarea name=\"text\" rows=\"2\" required placeholder=\"What should Codex do?\"></textarea></label>\
              <div><button class=\"primary\">Start chat</button></div></form></details>",
             if rows.is_empty() { " open" } else { "" },
             csrf(c)
@@ -4119,27 +4209,20 @@ fn chats_page(c: &Ctx, flash: &Flash) -> Reply {
         b.push_str("<p>No chats yet.</p>");
     } else {
         b.push_str("<div class=\"items\">");
-        for (s, ch) in &rows {
-            let title = if ch.title.is_empty() {
-                "(no name yet)".to_string()
-            } else {
-                ch.title.clone()
-            };
+        for (s, href, title, modified, dot, doing) in &rows {
             b.push_str(&format!(
-                "<article class=\"item\"><div class=\"item-head\"><span class=\"dot {}\"></span>\
-                 <a class=\"item-name\" href=\"/space/{}/chat/{}\">{}</a></div>\
+                "<article class=\"item\"><div class=\"item-head\"><span class=\"dot {dot}\"></span>\
+                 <a class=\"item-name\" href=\"{}\">{}</a></div>\
                  <p class=\"item-meta\">on <a href=\"/host/{}\">{}</a> · space <a href=\"/space/{}\">{}</a> · {} · \
                  last written {}</p></article>",
-                if ch.running { "ok" } else { "idle" },
-                url_encode(&s.name),
-                url_encode(&ch.id),
-                esc(&title),
+                esc(href),
+                esc(title),
                 url_encode(&s.host),
                 esc(&s.host),
                 url_encode(&s.name),
                 esc(&s.name),
-                if ch.running { "running" } else { "not running" },
-                when(ch.modified)
+                esc(doing),
+                when(*modified)
             ));
         }
         b.push_str("</div>");
@@ -4188,5 +4271,619 @@ mod tests {
         assert_eq!(f["e"], "");
         assert!(parse_form("x=%ZZ").is_empty());
         assert!(parse_form("x=%4").is_empty());
+    }
+}
+
+// ---------------------------------------------------------- Codex chats
+//
+// Codex spaces have chats of their own (see codex.rs): a list on the space
+// page, a page for each chat with what Codex says and does, and what it
+// asks to be allowed, answered with buttons.
+
+/// The unlock form for typing into chats from this browser, sent to `to`.
+fn unlock_form(c: &Ctx, to: &str, agent: &str) -> String {
+    format!(
+        "<form method=\"post\" action=\"{}\" class=\"card stack chat-unlock\">{}\
+         <h2>Type into chats from this browser</h2><p class=\"hint\">A message here is a message from you, to {agent} \
+         that can change your machines. Confirm it is you, once for this browser: it stays unlocked as long as \
+         a login lasts (<code>web.session_hours</code>), and the Account page lists it.</p>\
+         <label>Password <input name=\"password\" type=\"password\" autocomplete=\"current-password\" required></label>\
+         {}<div><button class=\"primary\">Unlock</button></div></form>",
+        esc(to),
+        csrf(c),
+        code_field()
+    )
+}
+
+fn codex_chats_card(c: &Ctx, s: &SpaceView) -> String {
+    let n = url_encode(&s.name);
+    let lvl = s.level.unwrap_or(crate::state::Level::Owner);
+    let can_use = lvl >= crate::state::Level::Use;
+    let running = s.state == "running";
+    let list = if running {
+        get::<Vec<crate::codex::Chat>>(
+            c,
+            Op::CodexChats {
+                name: s.name.clone(),
+            },
+        )
+    } else {
+        Ok(Vec::new())
+    };
+    let now = crate::state::now();
+    let rows = match &list {
+        Err(e) => format!("<p class=\"t-bad\">{}</p>", esc(e)),
+        Ok(v) if v.is_empty() && running => "<p>No chats yet.</p>".to_string(),
+        Ok(v) if v.is_empty() => {
+            "<p class=\"hint\">Start the space to see its chats and talk to Codex.</p>".to_string()
+        }
+        Ok(v) => {
+            let rows: String = v
+                .iter()
+                .map(|ch| {
+                    let state = crate::codex::state_label(&ch.state);
+                    let badge = match ch.state.as_str() {
+                        "" => String::new(),
+                        "waiting" => format!("<span class=\"badge warn\">{state}</span>"),
+                        "error" => format!("<span class=\"badge bad\">{state}</span>"),
+                        _ => format!("<span class=\"badge ok\">{state}</span>"),
+                    };
+                    format!(
+                        "<li class=\"chat\"><div class=\"chat-main\"><a class=\"chat-title\" href=\"/space/{n}/codex/{id}\">{}</a>\
+                         <span class=\"item-meta\">{} · <code>{}</code></span></div><div class=\"chat-actions\">{badge}</div></li>",
+                        esc(if ch.title.is_empty() { "(no message yet)" } else { ch.title.as_str() }),
+                        ago(now.saturating_sub(ch.updated)),
+                        esc(&ch.id[..8.min(ch.id.len())]),
+                        id = esc(&ch.id),
+                    )
+                })
+                .collect();
+            format!("<ul class=\"chats\">{rows}</ul>")
+        }
+    };
+    let start = if !can_use || !running {
+        String::new()
+    } else if !c.chat {
+        unlock_form(c, &format!("/space/{n}/codex-unlock"), "a Codex")
+    } else {
+        format!(
+            "<form method=\"post\" action=\"/space/{n}/codex-new\" class=\"stack codex-new\">{}\
+             <label>New chat <textarea name=\"text\" rows=\"2\" required placeholder=\"What should Codex do?\"></textarea></label>\
+             <div><button class=\"primary\">Start chat</button></div></form>",
+            csrf(c)
+        )
+    };
+    format!(
+        "<section class=\"card\" id=\"chats\"><h2>Chats</h2><p class=\"hint\">Each chat is a conversation of its own. \
+         Codex runs commands in the space without asking for most; when it does ask, the chat shows what and waits \
+         for your answer.</p>{start}{rows}</section>"
+    )
+}
+
+/// What a Codex chat says and does, as HTML. Each foldable part has an id,
+/// so the page keeps it open when it redraws.
+fn codex_items_html(items: &[crate::codex::Item]) -> String {
+    let mut out = String::new();
+    for it in items {
+        let id = esc(&it.id);
+        match it.kind.as_str() {
+            "user" => out.push_str(&format!(
+                "<div class=\"msg user\">{}<div class=\"bubble\">{}</div></div>",
+                it.by
+                    .as_ref()
+                    .map(|b| format!("<span class=\"by\">{}</span>", esc(b)))
+                    .unwrap_or_default(),
+                esc(&it.text)
+            )),
+            "agent" => out.push_str(&format!(
+                "<div class=\"msg assistant\">{}</div>",
+                crate::markdown::to_html(&it.text)
+            )),
+            "plan" => out.push_str(&format!(
+                "<div class=\"msg assistant plan\"><p class=\"item-meta\">Plan</p>{}</div>",
+                crate::markdown::to_html(&it.text)
+            )),
+            "reasoning" => out.push_str(&format!(
+                "<details class=\"tool thinking\" data-id=\"{id}\"><summary>Thinking</summary>\
+                 <div class=\"msg assistant\">{}</div></details>",
+                crate::markdown::to_html(&it.text)
+            )),
+            "command" => {
+                let first = it.text.lines().next().unwrap_or("");
+                let more = if it.text.lines().nth(1).is_some() { " …" } else { "" };
+                let status = match (it.status.as_str(), it.exit) {
+                    ("inProgress", _) => "<span class=\"badge ok\">running</span>".to_string(),
+                    ("declined", _) => "<span class=\"badge\">declined</span>".to_string(),
+                    (_, Some(0)) => String::new(),
+                    (_, Some(e)) => format!("<span class=\"badge bad\">exit {e}</span>"),
+                    ("failed", None) => "<span class=\"badge bad\">failed</span>".to_string(),
+                    _ => String::new(),
+                };
+                let cmd = if more.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}\n\n", crate::highlight::highlight("bash", &it.text))
+                };
+                out.push_str(&format!(
+                    "<details class=\"tool\" data-id=\"{id}\"><summary><span class=\"tool-name\">$</span> <code>{}{more}</code> {status}</summary>\
+                     <pre class=\"code\">{cmd}{}</pre></details>",
+                    esc(first),
+                    if it.detail.is_empty() { "(no output)".to_string() } else { esc(&it.detail) }
+                ));
+            }
+            "files" => {
+                let lines: Vec<&str> = it.text.lines().collect();
+                let summary = match lines.as_slice() {
+                    [] => "files".to_string(),
+                    [one] => one.to_string(),
+                    [first, rest @ ..] => format!("{first} and {} more", rest.len()),
+                };
+                let diff: String = it
+                    .detail
+                    .lines()
+                    .map(|l| {
+                        let class = if l.starts_with("+++") || l.starts_with("---") {
+                            "head"
+                        } else if l.starts_with('+') {
+                            "add"
+                        } else if l.starts_with('-') {
+                            "del"
+                        } else {
+                            ""
+                        };
+                        format!("<span class=\"{class}\">{}</span>\n", esc(l))
+                    })
+                    .collect();
+                let status = match it.status.as_str() {
+                    "declined" => " <span class=\"badge\">declined</span>",
+                    "failed" => " <span class=\"badge bad\">failed</span>",
+                    "inProgress" => " <span class=\"badge ok\">changing</span>",
+                    _ => "",
+                };
+                out.push_str(&format!(
+                    "<details class=\"tool\" data-id=\"{id}\"><summary><span class=\"tool-name\">Edit</span> <code>{}</code>{status}</summary>\
+                     <pre class=\"code\">{diff}</pre></details>",
+                    esc(&summary)
+                ));
+            }
+            "tool" | "search" => out.push_str(&format!(
+                "<details class=\"tool\" data-id=\"{id}\"><summary><span class=\"tool-name\">{}</span> <code>{}</code></summary>\
+                 <pre class=\"code\">{}</pre></details>",
+                if it.kind == "search" { "Search" } else { "Tool" },
+                esc(&it.text),
+                esc(&it.detail)
+            )),
+            "error" => out.push_str(&format!("<div class=\"msg note t-bad\">{}</div>", esc(&it.text))),
+            _ => out.push_str(&format!("<div class=\"msg note\">{}</div>", esc(&it.text))),
+        }
+    }
+    out
+}
+
+/// What Codex waits on, and whether it works, with what can be done.
+fn codex_state_html(c: &Ctx, n: &str, id: &str, feed: &crate::codex::Feed) -> String {
+    let may = c.chat && may_use_level(feed.level);
+    let action = format!("/space/{n}/codex/{}/answer", esc(id));
+    let mut out = String::new();
+    for a in &feed.asks {
+        let what = match a.kind.as_str() {
+            "command" => "Codex asks to run",
+            "files" => "Codex asks to change files",
+            "permissions" => "Codex asks for more access",
+            _ => "Codex asks",
+        };
+        let body = match a.kind.as_str() {
+            "command" => format!(
+                "<pre class=\"code\">{}</pre><p class=\"hint\">{}</p>",
+                crate::highlight::highlight("bash", &a.text),
+                esc(&a.detail)
+            ),
+            "question" => String::new(),
+            _ => format!(
+                "{}<pre class=\"code\">{}</pre>",
+                if a.text.is_empty() {
+                    String::new()
+                } else {
+                    format!("<p>{}</p>", esc(&a.text))
+                },
+                esc(&a.detail)
+            ),
+        };
+        let buttons = if !may {
+            String::new()
+        } else if a.kind == "question" {
+            let qs: String = a
+                .questions
+                .iter()
+                .map(|q| {
+                    let name = format!("q-{}", esc(&q.id));
+                    let opts: String = q
+                        .options
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (label, about))| {
+                            format!(
+                                "<label class=\"check\"><input type=\"radio\" name=\"{name}\" value=\"{}\"{}> <b>{}</b> \
+                                 <span class=\"hint\">{}</span></label>",
+                                esc(label),
+                                if i == 0 { " checked" } else { "" },
+                                esc(label),
+                                esc(about)
+                            )
+                        })
+                        .collect();
+                    let other = if q.other || q.options.is_empty() {
+                        format!(
+                            "<label>{} <input name=\"{name}-other\" type=\"{}\" autocomplete=\"off\"></label>",
+                            if q.options.is_empty() { "Answer" } else { "Or your own answer" },
+                            if q.secret { "password" } else { "text" }
+                        )
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "<fieldset><legend>{}</legend><p>{}</p>{opts}{other}</fieldset>",
+                        esc(&q.header),
+                        esc(&q.question)
+                    )
+                })
+                .collect();
+            format!(
+                "<form method=\"post\" action=\"{action}\" class=\"stack codex-answer\">{}\
+                 <input type=\"hidden\" name=\"ask\" value=\"{}\">{qs}<div class=\"buttons\">\
+                 <button name=\"decision\" value=\"accept\" class=\"primary\">Answer</button>\
+                 <button name=\"decision\" value=\"decline\">Skip</button></div></form>",
+                csrf(c),
+                a.key
+            )
+        } else {
+            let b = |d: &str, label: &str, class: &str| {
+                format!(
+                    "<form method=\"post\" action=\"{action}\" class=\"inline codex-answer\">{}\
+                     <input type=\"hidden\" name=\"ask\" value=\"{}\"><input type=\"hidden\" name=\"decision\" value=\"{d}\">\
+                     <button class=\"{class}\">{label}</button></form>",
+                    csrf(c),
+                    a.key
+                )
+            };
+            format!(
+                "<div class=\"buttons\">{}{}{}{}</div>",
+                b("accept", "Allow once", "primary"),
+                b("session", "Allow for this chat", ""),
+                b("decline", "Decline", ""),
+                b("cancel", "Decline and stop", "danger")
+            )
+        };
+        out.push_str(&format!(
+            "<div class=\"chat-state asking\"><b>{what}</b>{body}{buttons}</div>"
+        ));
+    }
+    if !feed.asks.is_empty() && !may {
+        out.push_str(if c.chat {
+            "<p class=\"hint\">Answering needs <b>use</b> of the space.</p>"
+        } else {
+            "<p class=\"hint\">To answer, unlock this browser below.</p>"
+        });
+    }
+    match feed.state.as_str() {
+        "working" => out.push_str(&format!(
+            "<div class=\"chat-state busy\"><span class=\"dot\"></span>Codex is working{}</div>",
+            if may {
+                format!(
+                    "<form method=\"post\" action=\"/space/{n}/codex/{}/stop\" class=\"inline codex-stop\">{}\
+                     <button>Stop</button></form>",
+                    esc(id),
+                    csrf(c)
+                )
+            } else {
+                String::new()
+            }
+        )),
+        "error" => out.push_str("<div class=\"chat-state\">Codex hit an error in this chat; a new message tries again.</div>"),
+        _ => {}
+    }
+    if !feed.notice.is_empty() && !feed.state.is_empty() {
+        out.push_str(&format!("<p class=\"hint\">{}</p>", esc(&feed.notice)));
+    }
+    out
+}
+
+fn may_use_level(l: Option<crate::state::Level>) -> bool {
+    l.map_or(true, |l| l >= crate::state::Level::Use)
+}
+
+fn codex_page(
+    c: &Ctx,
+    name: &str,
+    id: &str,
+    query: &HashMap<String, String>,
+    flash: &Flash,
+) -> Reply {
+    let n = url_encode(name);
+    if !crate::codex::id_ok(id) {
+        return Reply::Html(404, page(c, "Not found", "<h1>Not found</h1>", flash));
+    }
+    let turns: u32 = query
+        .get("turns")
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(30);
+    let feed = match get::<crate::codex::Feed>(
+        c,
+        Op::CodexFeed {
+            name: name.into(),
+            id: id.into(),
+            since: 0,
+            turns,
+        },
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            let body = format!(
+                "<p><a href=\"/space/{n}#chats\">← {}</a></p><section class=\"card\"><p class=\"t-bad\">{}</p></section>",
+                esc(name),
+                esc(&e)
+            );
+            return Reply::Html(404, page(c, "Chat", &body, flash));
+        }
+    };
+    let here = format!("/space/{n}/codex/{}", esc(id));
+    let may = may_use_level(feed.level);
+    let composer = if !may {
+        "<p class=\"hint\">You may read this chat; typing into it needs <b>use</b> of the space.</p>".to_string()
+    } else if !c.chat {
+        unlock_form(c, &format!("{here}/unlock"), "a Codex")
+    } else {
+        format!(
+            "<form method=\"post\" action=\"{here}/send\" id=\"composer\" class=\"composer\">{}\
+             <div class=\"composer-row\"><textarea name=\"text\" id=\"chat-text\" rows=\"1\" \
+             placeholder=\"Message Codex\" required></textarea>\
+             <button class=\"primary send\">Send</button></div>\
+             <div class=\"composer-foot\"><span class=\"hint\">{}</span></div></form>",
+            csrf(c),
+            esc(&feed.model)
+        )
+    };
+    let rename = if may {
+        pop_dialog(
+            c,
+            &format!("{here}/rename"),
+            "Rename",
+            "",
+            "Rename this chat",
+            &format!(
+                "<label>New name <input name=\"title\" value=\"{}\" required maxlength=\"100\" autocomplete=\"off\"></label>",
+                esc(&feed.title)
+            ),
+            "Save",
+        )
+    } else {
+        String::new()
+    };
+    let archive = if feed
+        .level
+        .map_or(true, |l| l >= crate::state::Level::Manage)
+    {
+        format!(
+            "<form method=\"post\" action=\"{here}/archive\" class=\"inline\" data-confirm=\"Archive this chat? Codex keeps it; it leaves this list.\">\
+             {}<button class=\"link\">Archive</button></form>",
+            csrf(c)
+        )
+    } else {
+        String::new()
+    };
+    let older = if feed.more {
+        format!(
+            "<p class=\"older\"><a href=\"{here}?turns={}\">Show earlier messages</a></p>",
+            turns.saturating_mul(3).min(500)
+        )
+    } else {
+        String::new()
+    };
+    let body = format!(
+        "<div class=\"codex-page\" data-feed=\"{here}/feed?turns={turns}\" data-version=\"{}\" data-csrf=\"{}\">\
+         <div class=\"page-head\"><div><p class=\"crumbs\"><a href=\"/space/{n}#chats\">← {}</a></p>\
+         <h1 class=\"chat-h\" id=\"chat-title\">{}</h1></div><div class=\"buttons\">{rename}{archive}<code class=\"hint\">{}</code></div></div>\
+         {older}<div class=\"chat-log\" id=\"chat-log\" aria-live=\"polite\">{}</div>\
+         <div id=\"chat-state\">{}</div>{composer}</div>",
+        feed.version,
+        esc(&c.csrf),
+        esc(name),
+        esc(if feed.title.is_empty() { "New chat" } else { feed.title.as_str() }),
+        esc(&id[..8]),
+        codex_items_html(&feed.items),
+        codex_state_html(c, &n, id, &feed),
+    );
+    let title = if feed.title.is_empty() {
+        "Chat".to_string()
+    } else {
+        feed.title.clone()
+    };
+    Reply::Html(200, page(c, &title, &body, flash))
+}
+
+fn codex_feed(c: &Ctx, name: &str, id: &str, query: &HashMap<String, String>) -> Reply {
+    if !crate::codex::id_ok(id) {
+        return Reply::Json(404, "{\"error\":\"no such chat\"}".into());
+    }
+    let since = query.get("since").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let turns = query
+        .get("turns")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    match get::<crate::codex::Feed>(
+        c,
+        Op::CodexFeed {
+            name: name.into(),
+            id: id.into(),
+            since,
+            turns,
+        },
+    ) {
+        Ok(f) if f.same => Reply::Json(
+            200,
+            serde_json::json!({"same": true, "version": f.version}).to_string(),
+        ),
+        Ok(f) => Reply::Json(
+            200,
+            serde_json::json!({
+                "version": f.version,
+                "html": codex_items_html(&f.items),
+                "state_html": codex_state_html(c, &url_encode(name), id, &f),
+                "state": f.state,
+                "title": f.title,
+            })
+            .to_string(),
+        ),
+        Err(e) => Reply::Json(400, serde_json::json!({ "error": e }).to_string()),
+    }
+}
+
+fn codex_post(
+    c: &Ctx,
+    name: &str,
+    id: &str,
+    action: &str,
+    form: &HashMap<String, String>,
+) -> Reply {
+    if !crate::codex::id_ok(id) {
+        return Reply::Json(404, "{\"error\":\"no such chat\"}".into());
+    }
+    let n = url_encode(name);
+    let here = format!("/space/{n}/codex/{id}");
+    let js = f(form, "js") == "1";
+    let answer = |r: std::result::Result<serde_json::Value, String>, ok: &str, to: &str| -> Reply {
+        if js {
+            match r {
+                Ok(v) => Reply::Json(200, serde_json::json!({ "ok": ok, "data": v }).to_string()),
+                Err(e) => Reply::Json(400, serde_json::json!({ "error": e }).to_string()),
+            }
+        } else {
+            back(to, r.map(|_| ok.to_string()))
+        }
+    };
+    match action {
+        "unlock" => unlock(c, form, &here),
+        "send" => answer(
+            get(
+                c,
+                Op::CodexSend {
+                    name: name.into(),
+                    id: id.into(),
+                    text: f(form, "text").into(),
+                },
+            ),
+            "sent",
+            &here,
+        ),
+        "stop" => answer(
+            get(
+                c,
+                Op::CodexStop {
+                    name: name.into(),
+                    id: id.into(),
+                },
+            ),
+            "stopped",
+            &here,
+        ),
+        "answer" => {
+            // Questions: q-ID is the option picked, q-ID-other a free answer
+            // (which wins when given).
+            let mut answers = std::collections::BTreeMap::new();
+            for (k, v) in form {
+                if let Some(q) = k.strip_prefix("q-") {
+                    if let Some(q) = q.strip_suffix("-other") {
+                        if !v.trim().is_empty() {
+                            answers.insert(q.to_string(), v.trim().to_string());
+                        }
+                    } else {
+                        answers.entry(q.to_string()).or_insert_with(|| v.clone());
+                    }
+                }
+            }
+            answer(
+                get(
+                    c,
+                    Op::CodexAnswer {
+                        name: name.into(),
+                        id: id.into(),
+                        ask: f(form, "ask").parse().unwrap_or(0),
+                        decision: f(form, "decision").into(),
+                        answers,
+                    },
+                ),
+                "answered",
+                &here,
+            )
+        }
+        "rename" => answer(
+            get(
+                c,
+                Op::CodexRename {
+                    name: name.into(),
+                    id: id.into(),
+                    title: f(form, "title").into(),
+                },
+            ),
+            "renamed",
+            &here,
+        ),
+        "archive" => answer(
+            get(
+                c,
+                Op::CodexArchive {
+                    name: name.into(),
+                    id: id.into(),
+                },
+            ),
+            "archived",
+            &format!("/space/{n}#chats"),
+        ),
+        _ => Reply::Json(404, "{\"error\":\"no such action\"}".into()),
+    }
+}
+
+/// Unlocks this browser for chats (password and code), then goes to `to`.
+fn unlock(c: &Ctx, form: &HashMap<String, String>, to: &str) -> Reply {
+    match get::<serde_json::Value>(
+        c,
+        Op::ChatUnlock {
+            password: f(form, "password").into(),
+            code: f(form, "code").into(),
+        },
+    ) {
+        Ok(v) => {
+            let token = v["token"].as_str().unwrap_or("");
+            let age = v["max_age"].as_u64().unwrap_or(24 * 3600);
+            let sep = if to.contains('?') { '&' } else { '?' };
+            Reply::Redirect(
+                format!("{to}{sep}ok=unlocked"),
+                Some(format!(
+                    "{CHAT_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={age}"
+                )),
+            )
+        }
+        Err(e) => back(to, Err(e)),
+    }
+}
+
+/// Starts a Codex chat and opens it.
+fn codex_new(c: &Ctx, name: &str, form: &HashMap<String, String>) -> Reply {
+    let n = url_encode(name);
+    match get::<String>(
+        c,
+        Op::CodexNew {
+            name: name.into(),
+            text: f(form, "text").into(),
+        },
+    ) {
+        Ok(id) if crate::codex::id_ok(&id) => {
+            Reply::Redirect(format!("/space/{n}/codex/{id}"), None)
+        }
+        Ok(_) => back(
+            &format!("/space/{n}#chats"),
+            Err("Codex did not start a chat".into()),
+        ),
+        Err(e) => back(&format!("/space/{n}#chats"), Err(e)),
     }
 }

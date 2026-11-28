@@ -134,6 +134,53 @@ pub enum Op {
         filename: String,
         data: String,
     },
+    /// A Codex space's chats (see codex.rs).
+    CodexChats {
+        name: String,
+    },
+    /// A Codex chat's latest turns, unless nothing changed since `since`.
+    CodexFeed {
+        name: String,
+        id: String,
+        #[serde(default)]
+        since: u64,
+        #[serde(default)]
+        turns: u32,
+    },
+    /// Starts a Codex chat with its first message (needs the chat unlock).
+    CodexNew {
+        name: String,
+        text: String,
+    },
+    /// Sends a message to a Codex chat (needs the chat unlock).
+    CodexSend {
+        name: String,
+        id: String,
+        text: String,
+    },
+    /// Stops what Codex is doing in a chat (needs the chat unlock).
+    CodexStop {
+        name: String,
+        id: String,
+    },
+    /// Answers what Codex asks (needs the chat unlock).
+    CodexAnswer {
+        name: String,
+        id: String,
+        ask: u64,
+        decision: String,
+        #[serde(default)]
+        answers: std::collections::BTreeMap<String, String>,
+    },
+    CodexRename {
+        name: String,
+        id: String,
+        title: String,
+    },
+    CodexArchive {
+        name: String,
+        id: String,
+    },
     SpaceNew {
         space: NewSpace,
     },
@@ -393,6 +440,8 @@ impl Op {
                 | Op::AccountNames
                 | Op::ChatFeed { .. }
                 | Op::ChatCommands { .. }
+                | Op::CodexChats { .. }
+                | Op::CodexFeed { .. }
                 | Op::SpaceScreen { .. }
                 | Op::HostPubkey { .. }
                 | Op::ConfigShow
@@ -412,7 +461,14 @@ impl Op {
     fn needs_chat_unlock(&self) -> bool {
         matches!(
             self,
-            Op::ChatSend { .. } | Op::ChatKey { .. } | Op::ChatUpload { .. } | Op::AskDecide { .. }
+            Op::ChatSend { .. }
+                | Op::ChatKey { .. }
+                | Op::ChatUpload { .. }
+                | Op::AskDecide { .. }
+                | Op::CodexNew { .. }
+                | Op::CodexSend { .. }
+                | Op::CodexStop { .. }
+                | Op::CodexAnswer { .. }
         )
     }
 
@@ -902,12 +958,19 @@ fn need(op: &Op) -> Need {
         | Op::ChatCommands { name }
         | Op::SpaceScreen { name }
         | Op::ChatList { name }
+        | Op::CodexChats { name }
+        | Op::CodexFeed { name, .. }
         | Op::Activity { name, .. } => one(name, View),
         Op::ChatSend { name, .. }
         | Op::ChatKey { name, .. }
         | Op::ChatUpload { name, .. }
         | Op::ChatOpen { name, .. }
         | Op::ChatStop { name, .. }
+        | Op::CodexNew { name, .. }
+        | Op::CodexSend { name, .. }
+        | Op::CodexStop { name, .. }
+        | Op::CodexAnswer { name, .. }
+        | Op::CodexRename { name, .. }
         | Op::SpaceSend { name, .. }
         | Op::SpaceRootOff { name } => one(name, Use),
         Op::SpaceAccess { name, access, .. } => one(
@@ -927,6 +990,7 @@ fn need(op: &Op) -> Need {
         | Op::SpaceRoot { name, .. }
         | Op::SpaceRemote { name, .. }
         | Op::ChatRm { name, .. }
+        | Op::CodexArchive { name, .. }
         | Op::SpaceShare { name, .. } => one(name, Manage),
         Op::SpaceRename { old, .. } => one(old, Manage),
         Op::BridgeAdd { from, to, .. } | Op::BridgeRm { from, to } => {
@@ -1397,6 +1461,32 @@ fn run_op(
             json(crate::asks::decide(&id, approve, user, &reason)?)
         }
         Op::ChatCommands { name } => json(crate::chat::commands(&name)?),
+        Op::CodexChats { name } => json(crate::codex::chats(&name)?),
+        Op::CodexFeed {
+            name,
+            id,
+            since,
+            turns,
+        } => {
+            let mut f = crate::codex::feed(&name, &id, since, if turns == 0 { 30 } else { turns })?;
+            let (_, st) = ctx::read_only()?;
+            f.level = st.space(&name)?.level(user, admin);
+            json(f)
+        }
+        Op::CodexNew { name, text } => json(crate::codex::new(&name, &text, user)?),
+        Op::CodexSend { name, id, text } => json(crate::codex::send(&name, &id, &text, user)?),
+        Op::CodexStop { name, id } => json(crate::codex::stop(&name, &id, user)?),
+        Op::CodexAnswer {
+            name,
+            id,
+            ask,
+            decision,
+            answers,
+        } => json(crate::codex::answer(
+            &name, &id, ask, &decision, &answers, user,
+        )?),
+        Op::CodexRename { name, id, title } => json(crate::codex::rename(&name, &id, &title)?),
+        Op::CodexArchive { name, id } => json(crate::codex::archive(&name, &id)?),
         Op::ChatSend { name, id, text } => json(crate::chat::send(&name, &id, &text, user)?),
         Op::ChatKey { name, id, key } => json(crate::chat::key(&name, &id, &key, user)?),
         Op::ChatUpload {
@@ -2093,6 +2183,36 @@ pub fn all_op_names() -> Vec<String> {
         },
         Op::CodexShow,
         Op::CodexInstall { code: s() },
+        Op::CodexChats { name: s() },
+        Op::CodexFeed {
+            name: s(),
+            id: s(),
+            since: 0,
+            turns: 0,
+        },
+        Op::CodexNew {
+            name: s(),
+            text: s(),
+        },
+        Op::CodexSend {
+            name: s(),
+            id: s(),
+            text: s(),
+        },
+        Op::CodexStop { name: s(), id: s() },
+        Op::CodexAnswer {
+            name: s(),
+            id: s(),
+            ask: 0,
+            decision: s(),
+            answers: Default::default(),
+        },
+        Op::CodexRename {
+            name: s(),
+            id: s(),
+            title: s(),
+        },
+        Op::CodexArchive { name: s(), id: s() },
         Op::Account,
         Op::AccountPassword {
             current: s(),
@@ -2166,6 +2286,14 @@ pub fn all_op_names() -> Vec<String> {
             | Op::LoginApiKey { .. }
             | Op::CodexShow
             | Op::CodexInstall { .. }
+            | Op::CodexChats { .. }
+            | Op::CodexFeed { .. }
+            | Op::CodexNew { .. }
+            | Op::CodexSend { .. }
+            | Op::CodexStop { .. }
+            | Op::CodexAnswer { .. }
+            | Op::CodexRename { .. }
+            | Op::CodexArchive { .. }
             | Op::Account
             | Op::AccountPassword { .. }
             | Op::AccountTotpBegin { .. }
